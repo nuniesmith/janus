@@ -1,0 +1,38 @@
+[package]
+name = "janus-registry-lib"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Asset registry and service discovery library for JANUS trading system"
+
+[lib]
+name = "janus_registry_lib"
+path = "src/lib.rs"
+
+[dependencies]
+# Async runtime
+tokio = { workspace = true, features = ["sync"] }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Time handling
+chrono = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+
+# Utilities
+uuid = { workspace = true }
+
+# Redis cache for persistence
+redis = { workspace = true }
+
+[dev-dependencies]
+tokio-test = "0.4.4"

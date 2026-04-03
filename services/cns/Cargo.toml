@@ -1,0 +1,52 @@
+[package]
+name = "janus-cns-service"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+name = "janus_cns_service"
+path = "src/lib.rs"
+
+[[bin]]
+name = "janus-cns"
+path = "src/main.rs"
+
+[dependencies]
+# Unified JANUS core
+janus-core = { workspace = true }
+
+# Workspace dependencies
+janus-cns = { path = "../../crates/cns" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+config = { workspace = true }
+toml = { workspace = true }
+
+# Redis for recovery actions
+redis = { workspace = true }
+
+# HTTP server for metrics
+axum = "0.8.8"
+tower = "0.5.2"
+tower-http = { version = "0.6.8", features = ["trace", "cors"] }
+
+# Prometheus metrics encoding
+prometheus = "0.14.0"
+
+# Signal handling for graceful shutdown
+# NOTE: tokio-signal 0.2.9, signal-hook, and signal-hook-tokio were removed
+# because the code already uses tokio::signal (built into tokio 1.x).
+# The old deps pulled in vulnerable transitive deps (net2, mio 0.6).
+
+# gRPC (using centralized fks-proto crate if needed)
+tonic = "0.10"
+prost = "0.12"
+
+# Centralized proto definitions (for future gRPC integration)
+# fks-proto = { path = "../../../proto" }

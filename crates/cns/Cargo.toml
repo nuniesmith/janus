@@ -1,0 +1,47 @@
+[package]
+name = "janus-cns"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+# Workspace dependencies
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+
+# Prometheus metrics
+prometheus = "0.14.0"
+
+# HTTP server for metrics endpoint
+axum = "0.8.8"
+tower = "0.5.2"
+tower-http = { version = "0.6.8", features = ["trace", "cors"] }
+
+# Health check probes
+reqwest = { version = "0.12.0", features = ["json"] }
+
+# Redis health check
+redis = { workspace = true }
+
+# gRPC health check
+tonic = { workspace = true }
+tonic-health = "0.14"
+prost = { workspace = true }
+
+# Async utilities
+async-trait = "0.1.89"
+futures = "0.3.31"
+
+# Config file validation (preflight checks)
+toml = { workspace = true }
+
+[dev-dependencies]
+tokio-test = "0.4.4"
+tempfile = "3.15.0"

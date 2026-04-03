@@ -1,0 +1,427 @@
+# ════════════════════════════════════════════════════════════════════
+# JANUS Brain Pipeline — Prometheus Alerting Rules
+# ════════════════════════════════════════════════════════════════════
+#
+# Deploy this file alongside your Prometheus configuration:
+#
+#   rule_files:
+#     - /etc/prometheus/rules/brain-alerts.yml
+#
+# These rules monitor the brain-inspired trading pipeline for
+# operational anomalies, performance degradation, and emergencies.
+#
+# Severity levels:
+#   critical  — Immediate pager / on-call escalation
+#   warning   — Investigate within 15 minutes
+#   info      — Review during next check-in
+#
+# ════════════════════════════════════════════════════════════════════
+
+groups:
+  # ──────────────────────────────────────────────────────────────────
+  # Kill Switch & Emergency
+  # ──────────────────────────────────────────────────────────────────
+  - name: janus-brain-emergency
+    interval: 10s
+    rules:
+      - alert: BrainKillSwitchActive
+        expr: janus_brain_kill_switch_active == 1
+        for: 30s
+        labels:
+          severity: critical
+          component: brain-pipeline
+          team: trading-ops
+        annotations:
+          summary: "🛑 JANUS brain kill switch is ACTIVE — all trading halted"
+          description: >-
+            The brain pipeline kill switch has been active for more than 30 seconds.
+            All new position entries are blocked. This may be intentional (operator action)
+            or triggered automatically by the watchdog.
+            Check: curl -s http://{{ $labels.instance }}/api/v1/brain/health | jq .
+          runbook_url: "https://docs.internal/janus/runbook#kill-switch"
+          dashboard_url: "https://grafana.internal/d/janus-brain/brain-pipeline"
+
+      - alert: BrainKillSwitchActivatedRecently
+        expr: changes(janus_brain_kill_switch_active[5m]) > 0 and janus_brain_kill_switch_active == 1
+        for: 0s
+        labels:
+          severity: critical
+          component: brain-pipeline
+          team: trading-ops
+        annotations:
+          summary: "🛑 Kill switch was just activated on {{ $labels.instance }}"
+          description: >-
+            The brain kill switch transitioned to active in the last 5 minutes.
+            Immediate review required to determine if this was operator-initiated
+            or an automated trigger.
+
+  # ──────────────────────────────────────────────────────────────────
+  # Block Rate & Pipeline Health
+  # ──────────────────────────────────────────────────────────────────
+  - name: janus-brain-pipeline-health
+    interval: 15s
+    rules:
+      - alert: BrainHighBlockRate
+        expr: >-
+          (
+            sum(rate(janus_brain_blocks_total[5m]))
+            /
+            clamp_min(rate(janus_brain_evaluations_total[5m]), 0.001)
+          ) > 0.80
+        for: 5m
+        labels:
+          severity: warning
+          component: brain-pipeline
+        annotations:
+          summary: "⚠️ Brain pipeline block rate above 80% on {{ $labels.instance }}"
+          description: >-
+            More than 80% of pipeline evaluations are being blocked for the last 5 minutes.
+            Current block rate: {{ $value | humanizePercentage }}.
+            This may indicate overly aggressive gating, a regime detection issue,
+            or stale market data driving low confidence.
+          runbook_url: "https://docs.internal/janus/runbook#high-block-rate"
+
+      - alert: BrainVeryHighBlockRate
+        expr: >-
+          (
+            sum(rate(janus_brain_blocks_total[5m]))
+            /
+            clamp_min(rate(janus_brain_evaluations_total[5m]), 0.001)
+          ) > 0.95
+        for: 2m
+        labels:
+          severity: critical
+          component: brain-pipeline
+        annotations:
+          summary: "🚨 Brain pipeline block rate above 95% on {{ $labels.instance }}"
+          description: >-
+            Nearly all pipeline evaluations are blocked. Effective trading has stopped.
+            Block rate: {{ $value | humanizePercentage }}.
+            Likely cause: kill switch active, all regimes below confidence threshold,
+            or gating misconfiguration.
+
+      - alert: BrainNoEvaluations
+        expr: rate(janus_brain_evaluations_total[10m]) == 0 and janus_brain_boot_passed == 1
+        for: 15m
+        labels:
+          severity: warning
+          component: brain-pipeline
+        annotations:
+          summary: "⚠️ No brain pipeline evaluations in 15 minutes on {{ $labels.instance }}"
+          description: >-
+            The brain pipeline has passed boot checks but has not evaluated any signals
+            in the last 15 minutes. This may indicate the data feed is down, the event loop
+            is stalled, or no trading signals are being generated.
+
+      - alert: BrainBootFailed
+        expr: janus_brain_boot_passed == 0
+        for: 2m
+        labels:
+          severity: critical
+          component: brain-pipeline
+        annotations:
+          summary: "🚨 Brain pipeline boot check FAILED on {{ $labels.instance }}"
+          description: >-
+            The brain runtime pre-flight checks did not pass. The pipeline may be running
+            in degraded mode or completely non-functional. Check service logs and the
+            health endpoint for details.
+          runbook_url: "https://docs.internal/janus/runbook#boot-failure"
+
+  # ──────────────────────────────────────────────────────────────────
+  # Pipeline Latency
+  # ──────────────────────────────────────────────────────────────────
+  - name: janus-brain-latency
+    interval: 15s
+    rules:
+      - alert: BrainHighEvaluationLatencyP99
+        expr: >-
+          histogram_quantile(0.99, rate(janus_brain_evaluation_duration_us_bucket[5m])) > 5000
+        for: 5m
+        labels:
+          severity: warning
+          component: brain-pipeline
+        annotations:
+          summary: "⚠️ Brain pipeline p99 latency above 5ms on {{ $labels.instance }}"
+          description: >-
+            The 99th percentile pipeline evaluation latency is {{ $value | humanize }}μs
+            (threshold: 5000μs / 5ms). High latency may indicate lock contention,
+            slow correlation computation, or resource pressure.
+
+      - alert: BrainVeryHighEvaluationLatencyP99
+        expr: >-
+          histogram_quantile(0.99, rate(janus_brain_evaluation_duration_us_bucket[5m])) > 50000
+        for: 2m
+        labels:
+          severity: critical
+          component: brain-pipeline
+        annotations:
+          summary: "🚨 Brain pipeline p99 latency above 50ms on {{ $labels.instance }}"
+          description: >-
+            Pipeline evaluation latency is critically high at {{ $value | humanize }}μs.
+            This will cause order delays and may result in missed entries or stale fills.
+
+      - alert: BrainHighEvaluationLatencyP50
+        expr: >-
+          histogram_quantile(0.50, rate(janus_brain_evaluation_duration_us_bucket[5m])) > 2000
+        for: 10m
+        labels:
+          severity: warning
+          component: brain-pipeline
+        annotations:
+          summary: "⚠️ Brain pipeline median latency above 2ms on {{ $labels.instance }}"
+          description: >-
+            The median (p50) pipeline evaluation latency is {{ $value | humanize }}μs.
+            Sustained high median latency suggests a systemic performance issue.
+
+  # ──────────────────────────────────────────────────────────────────
+  # Watchdog Health
+  # ──────────────────────────────────────────────────────────────────
+  - name: janus-brain-watchdog
+    interval: 15s
+    rules:
+      - alert: BrainWatchdogDeadComponents
+        expr: janus_brain_watchdog_dead_count > 0
+        for: 1m
+        labels:
+          severity: critical
+          component: brain-watchdog
+        annotations:
+          summary: "🚨 {{ $value }} dead component(s) detected by brain watchdog on {{ $labels.instance }}"
+          description: >-
+            The CNS watchdog has detected {{ $value }} component(s) with no heartbeat.
+            Dead components may trigger an automatic kill switch if configured.
+            Check the health endpoint: curl -s http://{{ $labels.instance }}/api/v1/brain/health | jq .watchdog
+          runbook_url: "https://docs.internal/janus/runbook#watchdog-dead"
+
+      - alert: BrainWatchdogDegradedComponents
+        expr: janus_brain_watchdog_degraded_count > 0
+        for: 5m
+        labels:
+          severity: warning
+          component: brain-watchdog
+        annotations:
+          summary: "⚠️ {{ $value }} degraded component(s) detected by brain watchdog on {{ $labels.instance }}"
+          description: >-
+            The CNS watchdog reports {{ $value }} component(s) in degraded state
+            (heartbeats arriving late). If this persists, components may transition to dead.
+
+      - alert: BrainWatchdogLowHealthScore
+        expr: >-
+          (janus_brain_watchdog_alive_count / clamp_min(janus_brain_watchdog_components_total, 1)) < 0.5
+        for: 2m
+        labels:
+          severity: critical
+          component: brain-watchdog
+        annotations:
+          summary: "🚨 Brain watchdog health score below 50% on {{ $labels.instance }}"
+          description: >-
+            Fewer than half of registered components are alive.
+            Health score: {{ $value | humanizePercentage }}.
+            The system is significantly degraded and may auto-trigger the kill switch.
+
+      - alert: BrainWatchdogNoComponents
+        expr: janus_brain_watchdog_components_total == 0 and janus_brain_boot_passed == 1
+        for: 5m
+        labels:
+          severity: warning
+          component: brain-watchdog
+        annotations:
+          summary: "⚠️ Brain watchdog has 0 registered components on {{ $labels.instance }}"
+          description: >-
+            The brain runtime booted successfully but the watchdog has no registered
+            components. This may indicate the watchdog was not started or components
+            failed to register.
+
+  # ──────────────────────────────────────────────────────────────────
+  # Stage-Specific Blocking
+  # ──────────────────────────────────────────────────────────────────
+  - name: janus-brain-stages
+    interval: 30s
+    rules:
+      - alert: BrainHighAmygdalaRiskRate
+        expr: >-
+          rate(janus_brain_amygdala_high_risk_total[10m])
+          /
+          clamp_min(rate(janus_brain_evaluations_total[10m]), 0.001)
+          > 0.50
+        for: 10m
+        labels:
+          severity: warning
+          component: brain-amygdala
+        annotations:
+          summary: "⚠️ Amygdala detecting high risk on >50% of evaluations on {{ $labels.instance }}"
+          description: >-
+            The amygdala threat detector is flagging more than 50% of evaluations as
+            high risk. This may indicate genuine market stress or an overly sensitive
+            amygdala configuration.
+            Rate: {{ $value | humanizePercentage }}
+
+      - alert: BrainHighGateRejectionRate
+        expr: >-
+          rate(janus_brain_gate_rejections_total[10m])
+          /
+          clamp_min(rate(janus_brain_evaluations_total[10m]), 0.001)
+          > 0.60
+        for: 10m
+        labels:
+          severity: warning
+          component: brain-gating
+        annotations:
+          summary: "⚠️ Strategy gate rejecting >60% of evaluations on {{ $labels.instance }}"
+          description: >-
+            The strategy gating filter is rejecting a high proportion of signals.
+            This may indicate a mismatch between active strategies and detected regimes,
+            or overly restrictive gating configuration.
+
+      - alert: BrainHighCorrelationBlockRate
+        expr: >-
+          rate(janus_brain_correlation_blocks_total[10m])
+          /
+          clamp_min(rate(janus_brain_evaluations_total[10m]), 0.001)
+          > 0.30
+        for: 10m
+        labels:
+          severity: info
+          component: brain-correlation
+        annotations:
+          summary: "ℹ️ Correlation filter blocking >30% of evaluations on {{ $labels.instance }}"
+          description: >-
+            The correlation filter is preventing a significant number of new positions.
+            This is often healthy behavior during correlated market moves. Review if
+            the max_correlated_positions setting is appropriate for your portfolio size.
+
+      - alert: BrainRegimeBridgeHighBlockRate
+        expr: >-
+          rate(janus_brain_blocks_total{stage="RegimeBridge"}[10m])
+          /
+          clamp_min(rate(janus_brain_evaluations_total[10m]), 0.001)
+          > 0.50
+        for: 10m
+        labels:
+          severity: warning
+          component: brain-regime-bridge
+        annotations:
+          summary: "⚠️ RegimeBridge blocking >50% of evaluations (low confidence) on {{ $labels.instance }}"
+          description: >-
+            More than half of pipeline evaluations are being blocked at the RegimeBridge
+            stage due to low regime confidence. This may indicate poor market data quality,
+            regime detector issues, or an overly high min_regime_confidence threshold.
+
+  # ──────────────────────────────────────────────────────────────────
+  # Scale Distribution
+  # ──────────────────────────────────────────────────────────────────
+  - name: janus-brain-scale
+    interval: 30s
+    rules:
+      - alert: BrainConsistentlyLowScale
+        expr: >-
+          histogram_quantile(0.75, rate(janus_brain_scale_histogram_bucket[15m])) < 0.3
+        for: 15m
+        labels:
+          severity: warning
+          component: brain-hypothalamus
+        annotations:
+          summary: "⚠️ 75th percentile position scale below 0.3 for 15 min on {{ $labels.instance }}"
+          description: >-
+            The hypothalamus scaling system is consistently producing very small scales.
+            This means all approved trades are sized at less than 30% of normal.
+            p75 scale: {{ $value | humanize }}.
+            Check if this reflects genuine regime uncertainty or a configuration issue.
+
+      - alert: BrainConsistentlyLowConfidence
+        expr: >-
+          histogram_quantile(0.50, rate(janus_brain_confidence_histogram_bucket[15m])) < 0.4
+        for: 15m
+        labels:
+          severity: info
+          component: brain-regime
+        annotations:
+          summary: "ℹ️ Median regime confidence below 40% for 15 min on {{ $labels.instance }}"
+          description: >-
+            The regime detection system is reporting low confidence across evaluations.
+            Median confidence: {{ $value | humanize }}.
+            This may be normal during unclear market conditions or indicate data issues.
+
+  # ──────────────────────────────────────────────────────────────────
+  # Reduce-Only Monitoring
+  # ──────────────────────────────────────────────────────────────────
+  - name: janus-brain-reduce-only
+    interval: 15s
+    rules:
+      - alert: BrainSustainedReduceOnly
+        expr: >-
+          rate(janus_brain_reduce_only_total[5m]) > 0
+          and
+          rate(janus_brain_proceeds_total[5m]) == 0
+        for: 10m
+        labels:
+          severity: warning
+          component: brain-pipeline
+        annotations:
+          summary: "⚠️ Pipeline in reduce-only mode for 10+ minutes on {{ $labels.instance }}"
+          description: >-
+            The pipeline is only producing ReduceOnly decisions with zero Proceed outcomes.
+            This means only position closures are allowed; no new entries will execute.
+            Check if a crisis regime is sustained or if configuration needs adjustment.
+
+      - alert: BrainHighReduceOnlyRate
+        expr: >-
+          rate(janus_brain_reduce_only_total[10m])
+          /
+          clamp_min(rate(janus_brain_evaluations_total[10m]), 0.001)
+          > 0.50
+        for: 10m
+        labels:
+          severity: warning
+          component: brain-pipeline
+        annotations:
+          summary: "⚠️ >50% of evaluations producing ReduceOnly on {{ $labels.instance }}"
+          description: >-
+            A majority of pipeline evaluations are ReduceOnly decisions.
+            Rate: {{ $value | humanizePercentage }}.
+            The amygdala is detecting sustained crisis conditions.
+
+  # ──────────────────────────────────────────────────────────────────
+  # Recording Rules (for dashboard efficiency)
+  # ──────────────────────────────────────────────────────────────────
+  - name: janus-brain-recording-rules
+    interval: 15s
+    rules:
+      - record: janus_brain:block_rate_5m
+        expr: >-
+          sum(rate(janus_brain_blocks_total[5m]))
+          /
+          clamp_min(rate(janus_brain_evaluations_total[5m]), 0.001)
+
+      - record: janus_brain:evaluation_rate_5m
+        expr: rate(janus_brain_evaluations_total[5m])
+
+      - record: janus_brain:proceed_rate_5m
+        expr: rate(janus_brain_proceeds_total[5m])
+
+      - record: janus_brain:reduce_only_rate_5m
+        expr: rate(janus_brain_reduce_only_total[5m])
+
+      - record: janus_brain:latency_p50_5m
+        expr: histogram_quantile(0.50, rate(janus_brain_evaluation_duration_us_bucket[5m]))
+
+      - record: janus_brain:latency_p99_5m
+        expr: histogram_quantile(0.99, rate(janus_brain_evaluation_duration_us_bucket[5m]))
+
+      - record: janus_brain:scale_p50_5m
+        expr: histogram_quantile(0.50, rate(janus_brain_scale_histogram_bucket[5m]))
+
+      - record: janus_brain:confidence_p50_5m
+        expr: histogram_quantile(0.50, rate(janus_brain_confidence_histogram_bucket[5m]))
+
+      - record: janus_brain:watchdog_health_score
+        expr: >-
+          janus_brain_watchdog_alive_count
+          /
+          clamp_min(janus_brain_watchdog_components_total, 1)
+
+      - record: janus_brain:amygdala_risk_rate_10m
+        expr: >-
+          rate(janus_brain_amygdala_high_risk_total[10m])
+          /
+          clamp_min(rate(janus_brain_evaluations_total[10m]), 0.001)

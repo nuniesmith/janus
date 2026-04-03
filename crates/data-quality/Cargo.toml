@@ -1,0 +1,63 @@
+[package]
+name = "janus-data-quality"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Workspace dependencies
+janus-core = { workspace = true }
+janus-gap-detection = { path = "../gap-detection" }
+janus-cns = { path = "../cns", optional = true }
+
+# Async runtime
+tokio = { workspace = true, features = ["full"] }
+async-trait = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Data processing
+rust_decimal = { workspace = true }
+
+# Time
+chrono = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Metrics
+prometheus = { workspace = true, optional = true }
+
+# Parquet export
+arrow = { workspace = true }
+parquet = { workspace = true }
+
+# Statistics
+statrs = "0.17.1"
+
+# Utilities
+uuid = { workspace = true }
+
+[dev-dependencies]
+tokio-test = "0.4.4"
+criterion = "0.5.1"
+
+[features]
+default = ["cns-metrics"]
+cns-metrics = ["janus-cns", "prometheus"]
+
+# [[bench]]
+# name = "validators"
+# harness = false
+
+# [[bench]]
+# name = "anomaly_detection"
+# harness = false

@@ -1,0 +1,47 @@
+# Grafana Datasources Provisioning Configuration
+# This file configures Prometheus as a datasource for Grafana.
+#
+# Place this file in your Grafana provisioning directory:
+#   /etc/grafana/provisioning/datasources/datasources.yaml
+#
+# Or mount it via Docker:
+#   -v ./provisioning:/etc/grafana/provisioning
+
+apiVersion: 1
+
+datasources:
+  # Prometheus datasource for FKS metrics
+  - name: Prometheus
+    type: prometheus
+    uid: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: true
+    jsonData:
+      httpMethod: POST
+      manageAlerts: true
+      prometheusType: Prometheus
+      prometheusVersion: 2.47.0
+      cacheLevel: 'High'
+      disableRecordingRules: false
+      incrementalQueryOverlapWindow: 10m
+
+  # QuestDB datasource for historical data queries (optional)
+  - name: QuestDB
+    type: postgres
+    uid: questdb
+    access: proxy
+    url: questdb:8812
+    user: admin
+    editable: true
+    jsonData:
+      database: qdb
+      sslmode: disable
+      maxOpenConns: 10
+      maxIdleConns: 5
+      connMaxLifetime: 14400
+      postgresVersion: 1200
+      timescaledb: false
+    secureJsonData:
+      password: quest

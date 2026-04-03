@@ -1,0 +1,23 @@
+# Grafana Dashboard Provisioning Configuration
+# This file configures Grafana to automatically load dashboards from the specified directory.
+#
+# Place this file in your Grafana provisioning directory:
+#   /etc/grafana/provisioning/dashboards/dashboards.yaml
+#
+# Or mount it via Docker:
+#   -v ./provisioning:/etc/grafana/provisioning
+
+apiVersion: 1
+
+providers:
+  - name: 'FKS Execution'
+    orgId: 1
+    folder: 'FKS'
+    folderUid: 'fks-execution'
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards/fks
+      foldersFromFilesStructure: false

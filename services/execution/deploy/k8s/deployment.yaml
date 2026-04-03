@@ -1,0 +1,113 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: execution-service
+  namespace: execution
+  labels:
+    app: execution-service
+    version: v1
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: execution-service
+  template:
+    metadata:
+      labels:
+        app: execution-service
+        version: v1
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8081"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+      - name: execution-service
+        image: execution-service:latest
+        imagePullPolicy: Always
+        ports:
+        - name: grpc
+          containerPort: 50052
+          protocol: TCP
+        - name: http
+          containerPort: 8081
+          protocol: TCP
+        envFrom:
+        - configMapRef:
+            name: execution-config
+        - secretRef:
+            name: execution-secrets
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "500m"
+          limits:
+            memory: "2Gi"
+            cpu: "2000m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8081
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8081
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1000
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: execution-service
+  namespace: execution
+  labels:
+    app: execution-service
+spec:
+  type: ClusterIP
+  selector:
+    app: execution-service
+  ports:
+  - name: grpc
+    port: 50052
+    targetPort: 50052
+    protocol: TCP
+  - name: http
+    port: 8081
+    targetPort: 8081
+    protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: execution-service-lb
+  namespace: execution
+  labels:
+    app: execution-service
+spec:
+  type: LoadBalancer
+  selector:
+    app: execution-service
+  ports:
+  - name: grpc
+    port: 50052
+    targetPort: 50052
+    protocol: TCP
+  - name: http
+    port: 8081
+    targetPort: 8081
+    protocol: TCP

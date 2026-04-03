@@ -1,0 +1,44 @@
+[package]
+name = "janus-rate-limiter"
+version = "0.1.0"
+edition = "2024"
+authors = ["nuniesmith"]
+license = "MIT"
+
+[lib]
+name = "janus_rate_limiter"
+path = "src/lib.rs"
+
+[dependencies]
+# Use workspace dependencies where available
+tokio = { workspace = true }
+parking_lot = "0.12.5"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+async-trait = "0.1.89"
+
+# HTTP client for examples
+reqwest = { workspace = true, optional = true }
+
+# Utilities
+rand = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio-util = "0.7.17"
+wiremock = "0.6.5"
+criterion = { version = "0.8.1", features = ["async_tokio"] }
+proptest = "1.9.0"
+reqwest = { workspace = true }
+rand = { workspace = true }
+
+[[bench]]
+name = "token_bucket"
+harness = false
+
+[features]
+default = []
+examples = ["reqwest", "rand"]

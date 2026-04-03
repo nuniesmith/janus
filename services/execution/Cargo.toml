@@ -1,0 +1,181 @@
+# ============================================================================
+# JANUS Execution Service
+# ============================================================================
+# Order execution, position management, and risk controls for the JANUS trading
+# system. Supports simulated, paper, and live trading modes.
+#
+# Part of the JANUS workspace (../../Cargo.toml)
+# ============================================================================
+
+[package]
+name = "janus-execution"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "janus_execution"
+path = "src/lib.rs"
+
+[[bin]]
+name = "janus-execution"
+path = "src/main.rs"
+
+[[example]]
+name = "paper_trading"
+path = "examples/paper_trading.rs"
+
+[[example]]
+name = "sim_environment"
+path = "examples/sim_environment.rs"
+
+[[example]]
+name = "data_pipeline"
+path = "examples/data_pipeline.rs"
+
+[[example]]
+name = "walk_forward_backtest"
+path = "examples/walk_forward_backtest.rs"
+
+[[example]]
+name = "questdb_walkforward"
+path = "examples/questdb_walkforward.rs"
+
+[[example]]
+name = "benchmark_optimization"
+path = "examples/benchmark_optimization.rs"
+
+[[bench]]
+name = "optimization_benchmark"
+harness = false
+
+[dependencies]
+# ---------------------------------------------------------------------------
+# Shared Proto Crate (from root workspace)
+# ---------------------------------------------------------------------------
+fks-proto = { workspace = true }
+
+# ---------------------------------------------------------------------------
+# JANUS Workspace Crates
+# ---------------------------------------------------------------------------
+janus-questdb-writer = { workspace = true }
+janus-risk = { workspace = true }
+janus-compliance = { workspace = true }
+janus-models = { workspace = true }
+
+# ---------------------------------------------------------------------------
+# Async Runtime
+# ---------------------------------------------------------------------------
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+tokio-stream = { version = "0.1.17", features = ["sync"] }
+futures-util = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+
+# ---------------------------------------------------------------------------
+# gRPC & Protobuf
+# ---------------------------------------------------------------------------
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
+
+# ---------------------------------------------------------------------------
+# HTTP & Web
+# ---------------------------------------------------------------------------
+reqwest = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+
+# ---------------------------------------------------------------------------
+# Serialization
+# ---------------------------------------------------------------------------
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# ---------------------------------------------------------------------------
+# Logging & Tracing
+# ---------------------------------------------------------------------------
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# ---------------------------------------------------------------------------
+# Error Handling
+# ---------------------------------------------------------------------------
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# ---------------------------------------------------------------------------
+# Database & State
+# ---------------------------------------------------------------------------
+redis = { workspace = true }
+
+# ---------------------------------------------------------------------------
+# Time & Date
+# ---------------------------------------------------------------------------
+chrono = { workspace = true }
+
+# ---------------------------------------------------------------------------
+# Cryptography (for exchange API signatures)
+# ---------------------------------------------------------------------------
+hmac = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+ring = { workspace = true }
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+config = { workspace = true }
+dotenvy = { workspace = true }
+
+# ---------------------------------------------------------------------------
+# Numeric Types (high precision for prices)
+# ---------------------------------------------------------------------------
+rust_decimal = { workspace = true }
+
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
+url = { workspace = true }
+bytes = { workspace = true }
+parking_lot = { workspace = true }
+uuid = { workspace = true }
+flume = { workspace = true }
+
+# ---------------------------------------------------------------------------
+# Metrics (Prometheus)
+# ---------------------------------------------------------------------------
+prometheus = { workspace = true }
+
+# ---------------------------------------------------------------------------
+# Parallelism
+# ---------------------------------------------------------------------------
+rayon = { workspace = true }
+
+# ---------------------------------------------------------------------------
+# Additional Dependencies
+# ---------------------------------------------------------------------------
+base64 = "0.22.1"
+flate2 = "1.0"
+
+[dev-dependencies]
+tokio-test = "0.4.4"
+mockito = "1.7.2"
+rust_decimal_macros = "1.39"
+tempfile = "3.10"
+criterion = "0.6.0"
+rand = { workspace = true }
+
+[build-dependencies]
+tonic-prost-build = { workspace = true }
+
+[features]
+default = []
+simulated = []  # Enable simulated trading mode
+paper = []      # Enable paper trading mode
+live = []       # Enable live trading mode

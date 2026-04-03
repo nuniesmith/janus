@@ -1,0 +1,19 @@
+[package]
+name = "janus-regime"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Market regime detection for JANUS trading system - indicator-based, HMM, and ensemble methods"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+rand = { workspace = true }
+
+[lib]
+name = "janus_regime"
+path = "src/lib.rs"

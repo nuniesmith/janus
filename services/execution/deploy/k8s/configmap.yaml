@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: execution-config
+  namespace: execution
+data:
+  RUST_LOG: "info,execution=debug"
+  REDIS_URL: "redis://redis-service:6379"
+  QUESTDB_HOST: "questdb-service"
+  QUESTDB_PORT: "9009"
+  GRPC_PORT: "50052"
+  HTTP_PORT: "8081"

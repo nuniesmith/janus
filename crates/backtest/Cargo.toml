@@ -1,0 +1,41 @@
+[package]
+name = "janus-backtest"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Core crates
+janus-models = { path = "../models" }
+janus-indicators = { path = "../indicators" }
+janus-strategies = { path = "../strategies" }
+janus-risk = { path = "../risk" }
+janus-compliance = { path = "../compliance" }
+janus-regime = { path = "../regime" }
+
+# Data processing
+polars = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Time
+chrono = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }
+approx = "0.5"
+tempfile = "3.8"

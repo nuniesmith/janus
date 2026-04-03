@@ -1,0 +1,12 @@
+[package]
+name = "janus-indicators"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+
+[lib]
+name = "janus_indicators"
+path = "src/lib.rs"

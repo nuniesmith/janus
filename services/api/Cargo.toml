@@ -1,0 +1,65 @@
+[package]
+name = "janus-gateway"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "High-performance Rust gateway for Project JANUS - replaces Python FastAPI"
+
+[[bin]]
+name = "janus-gateway"
+path = "src/main.rs"
+
+[dependencies]
+# Workspace dependencies
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+
+# Web framework
+axum = { workspace = true, features = ["ws", "macros"] }
+axum-extra = { version = "0.10", features = ["typed-header"] }
+tower = { version = "0.5", features = ["timeout", "limit", "util"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip", "fs"] }
+hyper = { version = "1.6", features = ["full"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+
+# gRPC
+tonic = { workspace = true, features = ["gzip", "channel"] }
+tonic-web = "0.14"
+prost = { workspace = true }
+prost-types = { workspace = true }
+
+# Redis
+redis = { workspace = true, features = ["tokio-comp", "connection-manager"] }
+
+# Configuration
+config = { workspace = true }
+dotenvy = "0.15"
+
+# Metrics (using workspace prometheus which is stable)
+prometheus = { workspace = true }
+
+# Rate limiting
+governor = "0.8"
+
+# Password hashing (Authelia compatible)
+argon2 = { version = "0.5", features = ["std"] }
+
+# Internal crates
+fks-proto = { workspace = true }
+common = { path = "../../crates/common" }
+
+[build-dependencies]
+tonic-build = { workspace = true }
+prost-build = "0.14"
+
+[dev-dependencies]
+tokio-test = "0.4"

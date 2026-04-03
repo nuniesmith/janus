@@ -1,0 +1,270 @@
+# FKS DataRecorder Prometheus Alerting Rules
+#
+# These rules monitor the health and performance of the DataRecorder component.
+# Place this file in your Prometheus rules directory:
+#   /etc/prometheus/rules/fks-recorder-alerts.yaml
+#
+# Or reference it in prometheus.yml:
+#   rule_files:
+#     - /path/to/alert-rules.yaml
+
+groups:
+  - name: fks_recorder_health
+    interval: 30s
+    rules:
+      # ============================================================================
+      # Critical Alerts - Immediate attention required
+      # ============================================================================
+
+      - alert: RecorderUnhealthy
+        expr: sim_recorder_healthy == 0
+        for: 1m
+        labels:
+          severity: critical
+          component: data-recorder
+        annotations:
+          summary: "DataRecorder {{ $labels.instance }} is unhealthy"
+          description: |
+            The DataRecorder instance {{ $labels.instance }} has been in an unhealthy state for more than 1 minute.
+            This typically indicates connection issues, high error rates, or data loss.
+            Current health status: {{ $value }}
+          runbook_url: "https://docs.fks.io/runbooks/recorder-unhealthy"
+
+      - alert: RecorderDisconnected
+        expr: sim_recorder_connected == 0
+        for: 2m
+        labels:
+          severity: critical
+          component: data-recorder
+        annotations:
+          summary: "DataRecorder {{ $labels.instance }} disconnected from QuestDB"
+          description: |
+            The DataRecorder instance {{ $labels.instance }} has been disconnected from QuestDB for more than 2 minutes.
+            Events may be buffered locally or dropped if buffer overflows.
+            Check QuestDB availability and network connectivity.
+          runbook_url: "https://docs.fks.io/runbooks/recorder-disconnected"
+
+      - alert: RecorderHighDropRate
+        expr: sim_recorder_drop_rate_pct > 1
+        for: 2m
+        labels:
+          severity: critical
+          component: data-recorder
+        annotations:
+          summary: "DataRecorder {{ $labels.instance }} dropping events ({{ printf \"%.2f\" $value }}%)"
+          description: |
+            The DataRecorder instance {{ $labels.instance }} is dropping more than 1% of events.
+            Current drop rate: {{ printf "%.2f" $value }}%
+            This indicates buffer overflow - increase buffer size or investigate slow writes.
+          runbook_url: "https://docs.fks.io/runbooks/recorder-drop-rate"
+
+      # ============================================================================
+      # Warning Alerts - Attention needed but not critical
+      # ============================================================================
+
+      - alert: RecorderHighBufferUtilization
+        expr: sim_recorder_buffer_utilization_pct > 80
+        for: 5m
+        labels:
+          severity: warning
+          component: data-recorder
+        annotations:
+          summary: "DataRecorder {{ $labels.instance }} buffer utilization high ({{ printf \"%.1f\" $value }}%)"
+          description: |
+            The DataRecorder instance {{ $labels.instance }} buffer utilization is above 80%.
+            Current utilization: {{ printf "%.1f" $value }}%
+            Buffer depth: {{ with query "sim_recorder_buffer_depth{instance='$labels.instance'}" }}{{ . | first | value }}{{ end }}
+            Consider increasing batch size or flush frequency.
+          runbook_url: "https://docs.fks.io/runbooks/recorder-buffer-high"
+
+      - alert: RecorderHighChannelUtilization
+        expr: sim_recorder_channel_utilization_pct > 75
+        for: 5m
+        labels:
+          severity: warning
+          component: data-recorder
+        annotations:
+          summary: "DataRecorder {{ $labels.instance }} channel utilization high ({{ printf \"%.1f\" $value }}%)"
+          description: |
+            The DataRecorder instance {{ $labels.instance }} channel utilization is above 75%.
+            Current utilization: {{ printf "%.1f" $value }}%
+            This indicates the writer is not keeping up with incoming events.
+          runbook_url: "https://docs.fks.io/runbooks/recorder-channel-high"
+
+      - alert: RecorderHighErrorRate
+        expr: sim_recorder_error_rate_pct > 5
+        for: 5m
+        labels:
+          severity: warning
+          component: data-recorder
+        annotations:
+          summary: "DataRecorder {{ $labels.instance }} error rate high ({{ printf \"%.2f\" $value }}%)"
+          description: |
+            The DataRecorder instance {{ $labels.instance }} has an error rate above 5%.
+            Current error rate: {{ printf "%.2f" $value }}%
+            Total write errors: {{ with query "sim_recorder_write_errors_total{instance='$labels.instance'}" }}{{ . | first | value }}{{ end }}
+          runbook_url: "https://docs.fks.io/runbooks/recorder-error-rate"
+
+      - alert: RecorderFrequentReconnections
+        expr: increase(sim_recorder_reconnections_total[5m]) > 5
+        for: 0s
+        labels:
+          severity: warning
+          component: data-recorder
+        annotations:
+          summary: "DataRecorder {{ $labels.instance }} reconnecting frequently"
+          description: |
+            The DataRecorder instance {{ $labels.instance }} has reconnected more than 5 times in the last 5 minutes.
+            Reconnection count in last 5m: {{ printf "%.0f" $value }}
+            Check network stability and QuestDB health.
+          runbook_url: "https://docs.fks.io/runbooks/recorder-reconnections"
+
+      - alert: RecorderLowThroughput
+        expr: |
+          sim_recorder_events_per_second < 1
+          and sim_recorder_connected == 1
+          and sim_recorder_healthy == 1
+        for: 10m
+        labels:
+          severity: warning
+          component: data-recorder
+        annotations:
+          summary: "DataRecorder {{ $labels.instance }} has low throughput"
+          description: |
+            The DataRecorder instance {{ $labels.instance }} is recording fewer than 1 event per second.
+            Current rate: {{ printf "%.2f" $value }} events/sec
+            If this is unexpected, check data feed connections.
+          runbook_url: "https://docs.fks.io/runbooks/recorder-low-throughput"
+
+      # ============================================================================
+      # Fallback Storage Alerts
+      # ============================================================================
+
+      - alert: RecorderFallbackActive
+        expr: sim_recorder_fallback_active == 1
+        for: 1m
+        labels:
+          severity: warning
+          component: data-recorder
+        annotations:
+          summary: "DataRecorder {{ $labels.instance }} using fallback storage"
+          description: |
+            The DataRecorder instance {{ $labels.instance }} is writing to local fallback storage.
+            This indicates QuestDB is unavailable or experiencing issues.
+            Events written to fallback: {{ with query "sim_recorder_fallback_events_total{instance='$labels.instance'}" }}{{ . | first | value }}{{ end }}
+            Fallback bytes: {{ with query "sim_recorder_fallback_bytes_total{instance='$labels.instance'}" }}{{ . | first | value | humanize1024 }}B{{ end }}
+          runbook_url: "https://docs.fks.io/runbooks/recorder-fallback-active"
+
+      - alert: RecorderFallbackGrowing
+        expr: rate(sim_recorder_fallback_bytes_total[5m]) > 10485760
+        for: 5m
+        labels:
+          severity: warning
+          component: data-recorder
+        annotations:
+          summary: "DataRecorder {{ $labels.instance }} fallback storage growing rapidly"
+          description: |
+            The DataRecorder instance {{ $labels.instance }} fallback storage is growing at more than 10MB/min.
+            Current rate: {{ printf "%.2f" $value | humanize }}B/s
+            Total fallback bytes: {{ with query "sim_recorder_fallback_bytes_total{instance='$labels.instance'}" }}{{ . | first | value | humanize1024 }}B{{ end }}
+            Ensure QuestDB connectivity is restored soon to replay fallback data.
+          runbook_url: "https://docs.fks.io/runbooks/recorder-fallback-growing"
+
+      - alert: RecorderFallbackErrors
+        expr: increase(sim_recorder_fallback_errors_total[5m]) > 0
+        for: 0s
+        labels:
+          severity: critical
+          component: data-recorder
+        annotations:
+          summary: "DataRecorder {{ $labels.instance }} fallback write errors"
+          description: |
+            The DataRecorder instance {{ $labels.instance }} is experiencing errors writing to fallback storage.
+            This means events may be lost entirely as both QuestDB and fallback are failing.
+            Errors in last 5m: {{ printf "%.0f" $value }}
+            IMMEDIATE ACTION REQUIRED: Check disk space and permissions.
+          runbook_url: "https://docs.fks.io/runbooks/recorder-fallback-errors"
+
+      - alert: RecorderFallbackDiskUsageHigh
+        expr: sim_recorder_fallback_bytes_total > 1073741824
+        for: 5m
+        labels:
+          severity: warning
+          component: data-recorder
+        annotations:
+          summary: "DataRecorder {{ $labels.instance }} fallback storage exceeds 1GB"
+          description: |
+            The DataRecorder instance {{ $labels.instance }} has accumulated more than 1GB of fallback data.
+            Current fallback size: {{ $value | humanize1024 }}B
+            Events in fallback: {{ with query "sim_recorder_fallback_events_total{instance='$labels.instance'}" }}{{ . | first | value | humanize }}{{ end }}
+            Plan to replay this data to QuestDB once connectivity is restored.
+          runbook_url: "https://docs.fks.io/runbooks/recorder-fallback-disk"
+
+      # ============================================================================
+      # Capacity Planning Alerts
+      # ============================================================================
+
+      - alert: RecorderHighWriteVolume
+        expr: rate(sim_recorder_bytes_written_total[5m]) > 104857600
+        for: 10m
+        labels:
+          severity: info
+          component: data-recorder
+        annotations:
+          summary: "DataRecorder {{ $labels.instance }} high write volume ({{ $value | humanize }}B/s)"
+          description: |
+            The DataRecorder instance {{ $labels.instance }} is writing more than 100MB/s.
+            Current rate: {{ $value | humanize }}B/s
+            This is informational - ensure QuestDB can handle this volume.
+          runbook_url: "https://docs.fks.io/runbooks/recorder-high-volume"
+
+      - alert: RecorderNoEventsRecorded
+        expr: |
+          increase(sim_recorder_events_recorded_total[10m]) == 0
+          and sim_recorder_healthy == 1
+        for: 10m
+        labels:
+          severity: warning
+          component: data-recorder
+        annotations:
+          summary: "DataRecorder {{ $labels.instance }} has recorded no events in 10 minutes"
+          description: |
+            The DataRecorder instance {{ $labels.instance }} is healthy but has not recorded any events
+            in the last 10 minutes. Check if data feeds are connected and sending data.
+          runbook_url: "https://docs.fks.io/runbooks/recorder-no-events"
+
+  # ============================================================================
+  # Recording Rules (for dashboard efficiency)
+  # ============================================================================
+  - name: fks_recorder_recording_rules
+    interval: 30s
+    rules:
+      # Pre-compute rates for dashboard efficiency
+      - record: fks:recorder:events_rate_5m
+        expr: rate(sim_recorder_events_recorded_total[5m])
+
+      - record: fks:recorder:bytes_rate_5m
+        expr: rate(sim_recorder_bytes_written_total[5m])
+
+      - record: fks:recorder:drop_rate_5m
+        expr: rate(sim_recorder_events_dropped_total[5m])
+
+      - record: fks:recorder:error_rate_5m
+        expr: rate(sim_recorder_write_errors_total[5m])
+
+      - record: fks:recorder:fallback_events_rate_5m
+        expr: rate(sim_recorder_fallback_events_total[5m])
+
+      - record: fks:recorder:fallback_bytes_rate_5m
+        expr: rate(sim_recorder_fallback_bytes_total[5m])
+
+      # Aggregated health score (0-100)
+      - record: fks:recorder:health_score
+        expr: |
+          (
+            (sim_recorder_connected * 30) +
+            ((100 - sim_recorder_buffer_utilization_pct) * 0.2) +
+            ((100 - sim_recorder_channel_utilization_pct) * 0.2) +
+            ((100 - clamp_max(sim_recorder_drop_rate_pct * 10, 100)) * 0.15) +
+            ((100 - clamp_max(sim_recorder_error_rate_pct * 5, 100)) * 0.15)
+          )

@@ -1,0 +1,24 @@
+[package]
+name = "janus-api"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+janus-core.workspace = true
+
+tokio.workspace = true
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+prometheus.workspace = true
+redis.workspace = true
+
+[dev-dependencies]
+http-body-util = "0.1"
+http = "1"

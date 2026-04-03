@@ -1,0 +1,35 @@
+# Grafana dashboard provisioning for JANUS Regime Monitor
+#
+# Mount this file into the Grafana container at:
+#   /etc/grafana/provisioning/dashboards/janus.yml
+#
+# And mount the dashboard JSON directory at:
+#   /var/lib/grafana/dashboards/janus/
+#
+# Docker Compose volume example:
+#
+#   grafana:
+#     image: grafana/grafana:10.4.0
+#     volumes:
+#       - ./grafana/provisioning-dashboards.yml:/etc/grafana/provisioning/dashboards/janus.yml:ro
+#       - ./grafana:/var/lib/grafana/dashboards/janus:ro
+#       - grafana-data:/var/lib/grafana
+#     environment:
+#       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+#     ports:
+#       - "3000:3000"
+
+apiVersion: 1
+
+providers:
+  - name: JANUS
+    orgId: 1
+    folder: JANUS
+    folderUid: janus
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards/janus
+      foldersFromFilesStructure: false

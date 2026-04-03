@@ -1,0 +1,82 @@
+[package]
+name = "janus-optimizer"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Hyperparameter optimization for JANUS trading strategies"
+
+[[bin]]
+name = "optimizer-runner"
+path = "src/bin/optimizer_runner.rs"
+
+[dependencies]
+# Internal crates
+janus-core = { workspace = true }
+janus-backtest = { workspace = true }
+janus-indicators = { workspace = true }
+janus-strategies = { workspace = true }
+janus-models = { workspace = true }
+
+# Data processing
+polars = { workspace = true }
+ndarray = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+
+# Time
+chrono = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Random number generation
+rand = { workspace = true }
+
+# Parallel processing
+rayon = { workspace = true }
+
+# Redis for publishing results
+redis = { workspace = true }
+
+# Statistics
+statrs = { workspace = true }
+
+# UUID for optimization run IDs
+uuid = { workspace = true }
+
+# CLI
+clap = { version = "4.5", features = ["derive", "env"] }
+
+# Metrics
+prometheus = { workspace = true }
+
+# HTTP server for metrics
+axum = { workspace = true }
+
+# Signal handling
+ctrlc = "3.4"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }
+approx = "0.5"
+tempfile = "3.8"
+
+[features]
+default = []
+# Enable Redis publishing
+redis-publish = []
+# Enable parallel optimization
+parallel = []

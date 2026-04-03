@@ -1,0 +1,45 @@
+[package]
+name = "logic"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Neuro-Symbolic Logic for Project JANUS - Differentiable Logic Tensor Networks"
+
+[features]
+default = ["cpu"]
+cpu = []
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
+metal = ["candle-core/metal", "candle-nn/metal"]
+
+[dependencies]
+# Internal crates
+common = { path = "../common" }
+
+# ML Framework (Candle from HuggingFace) - for differentiable LTN
+candle-core = { workspace = true }
+candle-nn = { workspace = true }
+
+# Numerical computing (for non-differentiable ops and interop)
+ndarray = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Time and date handling
+chrono = { workspace = true }
+
+# UUID for unique identifiers
+uuid = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }

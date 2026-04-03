@@ -1,0 +1,99 @@
+[package]
+name = "janus-neuromorphic"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Experimental neuromorphic computing modules for Janus trading brain"
+
+[lib]
+name = "janus_neuromorphic"
+path = "lib.rs"
+
+[dependencies]
+common = { path = "../crates/common" }
+thiserror = "2.0.17"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { workspace = true }
+rand = "0.10.0"
+tracing = { workspace = true }
+async-trait = "0.1"
+chrono = { workspace = true }
+anyhow = { workspace = true }
+uuid = { workspace = true }
+
+# HTTP client for external data sources
+reqwest = { workspace = true }
+url = "2.5"
+
+# Configuration management
+toml = { workspace = true }
+
+# Redis cache for API responses
+redis = { workspace = true }
+
+# Phase 1: ONNX Inference Pipeline
+# ort = { workspace = true }  # Optional: ONNX Runtime (versions yanked, use tract-onnx instead)
+ndarray = { workspace = true }
+
+# Phase 2: Vector Database
+qdrant-client = { workspace = true }
+postcard = { workspace = true }
+
+# Memory crate (Qdrant production client, replay buffer)
+memory = { path = "../crates/memory" }
+
+# ML Framework (optional, for training)
+candle-core = { workspace = true }
+candle-nn = { workspace = true }
+
+# DSP / Signal Processing (Hilbert transform for amplitude/frequency/phase)
+rustfft = { workspace = true }
+num-complex = { workspace = true }
+
+# Parallel processing for GAF encoding
+rayon = { workspace = true }
+
+# CSV parsing for market data
+csv = "1.3"
+
+# Cryptography (checksum verification)
+sha2 = { workspace = true }
+hex = { workspace = true }
+
+# Hostname detection for distributed runtime
+hostname = "0.4.2"
+
+# gRPC for distributed training (using centralized proto crate)
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
+prost = "0.14"
+prost-types = "0.14"
+
+# Centralized proto definitions
+fks-proto = { path = "../../../src/proto" }
+
+# NCCL bindings for GPU communication
+cudarc = { version = "0.18.2", features = ["nccl", "cuda-12050"], optional = true }
+
+# CPU detection
+num_cpus = "1.16"
+
+[dev-dependencies]
+tokio-test = "0.4"
+tempfile = "3.8"
+tracing-subscriber = { workspace = true }
+wiremock = "0.6.5"
+
+[features]
+default = []
+# `cuda` enables candle's CUDA backend (uses precompiled PTX — no nvcc needed).
+# Use this for GPU inference and the full-size ViViT forward-pass test.
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
+# `metal` enables candle's Metal backend for Apple Silicon.
+metal = ["candle-core/metal", "candle-nn/metal"]
+# `nccl` additionally pulls in cudarc for custom CUDA kernels / multi-GPU
+# collective ops.  Requires nvcc + the full CUDA toolkit at build time.
+nccl = ["cuda", "cudarc", "cudarc/nccl"]

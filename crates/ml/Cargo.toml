@@ -1,0 +1,82 @@
+[package]
+name = "janus-ml"
+version = "2.0.0"
+edition = "2024"
+authors = ["nuniesmith"]
+description = "Machine learning models and inference for JANUS trading system"
+license = "MIT"
+
+[dependencies]
+# Burn ML framework - using individual crates to avoid SQLite conflict
+# We use burn-core and burn-ndarray directly, implementing our own training loop
+burn-core = { version = "0.19", features = ["std"], default-features = false }
+burn-ndarray = { version = "0.19", default-features = false }
+burn-autodiff = { version = "0.19", default-features = false }
+burn-nn = { version = "0.19", default-features = false }
+# Full burn crate for optimizer support
+burn = { version = "0.19", default-features = false, features = ["ndarray", "train"] }
+
+# Optional GPU support
+burn-wgpu = { version = "0.19", optional = true }
+
+# Numerical computing
+ndarray = "0.15"
+ndarray-stats = "0.5"
+
+# Technical analysis
+ta = "0.5"
+
+# Random number generation
+rand = "0.10.0"
+
+# Async runtime
+tokio = { version = "1.42", features = ["full"] }
+async-trait = "0.1"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+postcard = { version = "1.1", features = ["alloc"] }
+
+# Decimal handling
+rust_decimal = "1.39"
+
+# Parquet/Arrow for data loading
+parquet = { version = "54", default-features = false, features = ["arrow"] }
+arrow = { version = "54", default-features = false, features = ["chrono-tz"] }
+
+# Time handling
+chrono = { version = "0.4", features = ["serde"] }
+
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Logging
+tracing = "0.1"
+
+# JANUS dependencies
+janus-core = { path = "../../lib/janus-core" }
+janus-data-quality = { path = "../data-quality" }
+
+[dev-dependencies]
+criterion = "0.5"
+approx = "0.5"
+tempfile = "3.13"
+tracing-subscriber = "0.3"
+wgpu = "23.0"
+pollster = "0.3"
+
+[features]
+default = ["cpu"]
+cpu = []
+gpu = ["burn-wgpu"]
+
+# TODO: Uncomment when benchmarks are implemented
+# [[bench]]
+# name = "feature_extraction"
+# harness = false
+#
+# [[bench]]
+# name = "model_inference"
+# harness = false

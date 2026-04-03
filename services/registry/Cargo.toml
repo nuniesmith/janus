@@ -1,0 +1,59 @@
+[package]
+name = "janus-registry-service"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Asset registry REST API service for JANUS trading system"
+
+[[bin]]
+name = "janus-registry"
+path = "src/main.rs"
+
+[dependencies]
+# Internal registry library
+janus-registry-lib = { path = "../../crates/registry" }
+
+# Workspace dependencies
+janus-core = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+async-trait = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# HTTP server
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+
+# Time
+chrono = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Configuration
+config = { workspace = true }
+dotenvy = { workspace = true }
+
+# HTTP client (Python registry sync)
+reqwest = { workspace = true }
+
+# Metrics
+prometheus = { workspace = true }
+
+# Utilities
+uuid = { workspace = true }
+
+[dev-dependencies]
+tokio-test = "0.4.4"

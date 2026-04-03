@@ -1,0 +1,402 @@
+// ============================================================================
+// LOCAL PROTO — Centralization DEFERRED (STRUCT-C)
+//
+// This file defines the JanusService (signal generation API) for the
+// forward service. It lives here as a local compile target because:
+//   1. It uses package `janus.v1` (not `fks.janus.v1`) — a naming divergence
+//      from the centralized proto layout.
+//   2. `api/grpc.rs` includes it via `tonic::include_proto!("janus.v1")`.
+//
+// DEFERRED(STRUCT-C): Consolidation is safe to do but is NOT being done now
+//   because GrpcServer (api/grpc.rs) is confirmed dead code — it is compiled
+//   in but never started in main.rs (no GrpcServer::new() / ::start() call
+//   exists anywhere outside of api/grpc.rs itself, including in main.rs).
+//
+//   Prerequisites before consolidating:
+//     1. Decide whether JanusService belongs in the forward binary at all, or
+//        if it should move to a dedicated janus-signal service.
+//     2. If keeping: wire GrpcServer::start() into main.rs and choose a port.
+//     3. Then: move to `proto/fks/janus/v1/signal_service.proto` with package
+//        `fks.janus.v1`, update `tonic::include_proto!` in `src/api/grpc.rs`,
+//        remove this file, and stop compiling it in build.rs.
+//
+//   Audited: 2026-03-26 — no live server, deferral confirmed safe.
+// ============================================================================
+syntax = "proto3";
+
+package janus.v1;
+
+// JANUS Signal Generation Service
+// Provides trading signal generation using technical analysis and ML models
+service JanusService {
+  // Generate a single trading signal
+  rpc GenerateSignal(GenerateSignalRequest) returns (GenerateSignalResponse);
+
+  // Generate signals for multiple symbols in batch
+  rpc GenerateSignalBatch(GenerateSignalBatchRequest) returns (GenerateSignalBatchResponse);
+
+  // Get service health status
+  rpc GetHealth(HealthRequest) returns (HealthResponse);
+
+  // Get service metrics
+  rpc GetMetrics(MetricsRequest) returns (MetricsResponse);
+
+  // Load an ML model
+  rpc LoadModel(LoadModelRequest) returns (LoadModelResponse);
+
+  // Stream real-time signals (not yet implemented)
+  rpc StreamSignals(StreamSignalsRequest) returns (stream SignalUpdate);
+}
+
+// ============================================================================
+// Signal Generation
+// ============================================================================
+
+message GenerateSignalRequest {
+  // Trading symbol (e.g., "BTCUSD")
+  string symbol = 1;
+
+  // Timeframe (e.g., "1m", "5m", "1h")
+  int32 timeframe = 2;
+
+  // Current market price
+  double current_price = 3;
+
+  // Indicator analysis data
+  IndicatorAnalysis analysis = 4;
+}
+
+message GenerateSignalResponse {
+  // Generated trading signal (null if filtered)
+  TradingSignal signal = 1;
+
+  // Whether signal was filtered out
+  bool filtered = 2;
+
+  // Processing time in microseconds
+  uint64 processing_time_us = 3;
+
+  // Warning messages
+  repeated string warnings = 4;
+}
+
+message GenerateSignalBatchRequest {
+  // List of signal generation requests
+  repeated GenerateSignalRequest requests = 1;
+}
+
+message GenerateSignalBatchResponse {
+  // Individual responses for each request
+  repeated GenerateSignalResponse responses = 1;
+
+  // Total processing time for batch
+  uint64 total_processing_time_us = 2;
+
+  // Batch statistics
+  BatchStatistics statistics = 3;
+}
+
+message BatchStatistics {
+  // Total number of requests
+  uint32 total_requests = 1;
+
+  // Successfully generated signals
+  uint32 successful = 2;
+
+  // Filtered signals
+  uint32 filtered = 3;
+
+  // Failed requests
+  uint32 failed = 4;
+
+  // Success rate (0.0 to 1.0)
+  double success_rate = 5;
+}
+
+// ============================================================================
+// Health & Metrics
+// ============================================================================
+
+message HealthRequest {}
+
+message HealthResponse {
+  // Service name
+  string service = 1;
+
+  // Service version
+  string version = 2;
+
+  // Health status
+  HealthStatus status = 3;
+
+  // Uptime in seconds
+  uint64 uptime_seconds = 4;
+
+  // Signal generation metrics
+  SignalMetrics signal_metrics = 5;
+
+  // ML model metrics
+  MlMetrics ml_metrics = 6;
+}
+
+message MetricsRequest {}
+
+message MetricsResponse {
+  // Signal generation metrics
+  SignalMetrics signal_metrics = 1;
+
+  // ML model metrics
+  MlMetrics ml_metrics = 2;
+
+  // Per-strategy metrics
+  map<string, StrategyMetrics> strategy_metrics = 3;
+
+  // Indicator metrics
+  IndicatorMetrics indicator_metrics = 4;
+}
+
+message SignalMetrics {
+  // Total signals generated
+  uint64 total_generated = 1;
+
+  // Total signals filtered
+  uint64 total_filtered = 2;
+
+  // Filter rate (0.0 to 1.0)
+  double filter_rate = 3;
+}
+
+message MlMetrics {
+  // Total ML inferences
+  uint64 total_inferences = 1;
+
+  // Average inference latency (microseconds)
+  uint64 avg_latency_us = 2;
+
+  // P99 inference latency (microseconds)
+  uint64 p99_latency_us = 3;
+
+  // Average confidence score
+  double avg_confidence = 4;
+}
+
+message IndicatorMetrics {
+  // Total indicator updates
+  uint64 total_updates = 1;
+
+  // Average update time (microseconds)
+  uint64 avg_update_time_us = 2;
+}
+
+message StrategyMetrics {
+  // Strategy name
+  string name = 1;
+
+  // Signals generated by this strategy
+  uint64 signals_generated = 2;
+
+  // Win rate
+  double win_rate = 3;
+
+  // Total P&L
+  double total_pnl = 4;
+}
+
+// ============================================================================
+// Model Management
+// ============================================================================
+
+message LoadModelRequest {
+  // Model name/identifier
+  string model_name = 1;
+
+  // Path to model file
+  string model_path = 2;
+}
+
+message LoadModelResponse {
+  // Success flag
+  bool success = 1;
+
+  // Error message (if failed)
+  string error = 2;
+
+  // Model information
+  ModelInfo model_info = 3;
+}
+
+message ModelInfo {
+  // Model name
+  string name = 1;
+
+  // Model version
+  string version = 2;
+
+  // Model size in bytes
+  uint64 size_bytes = 3;
+
+  // Timestamp when loaded
+  int64 loaded_at = 4;
+}
+
+// ============================================================================
+// Signal Streaming
+// ============================================================================
+
+message StreamSignalsRequest {
+  // Symbols to stream (empty = all)
+  repeated string symbols = 1;
+
+  // Timeframes to include
+  repeated int32 timeframes = 2;
+}
+
+message SignalUpdate {
+  // Generated signal
+  TradingSignal signal = 1;
+
+  // Update timestamp
+  int64 timestamp = 2;
+
+  // Source strategy
+  string strategy = 3;
+}
+
+// ============================================================================
+// Core Data Types
+// ============================================================================
+
+message TradingSignal {
+  // Unique signal identifier
+  string signal_id = 1;
+
+  // Trading symbol
+  string symbol = 2;
+
+  // Signal type
+  SignalType signal_type = 3;
+
+  // Timeframe
+  int32 timeframe = 4;
+
+  // Signal strength (0.0 to 1.0)
+  double strength = 5;
+
+  // Confidence score (0.0 to 1.0)
+  double confidence = 6;
+
+  // Signal source information
+  SignalSource source = 7;
+
+  // Signal timestamp
+  int64 timestamp = 8;
+
+  // Metadata (key-value pairs)
+  map<string, string> metadata = 9;
+
+  // Stop loss price (optional)
+  double stop_loss = 10;
+
+  // Take profit price (optional)
+  double take_profit = 11;
+
+  // Risk/reward ratio
+  double risk_reward_ratio = 12;
+
+  // Entry price
+  double entry_price = 13;
+
+  // Position size
+  double position_size = 14;
+
+  // Reasoning/rationale
+  string reasoning = 15;
+
+  // Indicator analysis used
+  IndicatorAnalysis indicator_analysis = 16;
+}
+
+message IndicatorAnalysis {
+  // EMA indicators
+  double ema_fast = 1;
+  double ema_slow = 2;
+  double ema_cross = 3;
+
+  // RSI indicators
+  double rsi = 4;
+  double rsi_signal = 5;
+
+  // MACD indicators
+  double macd_line = 6;
+  double macd_signal = 7;
+  double macd_histogram = 8;
+  double macd_cross = 9;
+
+  // Bollinger Bands
+  double bb_upper = 10;
+  double bb_middle = 11;
+  double bb_lower = 12;
+  double bb_position = 13;
+
+  // ATR (Average True Range)
+  double atr = 14;
+
+  // Trend and volatility
+  double trend_strength = 15;
+  double volatility = 16;
+}
+message SignalSource {
+  oneof source {
+    TechnicalIndicatorSource technical_indicator = 1;
+    MlModelSource ml_model = 2;
+    StrategySource strategy = 3;
+    ManualSource manual = 4;
+  }
+}
+
+message TechnicalIndicatorSource {
+  string name = 1;
+}
+
+message MlModelSource {
+  string model_name = 1;
+  string version = 2;
+}
+
+message StrategySource {
+  string name = 1;
+}
+
+message ManualSource {
+  string user_id = 1;
+}
+
+// ============================================================================
+// Enums
+// ============================================================================
+
+enum SignalType {
+  SIGNAL_TYPE_UNSPECIFIED = 0;
+  STRONG_BUY = 1;
+  BUY = 2;
+  HOLD = 3;
+  SELL = 4;
+  STRONG_SELL = 5;
+}
+
+enum HealthStatus {
+  HEALTH_STATUS_UNSPECIFIED = 0;
+  HEALTHY = 1;
+  DEGRADED = 2;
+  UNHEALTHY = 3;
+}
+
+enum Timeframe {
+  TIMEFRAME_UNSPECIFIED = 0;
+  TIMEFRAME_1M = 1;
+  TIMEFRAME_5M = 5;
+  TIMEFRAME_15M = 15;
+  TIMEFRAME_1H = 60;
+  TIMEFRAME_4H = 240;
+  TIMEFRAME_1D = 1440;
+}

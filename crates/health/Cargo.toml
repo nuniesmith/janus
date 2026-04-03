@@ -1,0 +1,37 @@
+[package]
+name = "janus-health"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# HTTP server
+axum = { workspace = true }
+tower = "0.5.2"
+tower-http = { version = "0.6.8", features = ["trace", "cors"] }
+
+# Metrics
+prometheus = "0.14.0"
+
+# Async runtime
+tokio = { workspace = true, features = ["full"] }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Time
+chrono = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }
+reqwest = { workspace = true }

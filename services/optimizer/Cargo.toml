@@ -1,0 +1,84 @@
+[package]
+name = "janus-optimizer-service"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "JANUS Parameter Optimization Service - Automated strategy tuning with Redis hot-reload"
+
+[[bin]]
+name = "janus-optimizer"
+path = "src/main.rs"
+
+[dependencies]
+# Internal JANUS crates
+janus-core = { workspace = true }
+janus-optimizer = { workspace = true }
+janus-indicators = { workspace = true }
+janus-cns = { workspace = true }
+janus-exchanges = { workspace = true, features = ["kraken"] }
+
+# Async runtime
+tokio = { workspace = true, features = ["full", "signal"] }
+futures-util = { workspace = true }
+
+# HTTP client for Kraken REST API
+reqwest = { workspace = true, features = ["json"] }
+
+# Serialization
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+toml = { workspace = true }
+
+# Time
+chrono = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Configuration
+config = { workspace = true }
+dotenvy = { workspace = true }
+
+# Redis for param publishing
+redis = { workspace = true }
+
+# Data processing
+polars = { workspace = true, features = ["lazy", "temporal", "parquet", "ipc"] }
+
+# Metrics (Prometheus)
+prometheus = { workspace = true }
+
+# HTTP server for metrics/health
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true, features = ["cors", "trace"] }
+
+# Scheduling
+tokio-cron-scheduler = "0.13"
+
+# Database (SQLite for OHLC storage)
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
+
+# Utilities
+uuid = { workspace = true }
+parking_lot = { workspace = true }
+
+# CLI
+clap = { version = "4.4", features = ["derive", "env"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }
+tempfile = "3.8"
+mockito = "1.7"
+
+[features]
+default = ["metrics"]
+metrics = []
+debug = []

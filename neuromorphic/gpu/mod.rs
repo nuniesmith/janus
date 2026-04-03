@@ -1,0 +1,100 @@
+//! GPU Compute Infrastructure (wgpu)
+//!
+//! Provides custom GPU compute kernels via wgpu for accelerating
+//! numerically intensive operations that currently run on CPU.
+//!
+//! # Architecture
+//!
+//! ```text
+//! ┌─────────────────────────────────────────────────────────────────┐
+//! │                    GPU Compute Layer (wgpu)                      │
+//! ├─────────────────────────────────────────────────────────────────┤
+//! │                                                                  │
+//! │  ┌──────────────┐    ┌──────────────┐    ┌─────────────────┐   │
+//! │  │ Device       │    │ Buffer       │    │ Kernel          │   │
+//! │  │ Manager      │───▶│ Pool         │───▶│ Registry        │   │
+//! │  │ (Adapter +   │    │ (Alloc +     │    │ (Shader compile │   │
+//! │  │  Queue)      │    │  Transfer)   │    │  + Dispatch)    │   │
+//! │  └──────────────┘    └──────────────┘    └────────┬────────┘   │
+//! │                                                    │            │
+//! │  ┌─────────────────────────────────────────────────▼────────┐  │
+//! │  │                  Compute Pipelines                        │  │
+//! │  │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌────────────┐  │  │
+//! │  │  │ MatMul   │ │ Softmax  │ │ LayerNorm│ │ Attention  │  │  │
+//! │  │  │ Kernel   │ │ Kernel   │ │ Kernel   │ │ Kernel     │  │  │
+//! │  │  └──────────┘ └──────────┘ └──────────┘ └────────────┘  │  │
+//! │  │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌────────────┐  │  │
+//! │  │  │ GELU     │ │ Reduce   │ │ Embedding│ │ Pairwise   │  │  │
+//! │  │  │ Kernel   │ │ Kernel   │ │ Lookup   │ │ Distance   │  │  │
+//! │  │  └──────────┘ └──────────┘ └──────────┘ └────────────┘  │  │
+//! │  └──────────────────────────────────────────────────────────┘  │
+//! │                              │                                   │
+//! │                              ▼                                   │
+//! │  ┌──────────────────────────────────────────────────────────┐   │
+//! │  │  Candle Tensor Bridge (CPU ↔ GPU data transfer)          │   │
+//! │  └──────────────────────────────────────────────────────────┘   │
+//! └─────────────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! # Feature Gating
+//!
+//! All wgpu functionality is gated behind the `gpu` feature flag.
+//! When the feature is disabled, this module provides no-op stubs
+//! and a `GpuStatus::Unavailable` variant so callers can gracefully
+//! fall back to CPU paths.
+//!
+//! # Usage
+//!
+//! ```rust,ignore
+//! use janus_neuromorphic::gpu::*;
+//!
+//! // Initialize GPU runtime
+//! let gpu = GpuRuntime::new(GpuConfig::default()).await?;
+//! println!("GPU: {}", gpu.device_name());
+//!
+//! // Matrix multiply on GPU
+//! let a = vec![1.0f32; 64 * 128];
+//! let b = vec![1.0f32; 128 * 256];
+//! let c = gpu.matmul(&a, 64, 128, &b, 128, 256).await?;
+//!
+//! // Softmax
+//! let logits = vec![1.0f32; 512];
+//! let probs = gpu.softmax(&logits, 512).await?;
+//! ```
+
+pub mod kernels;
+pub mod runtime;
+pub mod shaders;
+pub mod tensor_bridge;
+
+// ─── Core runtime types ────────────────────────────────────────────────────
+
+pub use runtime::{
+    GpuBuffer, GpuBufferUsage, GpuConfig, GpuDeviceInfo, GpuError, GpuRuntime, GpuStatus,
+};
+
+// ─── Kernel registry & dispatch ────────────────────────────────────────────
+
+pub use kernels::{
+    // Kernel identifiers
+    KernelId,
+    // Pipeline cache
+    KernelRegistry,
+    // Dispatch helpers
+    WorkgroupSize,
+};
+
+// ─── Shader sources ────────────────────────────────────────────────────────
+
+pub use shaders::{
+    SHADER_ATTENTION, SHADER_DISTANCE, SHADER_EMBEDDING, SHADER_GELU, SHADER_LAYERNORM,
+    SHADER_MATMUL, SHADER_REDUCE, SHADER_SOFTMAX, ShaderCache, ShaderModule,
+};
+
+// ─── Candle tensor bridge ──────────────────────────────────────────────────
+
+pub use tensor_bridge::{GpuTensorBridge, TensorTransferStats};
+
+// ─── Convenience re-export of the error type ───────────────────────────────
+
+pub type Result<T> = std::result::Result<T, GpuError>;

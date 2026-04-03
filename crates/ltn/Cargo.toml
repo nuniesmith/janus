@@ -1,0 +1,23 @@
+[package]
+name = "janus-ltn"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Logic Tensor Networks for JANUS trading system"
+keywords = ["logic", "tensor", "fuzzy", "reasoning"]
+
+[lib]
+name = "janus_ltn"
+path = "mod.rs"
+
+[dependencies]
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[features]
+default = []
+
+[package.metadata.docs.rs]
+all-features = true

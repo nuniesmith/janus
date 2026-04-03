@@ -1,0 +1,22 @@
+[package]
+name = "janus-bybit-client"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio.workspace = true
+tokio-tungstenite = "0.28.0"
+futures-util = "0.3.31"
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+hmac = "0.12.1"
+sha2 = "0.10.9"
+hex = "0.4.3"
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[lib]
+name = "janus_bybit_client"
+path = "src/lib.rs"

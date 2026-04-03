@@ -1,0 +1,46 @@
+[package]
+name = "janus-dsp"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Production-grade Digital Signal Processing for High-Frequency Trading - Fractal-Adaptive Filtering"
+keywords = ["trading", "hft", "dsp", "fractal", "frama"]
+categories = ["algorithms", "mathematics", "science"]
+
+[lib]
+name = "dsp"
+path = "mod.rs"
+
+[[bench]]
+name = "bench_dsp"
+path = "benches/bench_dsp.rs"
+harness = false
+
+[dependencies]
+# No external dependencies - zero-allocation hot path requirement
+
+[dev-dependencies]
+# For benchmarking (nightly feature required)
+# Run with: cargo +nightly bench
+
+# Profiles are now defined at workspace level
+
+[features]
+default = []
+
+# Enable nightly-only features (benchmarks using #![feature(test)])
+nightly = []
+
+# Enable SIMD optimizations (future)
+simd = []
+
+# Enable allocation tracking (development)
+track-allocations = []
+
+# Enable detailed instrumentation (performance overhead)
+instrumentation = []
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

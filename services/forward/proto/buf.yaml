@@ -1,0 +1,20 @@
+version: v1
+# Buf configuration for Forward Service Protocol Buffers
+#
+# This directory contains the janus.v1 proto for signal generation.
+# Other protos (execution, forward, data, cns, etc.) are centralized
+# in the root proto/ directory and provided via the fks-proto crate.
+
+name: buf.build/fks/janus-forward
+
+lint:
+    use:
+        - DEFAULT
+    except:
+        # Allow non-standard enum prefixes for backward compatibility
+        - ENUM_VALUE_PREFIX
+        - ENUM_ZERO_VALUE_SUFFIX
+
+breaking:
+    use:
+        - FILE

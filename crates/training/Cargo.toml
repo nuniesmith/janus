@@ -1,0 +1,60 @@
+[package]
+name = "training"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Training infrastructure for Project JANUS - Optimizers, Schedulers, Replay Buffers"
+
+[features]
+default = ["cpu"]
+cpu = []
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
+metal = ["candle-core/metal", "candle-nn/metal"]
+vision = ["dep:vision"]
+
+[dependencies]
+# Internal crates
+common = { path = "../common" }
+vision = { path = "../vision", optional = true }
+logic = { path = "../logic" }
+
+# ML Framework (Candle from HuggingFace)
+candle-core = { workspace = true }
+candle-nn = { workspace = true }
+
+# Numerical computing
+rand = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+postcard = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true, features = ["rt", "macros", "fs", "sync"] }
+
+# Time utilities
+chrono = { workspace = true }
+
+# Collections and utilities
+flume = { workspace = true }
+
+# File I/O
+rkyv = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "test-util"] }
+
+# Examples that require optional features
+[[example]]
+name = "vision_ltn_training"
+required-features = ["vision"]

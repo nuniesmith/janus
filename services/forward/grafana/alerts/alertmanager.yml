@@ -1,0 +1,292 @@
+# ════════════════════════════════════════════════════════════════════
+# JANUS Brain Pipeline — Alertmanager Configuration Template
+# ════════════════════════════════════════════════════════════════════
+#
+# Deploy this file to your Alertmanager instance:
+#
+#   alertmanager --config.file=/etc/alertmanager/alertmanager.yml
+#
+# Customize the receiver endpoints (Slack webhooks, PagerDuty keys,
+# email addresses) before deploying to production.
+#
+# ════════════════════════════════════════════════════════════════════
+
+global:
+  # How long to wait before sending a notification again if it has
+  # already been sent for an identical alert group.
+  repeat_interval: 4h
+
+  # How long to initially wait to send a notification for a group of
+  # alerts. Allows batching of similar alerts.
+  group_wait: 30s
+
+  # How long to wait before sending notifications about new alerts
+  # that are added to a group for which an initial notification has
+  # already been sent.
+  group_interval: 5m
+
+  # Global SMTP settings (uncomment and configure for email alerts)
+  # smtp_smarthost: 'smtp.example.com:587'
+  # smtp_from: 'alertmanager@janus.internal'
+  # smtp_auth_username: 'alertmanager@janus.internal'
+  # smtp_auth_password: '{{ SMTP_PASSWORD }}'
+  # smtp_require_tls: true
+
+  # Global Slack API URL (uncomment and set your workspace webhook)
+  # slack_api_url: 'https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK'
+
+  # Global PagerDuty URL (usually left as default)
+  # pagerduty_url: 'https://events.pagerduty.com/v2/enqueue'
+
+# ════════════════════════════════════════════════════════════════════
+# Inhibition Rules
+# ════════════════════════════════════════════════════════════════════
+#
+# Suppress lower-severity alerts when a higher-severity alert is
+# already firing for the same component/instance.
+#
+inhibit_rules:
+  # If the kill switch is active (critical), suppress pipeline health
+  # warnings — they're expected consequences of the kill switch.
+  - source_matchers:
+      - alertname = "BrainKillSwitchActive"
+    target_matchers:
+      - alertname =~ "BrainHighBlockRate|BrainVeryHighBlockRate|BrainNoEvaluations|BrainSustainedReduceOnly"
+    equal: ['instance']
+
+  # If boot failed (critical), suppress operational warnings that
+  # stem from the pipeline not running at all.
+  - source_matchers:
+      - alertname = "BrainBootFailed"
+    target_matchers:
+      - alertname =~ "BrainNoEvaluations|BrainWatchdogNoComponents"
+    equal: ['instance']
+
+  # Critical block rate suppresses warning-level block rate
+  - source_matchers:
+      - alertname = "BrainVeryHighBlockRate"
+    target_matchers:
+      - alertname = "BrainHighBlockRate"
+    equal: ['instance']
+
+  # Dead watchdog components (critical) suppress degraded (warning)
+  - source_matchers:
+      - alertname = "BrainWatchdogDeadComponents"
+    target_matchers:
+      - alertname = "BrainWatchdogDegradedComponents"
+    equal: ['instance']
+
+  # Very high latency (critical) suppresses high latency (warning)
+  - source_matchers:
+      - alertname = "BrainVeryHighEvaluationLatencyP99"
+    target_matchers:
+      - alertname =~ "BrainHighEvaluationLatencyP99|BrainHighEvaluationLatencyP50"
+    equal: ['instance']
+
+  # Low watchdog health score (critical) suppresses degraded warning
+  - source_matchers:
+      - alertname = "BrainWatchdogLowHealthScore"
+    target_matchers:
+      - alertname = "BrainWatchdogDegradedComponents"
+    equal: ['instance']
+
+# ════════════════════════════════════════════════════════════════════
+# Routing Tree
+# ════════════════════════════════════════════════════════════════════
+route:
+  # Default receiver for unmatched alerts
+  receiver: janus-default
+
+  # Group alerts by component and instance to reduce noise
+  group_by: ['alertname', 'component', 'instance']
+
+  # Override defaults for brain pipeline alerts
+  routes:
+    # ── Critical: Kill switch & boot failures ────────────────────
+    # Route to PagerDuty/on-call immediately
+    - matchers:
+        - severity = "critical"
+        - component =~ "brain-pipeline|brain-watchdog"
+      receiver: janus-brain-critical
+      group_wait: 10s
+      group_interval: 1m
+      repeat_interval: 30m
+      continue: true  # Also send to Slack for visibility
+
+    # ── Critical: Send to Slack for team visibility ──────────────
+    - matchers:
+        - severity = "critical"
+        - component =~ "brain-.*"
+      receiver: janus-brain-slack-critical
+      group_wait: 10s
+      group_interval: 1m
+      repeat_interval: 1h
+
+    # ── Warning: Pipeline health & performance ───────────────────
+    - matchers:
+        - severity = "warning"
+        - component =~ "brain-.*"
+      receiver: janus-brain-slack-warning
+      group_wait: 1m
+      group_interval: 5m
+      repeat_interval: 2h
+
+    # ── Info: Operational awareness ──────────────────────────────
+    - matchers:
+        - severity = "info"
+        - component =~ "brain-.*"
+      receiver: janus-brain-slack-info
+      group_wait: 5m
+      group_interval: 15m
+      repeat_interval: 12h
+
+    # ── Regime detection alerts (from DEPLOYMENT.md rules) ───────
+    - matchers:
+        - alertname =~ "CrisisRegimeDetected|RegimeDetectorNotReady"
+      receiver: janus-brain-slack-critical
+      group_wait: 15s
+      group_interval: 2m
+      repeat_interval: 1h
+
+    # ── Team-specific routing ────────────────────────────────────
+    - matchers:
+        - team = "trading-ops"
+      receiver: janus-trading-ops
+      group_wait: 15s
+      repeat_interval: 1h
+
+# ════════════════════════════════════════════════════════════════════
+# Receivers
+# ════════════════════════════════════════════════════════════════════
+receivers:
+  # ── Default (catch-all) ──────────────────────────────────────────
+  - name: janus-default
+    # Uncomment and configure at least one notification channel:
+    #
+    # webhook_configs:
+    #   - url: 'http://localhost:9095/alerts'
+    #     send_resolved: true
+
+  # ── Critical: PagerDuty on-call escalation ───────────────────────
+  - name: janus-brain-critical
+    # PagerDuty integration (uncomment and set your routing key):
+    #
+    # pagerduty_configs:
+    #   - routing_key: '{{ PAGERDUTY_BRAIN_ROUTING_KEY }}'
+    #     severity: critical
+    #     description: '{{ .CommonAnnotations.summary }}'
+    #     details:
+    #       instance: '{{ .CommonLabels.instance }}'
+    #       component: '{{ .CommonLabels.component }}'
+    #       description: '{{ .CommonAnnotations.description }}'
+    #     group: 'janus-brain'
+
+    # Webhook fallback (e.g., Opsgenie, custom handler):
+    #
+    # webhook_configs:
+    #   - url: 'https://api.opsgenie.com/v2/alerts'
+    #     send_resolved: true
+    #     http_config:
+    #       authorization:
+    #         type: GenieKey
+    #         credentials: '{{ OPSGENIE_API_KEY }}'
+
+  # ── Critical: Slack channel for team visibility ──────────────────
+  - name: janus-brain-slack-critical
+    slack_configs:
+      - api_url: 'https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK'
+        channel: '#janus-alerts-critical'
+        send_resolved: true
+        color: '{{ if eq .Status "firing" }}danger{{ else }}good{{ end }}'
+        title: >-
+          {{ if eq .Status "firing" }}🚨{{ else }}✅{{ end }}
+          {{ .CommonAnnotations.summary }}
+        text: >-
+          {{ .CommonAnnotations.description }}
+
+          *Instance:* {{ .CommonLabels.instance }}
+          *Component:* {{ .CommonLabels.component }}
+          *Status:* {{ .Status | toUpper }}
+          {{ if .CommonAnnotations.runbook_url }}
+          *Runbook:* {{ .CommonAnnotations.runbook_url }}
+          {{ end }}
+          {{ if .CommonAnnotations.dashboard_url }}
+          *Dashboard:* {{ .CommonAnnotations.dashboard_url }}
+          {{ end }}
+        icon_emoji: ':brain:'
+        username: 'JANUS Brain Alerts'
+
+  # ── Warning: Slack channel for warnings ──────────────────────────
+  - name: janus-brain-slack-warning
+    slack_configs:
+      - api_url: 'https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK'
+        channel: '#janus-alerts'
+        send_resolved: true
+        color: '{{ if eq .Status "firing" }}warning{{ else }}good{{ end }}'
+        title: >-
+          {{ if eq .Status "firing" }}⚠️{{ else }}✅{{ end }}
+          {{ .CommonAnnotations.summary }}
+        text: >-
+          {{ .CommonAnnotations.description }}
+
+          *Instance:* {{ .CommonLabels.instance }}
+          *Component:* {{ .CommonLabels.component }}
+        icon_emoji: ':brain:'
+        username: 'JANUS Brain Alerts'
+
+  # ── Info: Low-priority Slack channel ─────────────────────────────
+  - name: janus-brain-slack-info
+    slack_configs:
+      - api_url: 'https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK'
+        channel: '#janus-alerts-info'
+        send_resolved: true
+        color: '{{ if eq .Status "firing" }}#439FE0{{ else }}good{{ end }}'
+        title: >-
+          {{ if eq .Status "firing" }}ℹ️{{ else }}✅{{ end }}
+          {{ .CommonAnnotations.summary }}
+        text: >-
+          {{ .CommonAnnotations.description }}
+        icon_emoji: ':brain:'
+        username: 'JANUS Brain Alerts'
+
+  # ── Trading Ops team channel ─────────────────────────────────────
+  - name: janus-trading-ops
+    slack_configs:
+      - api_url: 'https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK'
+        channel: '#trading-ops'
+        send_resolved: true
+        color: '{{ if eq .Status "firing" }}danger{{ else }}good{{ end }}'
+        title: >-
+          {{ if eq .Status "firing" }}🛑{{ else }}✅{{ end }}
+          [TRADING OPS] {{ .CommonAnnotations.summary }}
+        text: >-
+          {{ .CommonAnnotations.description }}
+
+          *Action required:*
+          {{ if eq .CommonLabels.alertname "BrainKillSwitchActive" }}
+          - Verify kill switch was intentionally activated
+          - To deactivate: `curl -X POST -H "Authorization: Bearer $BRAIN_API_TOKEN" http://<instance>/api/v1/brain/kill-switch/deactivate`
+          {{ end }}
+          {{ if eq .CommonLabels.alertname "BrainKillSwitchActivatedRecently" }}
+          - Check service logs for trigger reason
+          - Review recent watchdog snapshots
+          - Verify market data feeds are healthy
+          {{ end }}
+        icon_emoji: ':rotating_light:'
+        username: 'JANUS Trading Ops'
+
+    # Email fallback for trading ops (uncomment and configure):
+    #
+    # email_configs:
+    #   - to: 'trading-ops@example.com'
+    #     send_resolved: true
+    #     headers:
+    #       Subject: >-
+    #         [JANUS {{ .Status | toUpper }}] {{ .CommonAnnotations.summary }}
+
+# ════════════════════════════════════════════════════════════════════
+# Templates (optional — customize notification formatting)
+# ════════════════════════════════════════════════════════════════════
+#
+# templates:
+#   - '/etc/alertmanager/templates/*.tmpl'

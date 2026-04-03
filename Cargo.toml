@@ -1,0 +1,247 @@
+# ============================================================================
+# JANUS Workspace Configuration
+# ============================================================================
+# NOTE: This workspace is now part of the root FKS workspace (../../Cargo.toml)
+# The root workspace provides unified dependency management across all services.
+#
+# To build from the root:
+#   cd ../.. && cargo build
+#
+# To build just janus components:
+#   cargo build -p janus-core -p janus-forward
+#
+# This file is kept for backward compatibility and local development.
+# ============================================================================
+
+[workspace]
+members = [
+    # New unified JANUS infrastructure
+    "bin/janus",
+    "bin/backtest-cli",
+    "lib/janus-core",
+    "lib/janus-api",
+    # Existing crates
+    "crates/indicators",
+    "crates/strategies",
+    "crates/risk",
+    "crates/models",
+    "crates/bybit-client",
+    "crates/questdb-writer",
+    "crates/compliance",
+    "crates/backtest",
+    "crates/health",
+    "crates/logic",
+    "crates/common",
+    "crates/rate-limiter",
+    "crates/gap-detection",
+    "crates/memory",
+
+    "crates/cns",
+    "crates/vision",
+    "crates/training",
+    # Newly integrated crates
+    "crates/dsp",
+    "crates/ltn",
+    "crates/exchanges",
+    "crates/data-quality",
+    "crates/optimizer",
+    "crates/regime",
+    # Neuromorphic
+    "neuromorphic",
+    # Vendored crates
+    "crates/apalis-redis",
+    # Services (will be adapted to work with unified JANUS)
+    "services/api",
+    "services/optimizer",
+    "services/forward",
+    "services/backward",
+    "services/cns",
+    "services/data",
+    "services/registry",
+    "services/execution",
+    "crates/ml",
+    "crates/lob",
+    "crates/registry",
+]
+exclude = [
+    "tests/integration",
+    "tests/unit",
+    "tests",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["nuniesmith"]
+license = "MIT"
+repository = "https://github.com/nuniesmith/fks"
+rust-version = "1.92.0"
+
+[workspace.dependencies]
+# ===========================================================================
+# Shared Proto Crate (from root workspace)
+# ===========================================================================
+fks-proto = { path = "../../src/proto" }
+
+# ===========================================================================
+# JANUS Local Dependencies
+# ===========================================================================
+janus-core = { path = "lib/janus-core" }
+janus-api = { path = "lib/janus-api" }
+janus-dsp = { path = "crates/dsp" }
+janus-exchanges = { path = "crates/exchanges" }
+janus-ltn = { path = "crates/ltn" }
+janus-data = { path = "services/data" }
+janus-data-quality = { path = "crates/data-quality" }
+janus-gap-detection = { path = "crates/gap-detection" }
+janus-indicators = { path = "crates/indicators" }
+janus-strategies = { path = "crates/strategies" }
+janus-risk = { path = "crates/risk" }
+janus-models = { path = "crates/models" }
+janus-bybit-client = { path = "crates/bybit-client" }
+janus-questdb-writer = { path = "crates/questdb-writer" }
+janus-compliance = { path = "crates/compliance" }
+janus-backtest = { path = "crates/backtest" }
+janus-health = { path = "crates/health" }
+janus-logic = { path = "crates/logic" }
+janus-common = { path = "crates/common" }
+janus-rate-limiter = { path = "crates/rate-limiter" }
+janus-memory = { path = "crates/memory" }
+
+janus-cns = { path = "crates/cns" }
+janus-training = { path = "crates/training" }
+janus-ml = { path = "crates/ml" }
+janus-optimizer = { path = "crates/optimizer" }
+janus-regime = { path = "crates/regime" }
+janus-lob = { path = "crates/lob" }
+janus-registry-lib = { path = "crates/registry" }
+
+# Async Runtime
+tokio = { version = "1.48.0", features = ["full"] }
+tokio-util = { version = "0.7.17", features = ["rt"] }
+tokio-tungstenite = "0.28.0"
+futures-util = "0.3.31"
+futures = "0.3.31"
+async-trait = "0.1.83"
+
+# Serialization
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+postcard = { version = "1.1", features = ["alloc"] }
+
+# Data Processing
+polars = { version = "0.44.2", features = ["lazy", "temporal", "parquet"] }
+ndarray = "0.17.1"
+
+# HTTP & Network
+reqwest = { version = "0.12.9", features = ["json", "rustls-tls"], default-features = false }
+axum = { version = "0.8.8", features = ["ws"] }
+tower = "0.5.2"
+tower-http = { version = "0.6.8", features = ["cors", "trace"] }
+hyper = "1.8.1"
+
+# Time & Date
+chrono = { version = "0.4.42", features = ["serde"] }
+
+# Logging & Tracing
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter", "json", "registry"] }
+tracing-appender = "0.2.3"
+
+# Error Handling
+anyhow = "1.0.100"
+thiserror = "2.0.17"
+
+# Cryptography
+hmac = "0.12.1"
+sha2 = "0.10.9"
+hex = "0.4.3"
+ring = "0.17.14"
+
+# Configuration
+config = "0.15.19"
+dotenvy = "0.15.7"
+
+# Channels & Messaging
+flume = "0.12.0"
+
+# Metrics & Monitoring
+prometheus = "0.14.0"
+
+# ML/AI Infrastructure (Phase 1 & 2)
+# Note: ort versions are yanked/RUSTCODE only. Use tract-onnx as alternative or download manually
+# ort = { version = "2.0.0-rc.10" }  # ONNX Runtime (RUSTCODE version)
+tract-onnx = "0.22.0"  # Alternative ONNX Runtime
+candle-core = "0.9.1"  # ML framework (updated for compatibility)
+candle-nn = "0.9.1"    # Neural network layers
+
+# Vector Database (Phase 2)
+qdrant-client = "1.16.0"
+
+# Protobuf & Serialization
+prost = "0.14.1"
+prost-types = "0.14.1"
+rkyv = "0.8.13"
+
+# Utilities
+rand = "0.10.0"
+rayon = "1.11.0"  # Parallel processing
+uuid = { version = "1.19.0", features = ["v4", "serde"] }
+
+# Database
+# sqlx intentionally not in workspace - services specify their own features
+
+# DSP / Signal Processing
+rustfft = "6.2.0"
+num-complex = "0.4.6"
+
+# WebSocket & Async
+tungstenite = "0.28.0"
+
+# gRPC
+tonic = "0.14.2"
+tonic-build = "0.14.2"
+tonic-prost = "0.14.2"
+tonic-prost-build = "0.14.2"
+tonic-web = "0.14.2"
+
+# Job Queue (for backward service)
+apalis = "1.0.0-rc.3"
+apalis-redis = { path = "crates/apalis-redis" }
+redis = { version = "1.0.2", features = ["tokio-comp", "connection-manager"] }
+
+# Serialization Formats
+arrow = "57.1.0"
+arrow-ipc = "57.1.0"
+toml = "0.9.8"
+
+# Additional dependencies for data service
+rust_decimal = { version = "1.39.0", features = ["serde-float"] }
+scraper = "0.25.0"
+url = "2.5.7"
+governor = "0.10.4"
+bytes = "1.11.0"
+parking_lot = "0.12.5"
+socket2 = { version = "0.6.1", features = ["all"] }
+jsonwebtoken = "10.2.0"
+nix = { version = "0.30.1", features = ["fs"] }
+
+# Data processing and export
+parquet = "57.1.0"
+statrs = "0.18.0"
+
+# Database (services specify their own features)
+sqlx = { version = "0.8.2", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 16
+strip = true
+debug = false
+panic = "abort"  # Prevent silent task disappearance in Tokio — panics terminate the process cleanly for supervisor restart
+
+[profile.dev]
+opt-level = 0
+debug = true

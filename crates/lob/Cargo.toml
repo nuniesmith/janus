@@ -1,0 +1,64 @@
+[package]
+name = "janus-lob"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Limit Order Book simulator for JANUS backtesting and market microstructure analysis"
+
+[dependencies]
+# Core crates
+janus-core = { path = "../../lib/janus-core" }
+
+# Data processing
+rust_decimal = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Time
+chrono = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Collections (BTreeMap for sorted price levels)
+# std is sufficient — no extra crate needed
+
+# Random number generation (for latency jitter, fill probability)
+rand = { workspace = true }
+
+# Statistics (for market impact models)
+statrs = { workspace = true }
+
+# UUID for order IDs
+uuid = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }
+approx = "0.5"
+tempfile = "3.8"
+criterion = { workspace = true }
+rust_decimal_macros = "1.39"
+
+[features]
+default = []
+# Enable integration with janus-backtest replay engine
+backtest = []
+# Enable integration with execution service SimEnvironment
+execution-sim = []
+# Enable L2/L3 data recording to QuestDB
+questdb = []
+
+[[bench]]
+name = "orderbook_throughput"
+harness = false

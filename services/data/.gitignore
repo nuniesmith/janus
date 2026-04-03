@@ -1,0 +1,18 @@
+# Docker Secrets - NEVER COMMIT THESE!
+secrets/*.txt
+secrets/**/*.txt
+
+# Keep the directory structure but not the files
+!secrets/.gitkeep
+
+# Docker volumes
+volumes/
+
+# Build artifacts
+target/
+**/target/
+
+# Environment files with sensitive data
+.env.local
+.env.production
+

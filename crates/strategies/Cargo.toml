@@ -1,0 +1,20 @@
+[package]
+name = "janus-strategies"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+janus-indicators = { path = "../indicators" }
+janus-models = { path = "../models" }
+janus-regime = { path = "../regime" }
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+toml.workspace = true
+
+[lib]
+name = "janus_strategies"
+path = "src/lib.rs"

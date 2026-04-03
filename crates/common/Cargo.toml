@@ -1,0 +1,27 @@
+[package]
+name = "common"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+postcard = { workspace = true }
+rkyv = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
+ndarray = { workspace = true, optional = true, features = ["serde"] }
+
+[features]
+default = ["ndarray"]
+ndarray = ["dep:ndarray"]
+
+[dev-dependencies]
+proptest = "1.4"
