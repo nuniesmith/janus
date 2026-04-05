@@ -7,7 +7,7 @@
 --   api_key_audit  — Immutable audit log for every key mutation
 -- =============================================================================
 
-\set janus_db  `echo "${POSTGRES_DB:-janus_db}"`
+\set janus_db  `echo "${JANUS_DB:-janus_db}"`
 \connect :janus_db
 
 -- ---------------------------------------------------------------------------

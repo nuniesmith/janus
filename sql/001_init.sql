@@ -2,7 +2,7 @@
 -- janus/001_init.sql — janus_db setup
 -- =============================================================================
 -- Configures the janus_db database that is created automatically by the
--- PostgreSQL Docker image via the POSTGRES_DB env var.
+-- PostgreSQL Docker image via the JANUS_DB env var.
 --
 -- Runs on first container start (empty volume).
 -- Schema tables are created by Janus sqlx migrations at service startup:
@@ -11,7 +11,7 @@
 -- Run order: first (postgres image creates DB + user before initdb scripts run)
 -- =============================================================================
 
-\set janus_db  `echo "${POSTGRES_DB:-janus_db}"`
+\set janus_db  `echo "${JANUS_DB:-janus_db}"`
 \set fks_user  `echo "${POSTGRES_USER:-fks_user}"`
 
 \connect :janus_db

@@ -201,7 +201,7 @@ impl Database {
                     );
                 } else if err_str.contains("does not exist") {
                     tracing::error!("  💡 HINT: The database or role may not exist.");
-                    tracing::error!("     Check POSTGRES_DB and POSTGRES_USER settings.");
+                    tracing::error!("     Check JANUS_DB and POSTGRES_USER settings.");
                 } else if err_str.contains("SSL") || err_str.contains("ssl") {
                     tracing::error!("  💡 HINT: SSL negotiation issue. The DATABASE_URL may need");
                     tracing::error!(
