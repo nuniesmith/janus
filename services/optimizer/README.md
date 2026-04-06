@@ -393,7 +393,7 @@ services:
 Metrics are exposed on port 9092 (configurable via `OPTIMIZER_METRICS_PORT`) and scraped by Prometheus:
 
 ```yaml
-# infrastructure/config/monitoring/prometheus/prometheus.yml
+# infrastructure/config/prometheus/prometheus.yml
 - job_name: "fks-optimizer"
   scrape_interval: 30s
   metrics_path: "/metrics"
@@ -429,7 +429,7 @@ optimizer_scheduled_runs_failure_total
 optimizer_last_scheduled_duration_seconds
 ```
 
-A Grafana dashboard is available at `infrastructure/config/monitoring/grafana/dashboards/optimizer.json`.
+A Grafana dashboard is available at `infrastructure/config/grafana/dashboards/optimizer.json`.
 
 ## Redis Integration
 
