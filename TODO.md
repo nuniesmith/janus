@@ -1,78 +1,84 @@
 # fks-janus — TODO
 
-> **Repo:** `github.com/nuniesmith/fks-janus`
-> **Last synced from master todo:** 2026-04-03
+> **Repo:** `github.com/nuniesmith/janus`
+> **Scope:** janus-only (Rust ML inference + neuromorphic + signal generation).
+> Infrastructure orchestration lives in [fks](https://github.com/nuniesmith/fks);
+> rustcode / claw / RC-CRATES items live under `fks/src/rustcode/` and are
+> **not** tracked here anymore.
+> **Last synced:** 2026-05-24
 
 ---
 
 ## P0 — Codebase Health
 
-- [ ] **318 `#[allow(dead_code)]` annotations** — review `services/api/src/grpc.rs` (11 annotations) and `services/optimizer/src/collector.rs` (10 annotations) for actual dead code; most are benign serde deserialization fields
+- [ ] **318 `#[allow(dead_code)]` annotations** — audit results (2026-05-24):
+  - `services/forward/src/api/grpc.rs` — confirmed dead per `services/forward/build.rs:9-22` (audit 2026-03-26). **Intentionally retained** to keep impl type-checked until the signal-service ownership question (Option A vs B) is resolved. Do NOT delete without resolving STRUCT-C first.
+  - `services/api/src/grpc.rs` (11) — `GrpcClientManager` / `GatewayForwardService` scaffolding, never instantiated outside its own tests. Not benign serde — these are unused types. Decide: wire up or delete.
+  - `services/optimizer/src/collector.rs` (10) — mix of unused `OhlcCollector` methods (`fetch_ohlc`, `backfill`, etc.) and the `DataGap` struct. Some are reachable from `scheduler.rs`; verify before pruning.
+  - `services/optimizer/src/scheduler.rs` (7), `services/execution/tests/integration/scenarios.rs` (7), `services/data/src/api/auth.rs` (7), `services/api/src/rate_limit.rs` (7) — review each.
 - [ ] **Tonic version split** — workspace declares `0.14.2` but some crates resolve `0.10.2` transitively (via `apalis`). Track and resolve when `apalis` hits 1.0 stable.
-- [ ] Evaluate `shared_memory` IPC in containers — `/dev/shm` size limits may break Forward→Backward zero-copy Arrow IPC (removed crate, but protocol design question remains)
-- [ ] Centralize stray `forward/proto/janus/v1/janus.proto` → `proto/fks/janus/v1/signal_service.proto` — **deferred** until gRPC endpoint is actually needed (dead code today)
-- [ ] Update forward service `build.rs` to use `fks-proto` crate instead of compiling local protos (blocked on above)
+- [ ] Evaluate `shared_memory` IPC in containers — `/dev/shm` size limits may break Forward→Backward zero-copy Arrow IPC (removed crate, but protocol design question remains).
+- [ ] **STRUCT-C deferred:** Consolidate stray `services/forward/proto/janus/v1/janus.proto` → `proto/fks/janus/v1/signal_service.proto` once GrpcServer ownership is decided. See `services/forward/build.rs:14-19`.
 
 ---
 
 ## P1 — Signal Flow (JFLOW)
 
-### JFLOW-B: Dynamic asset config from Ruby
-- [ ] Janus startup config overlay from Redis: read `fks:janus:config` at startup (`janus-core/config.rs`) — higher-level config like which assets to trade currently reads from env vars only
-- [ ] When a JanusAI session starts, write session-specific config to Redis (`fks:janus:config`)
-- [ ] Optimizer reads asset list from Ruby's asset registry via gRPC or Redis
+### JFLOW-A: Session metrics wiring  *(infrastructure landed 2026-05-24)*
+- [x] `SessionMetricsClient` + `SessionMetrics` types in `lib/janus-core/src/session_metrics.rs` (no-op when `JANUS_AI_URL` is unset).
+- [ ] Call `SessionMetricsClient::push(session_id, metrics)` from the forward signal pipeline (`services/forward/src/signal/mod.rs`) after each generation cycle.
+- [ ] Forward `event_loop.rs` aggregator: roll signal counts / win rate / latency into `SessionMetrics` once per minute.
+
+### JFLOW-B: Dynamic asset config from Ruby  *(overlay landed 2026-05-24)*
+- [x] Janus startup config overlay from Redis: `Config::load()` now reads key `fks:janus:config` after env overrides (`lib/janus-core/src/config.rs::apply_redis_overlay`).
+- [ ] When a JanusAI session starts, write session-specific config to Redis (`fks:janus:config`) — **producer side, lives in fks repo**.
+- [ ] Optimizer reads asset list from Ruby's asset registry via gRPC or Redis (currently env-only).
 
 ### JFLOW-C: Two-way position feedback (remaining)
-- [ ] Janus receives live position data and provides guidance: take-profit suggestions based on regime changes, stop adjustment based on volatility, exit urgency from amygdala
-- [ ] All feedback stored as execution memories for learning
+- [ ] Janus receives live position data and provides guidance: take-profit suggestions based on regime changes, stop adjustment based on volatility, exit urgency from amygdala.
+- [ ] All feedback stored as execution memories for learning.
 
 ### JFLOW-D: Startup bootstrap (remaining)
-- [ ] Full Postgres bootstrap path in Rust: query `janus_memories` directly from Rust at startup (currently uses Python endpoint + Redis ring buffer as intermediate; direct Postgres requires sqlx setup in forward service Cargo.toml)
-
----
-
-## P1 — RustCode Crates Integration (RC-CRATES)
-
-> `src/rustcode/crates/` contains 9 new crates. Wire them into the existing `rustcode` binary.
-
-- [ ] **RC-CRATES-A:** Add all 9 crates to `src/rustcode/Cargo.toml` workspace members: `runtime`, `api`, `tools`, `plugins`, `commands`, `server`, `claw-cli`, `compat-harness`, `lsp`
-- [ ] **RC-CRATES-A:** Run `cargo check --workspace` — resolve dependency version conflicts (`reqwest 0.12`, `axum 0.8` vs workspace `0.7`)
-- [ ] **RC-CRATES-A:** Run `cargo test --workspace` — all existing RC tests must still pass
-- [ ] **RC-CRATES-B:** Replace ad-hoc `reqwest` LLM calls with `api` crate client: update `src/rustcode/src/llm/grok_client.rs` and `ollama_client.rs`
-- [ ] **RC-CRATES-C:** Replace scanner glob/hashing with `runtime` crate: `runtime::glob_files()`, `runtime::hash_file()`, `runtime::FileEntry`
-- [ ] **RC-CRATES-D:** Wire `tools` + `plugins` into RC tool execution — load TOML plugin manifests from `infrastructure/config/rustcode/plugins/`, implement `POST /api/v1/tools/run`
-- [ ] **RC-CRATES-D:** Create example plugin manifests: `code_review.toml`, `todo_scan.toml`, `file_summary.toml`
-- [ ] **RC-CRATES-E:** Add `--server` flag to `rustcode` binary — starts `server` crate's axum router on port 3501 alongside existing RC API on 3500
-- [ ] **RC-CRATES-F:** Build `claw-cli` binary and add to Dockerfile; test `claw scan`, `claw plan`, `claw work` subcommands
-- [ ] **RC-CRATES-G:** Create `tests/test_grok_integration.rs` — integration tests behind `#[cfg(feature = "integration")]`: complete call, ModelRouter classification (5 prompt types), RAG injection, cache hit
-- [ ] **RC-CRATES-G:** Add `./run.sh rc-test-grok` command — sets `XAI_API_KEY` from `.env`, runs integration tests
-- [ ] **RC-CRATES-G:** After integration tests pass: validate Claude API switch (flip `XAI_API_KEY` → `ANTHROPIC_API_KEY`, update `api` crate endpoint URL)
-
----
-
-## P1 — RustCode: API Security & Config
-
-- [ ] **API-C:** Make skip-extensions configurable per-repo — add `skip_extensions: Vec<String>` to repo config struct
-- [ ] **API-C:** Routing heuristic tuning — after deployment, measure local vs Grok classification quality and adjust `ModelRouter::llm_classify` system prompt
-- [ ] Consider workspace split: `rc-core`, `rc-api`, `rc-rag`, `rc-llm` — 81K LoC single crate; lower priority now that config is centralized and HNSW is implemented
+- [ ] Full Postgres bootstrap path in Rust: query `janus_memories` directly from Rust at startup (currently uses Python endpoint + Redis ring buffer as intermediate via `services/forward/src/main.rs:814 bootstrap_affinity_from_redis_ring`). Requires `sqlx` in forward service `Cargo.toml`.
 
 ---
 
 ## P1 — Janus AI (remaining)
 
-- [ ] Session metrics: wire signal pipeline (JFLOW-A) to call `POST /api/janus-ai/sessions/{id}/metrics`
+- [ ] Wire signal pipeline (JFLOW-A) to actually emit metrics — see JFLOW-A above. Endpoint contract lives in JanusAI service (Python, in fks repo).
+
+---
+
+## P2 — Build & Deployment
+
+- [x] Standalone `Dockerfile` for the unified `janus` binary (multi-stage, builds against an upstream `fks-proto` checkout).
+- [x] Standalone `docker-compose.yml` with Redis + QuestDB + Postgres so this repo can boot independently of the fks compose tree.
+- [ ] Publish a stub `fks-proto` crate (or vendor it under `crates/`) so the workspace builds without cloning the parent repo. Today `Cargo.toml` declares `fks-proto = { path = "../../src/proto" }` which only resolves when janus is nested inside `fks/src/janus`.
+- [ ] CI: add a GitHub Actions job that exercises the Dockerfile path on every PR.
 
 ---
 
 ## P2 — Housekeeping
 
-- [ ] Proto: Consolidate dual `ForwardService` — `fks.janus.v1.ForwardService` (4 RPCs) vs `fks.forward.v1.ForwardService` (7 RPCs) — **deferred**: `janus.v1.JanusService` in `forward/proto/` is confirmed dead code (GrpcServer compiled but not wired into main binary)
-- [ ] RC: OSS-B OpenViking — evaluate as replacement/supplement to brute-force `vector_index.rs` search (HNSW implemented, but OpenViking provides tier-based context management)
+- [ ] Proto: Consolidate dual `ForwardService` — `fks.janus.v1.ForwardService` (4 RPCs) vs `fks.forward.v1.ForwardService` (7 RPCs) — **deferred**: see STRUCT-C above.
+- [ ] Reduce legacy fields in `Config` (lines 99-145 of `lib/janus-core/src/config.rs`): `http_port`, `grpc_port`, `enable_forward`, `redis_url`, … — these duplicate the new nested config. Cleanup blocked on confirming no external TOMLs still rely on them.
 
 ---
 
 ## P3 — Future
 
-- [ ] Janus optimizer reads asset list from Ruby's asset registry via gRPC or Redis (JFLOW-B)
-- [ ] Neural architecture: 30-day live trading validation → document public API → stabilize neuromorphic crate for production use
-- [ ] RC: OSS-F Backlog — Heretic (local model uncensoring), Nanochat (custom LLM training from scratch, significant GPU time)
+- [ ] Neural architecture: 30-day live trading validation → document public API → stabilize neuromorphic crate for production use.
+- [ ] Optimizer reads asset list from Ruby's asset registry via gRPC or Redis (JFLOW-B follow-up).
+
+---
+
+## Out of scope for this repo
+
+The following live in the parent [fks](https://github.com/nuniesmith/fks) repo
+and are tracked there, not here:
+
+- `RC-CRATES-*` (rustcode workspace integration: runtime/api/tools/plugins/commands/server/claw-cli/compat-harness/lsp)
+- `API-*` (rustcode API security & config: skip-extensions config, ModelRouter tuning, rc-core/rc-api/rc-rag/rc-llm workspace split)
+- `OSS-*` evaluation queue (OpenViking, Heretic, Nanochat)
+- JanusAI Python service endpoints (`POST /api/janus-ai/sessions/{id}/metrics` etc.)
+- Ruby execution decision engine + asset registry
