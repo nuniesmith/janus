@@ -446,8 +446,16 @@ mod tests {
     #[test]
     fn test_process_batch_with_results() {
         let model = create_test_model();
+        // Force `generate_hold_signals = true` so the test doesn't depend
+        // on the untrained model's per-row argmax landing on a non-Hold
+        // class. Without this, zero-init input can yield all-Hold
+        // predictions which generate_batch silently skips → empty
+        // results → spurious CI failure.
+        let mut gen_config = GeneratorConfig::default();
+        gen_config.generate_hold_signals = true;
         let pipeline = PipelineBuilder::new()
             .model(model)
+            .generator_config(gen_config)
             .min_confidence(0.6)
             .build()
             .unwrap();
