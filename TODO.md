@@ -39,8 +39,10 @@
 - [ ] Janus receives live position data and provides guidance: take-profit suggestions based on regime changes, stop adjustment based on volatility, exit urgency from amygdala.
 - [ ] All feedback stored as execution memories for learning.
 
-### JFLOW-D: Startup bootstrap (remaining)
-- [ ] Full Postgres bootstrap path in Rust: query `janus_memories` directly from Rust at startup (currently uses Python endpoint + Redis ring buffer as intermediate via `services/forward/src/main.rs:814 bootstrap_affinity_from_redis_ring`). Requires `sqlx` in forward service `Cargo.toml`.
+### JFLOW-D: Startup bootstrap  *(direct Postgres path landed 2026-05-24)*
+- [x] `bootstrap_affinity_from_postgres()` queries `janus_memories` via `sqlx` and replays into the strategy-affinity tracker. Probes for the table first so a missing schema isn't reported as an error.
+- [x] Wired in `services/forward/src/main.rs` as the preferred path when `DATABASE_URL` is set; falls through to the Redis ring buffer on empty / missing / errored Postgres.
+- [x] `persistence` feature added to forward's `default = […]` so sqlx is compiled in by default. Opt out with `--no-default-features`.
 
 ---
 
