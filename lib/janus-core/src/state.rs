@@ -116,6 +116,13 @@ pub struct JanusState {
     /// Set via [`set_log_level_controller`] after `init_logging()` in `main()`.
     /// The API module reads this to expose `POST /api/log-level`.
     log_level_controller: RwLock<Option<Box<dyn LogLevelController>>>,
+
+    /// Latest market-regime label, as a free-form string. Updated by the
+    /// brain-pipeline / regime-detector producers; consumed by the JFLOW-A
+    /// session metrics reporter so the snapshot it pushes to JanusAI
+    /// carries `regime` instead of `None`. Defaults to `None` until a
+    /// producer calls [`set_current_regime`].
+    current_regime: RwLock<Option<String>>,
 }
 
 impl JanusState {
@@ -143,7 +150,27 @@ impl JanusState {
             service_state_tx,
             service_state_rx,
             log_level_controller: RwLock::new(None),
+            current_regime: RwLock::new(None),
         })
+    }
+
+    /// Get the most recently published market-regime label.
+    ///
+    /// Returns the value most recently written via [`set_current_regime`],
+    /// or `None` if no producer has reported a regime yet. Used by the
+    /// JFLOW-A session metrics reporter.
+    pub async fn current_regime(&self) -> Option<String> {
+        self.current_regime.read().await.clone()
+    }
+
+    /// Publish the latest market-regime label.
+    ///
+    /// Intended to be called by the brain pipeline / regime detector as
+    /// new decisions land. Overwrites whatever was there before — the
+    /// field is a snapshot, not a history.
+    pub async fn set_current_regime(&self, regime: impl Into<String>) {
+        let mut guard = self.current_regime.write().await;
+        *guard = Some(regime.into());
     }
 
     // ── Log level control ─────────────────────────────────────────────
