@@ -739,6 +739,71 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
     let mut signal_rx = state.signal_bus.subscribe();
     let signal_generator = service.signal_generator();
 
+    // ── JFLOW-A: Session metrics push loop ────────────────────────────────
+    // Periodically snapshot SignalGenerator metrics and push to JanusAI.
+    // No-op when JANUS_AI_URL is unset, so this is safe in standalone /
+    // dev / backtest runs.
+    let session_metrics_task = {
+        let sg = Arc::clone(&signal_generator);
+        let state_for_metrics = state.clone();
+        let client = janus_core::SessionMetricsClient::from_env();
+        let session_id = std::env::var("JANUS_SESSION_ID")
+            .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
+        let push_secs = std::env::var("JANUS_AI_PUSH_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(60);
+
+        if client.is_enabled() {
+            info!(
+                "🪞 Session metrics reporter enabled — pushing to JanusAI every {}s as session {}",
+                push_secs, session_id
+            );
+        } else {
+            tracing::debug!(
+                "Session metrics reporter disabled — JANUS_AI_URL not set"
+            );
+        }
+
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(tokio::time::Duration::from_secs(push_secs));
+            // Skip the immediate firing — first push happens after one full
+            // interval so SignalMetrics has time to populate.
+            ticker.tick().await;
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        if !client.is_enabled() {
+                            // Still respect shutdown even when no-op so the
+                            // task exits promptly during teardown.
+                            if state_for_metrics.is_shutdown_requested() {
+                                break;
+                            }
+                            continue;
+                        }
+                        let m = sg.metrics();
+                        let snapshot = janus_core::SessionMetrics {
+                            signals_generated: m.total_generated(),
+                            signals_filtered: m.total_filtered(),
+                            avg_confidence: 0.0,
+                            p50_latency_us: 0,
+                            p99_latency_us: 0,
+                            regime: None,
+                        };
+                        client.push(&session_id, &snapshot).await;
+                    }
+                    _ = tokio::time::sleep(tokio::time::Duration::from_millis(500)) => {
+                        if state_for_metrics.is_shutdown_requested() {
+                            break;
+                        }
+                    }
+                }
+            }
+            info!("Session metrics reporter loop exited");
+        })
+    };
+
     // ── Spawn brain REST server (forward REST port, default 8180) ─────────
     // In unified binary mode the forward module's full RestServer is never
     // started (it would conflict with janus_api on port 8080).  Instead we
@@ -1365,6 +1430,7 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
     // Cancel tasks
     signal_gen_task.abort();
     signal_rx_task.abort();
+    session_metrics_task.abort();
 
     // Shutdown service
     service
