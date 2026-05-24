@@ -24,10 +24,11 @@
 
 ## P1 — Signal Flow (JFLOW)
 
-### JFLOW-A: Session metrics wiring  *(client + reporter loop landed 2026-05-24)*
+### JFLOW-A: Session metrics wiring  *(client + reporter + real metrics landed 2026-05-24)*
 - [x] `SessionMetricsClient` + `SessionMetrics` types in `lib/janus-core/src/session_metrics.rs` (no-op when `JANUS_AI_URL` is unset).
 - [x] Session metrics reporter loop in `services/forward/src/lib.rs::start_module` — snapshots `SignalGenerator::metrics()` every `JANUS_AI_PUSH_SECS` (default 60s) and pushes to JanusAI. Session id from `JANUS_SESSION_ID` env or a generated UUID.
-- [ ] Populate `avg_confidence`, `p50_latency_us`, `p99_latency_us`, `regime` in the snapshot — currently sent as zeros / `None` because `SignalMetrics` doesn't track them yet. Needs latency histogram + confidence accumulator on `SignalGenerator`.
+- [x] Confidence accumulator + latency ring (1024 sample window) on `SignalMetrics` — both `generate_from_analysis` and `generate_from_indicators` now feed it via `record_generated(confidence, elapsed_us)`. Reporter sends real `avg_confidence` / `p50_latency_us` / `p99_latency_us`.
+- [ ] Populate `regime` in the snapshot — needs a hook into the regime detector's most recent output. Currently sent as `None`.
 
 ### JFLOW-B: Dynamic asset config from Ruby  *(overlay landed 2026-05-24)*
 - [x] Janus startup config overlay from Redis: `Config::load()` now reads key `fks:janus:config` after env overrides (`lib/janus-core/src/config.rs::apply_redis_overlay`).
