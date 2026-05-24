@@ -1,0 +1,27 @@
+# Cargo build output
+target/
+**/target/
+
+# Logs & runtime data
+logs/
+*.log
+
+# Editor / OS junk
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Git
+.git/
+.gitignore
+
+# Local docker / compose overrides
+docker-compose.override.yml
+.env
+.env.local
+
+# Docs / CI that don't belong in the build context
+.github/
+*.md
+!README.md

@@ -1,0 +1,44 @@
+# Default JANUS configuration for standalone (docker compose) runs.
+# Environment variables override every field here; see
+# lib/janus-core/src/config.rs::apply_env_overrides for the full list.
+
+[service]
+name = "janus"
+environment = "development"
+
+[ports]
+http = 8080
+grpc = 50051
+websocket = 8081
+metrics = 9090
+
+[host]
+bind = "0.0.0.0"
+public = "localhost"
+
+[modules]
+forward = true
+backward = true
+cns = true
+api = true
+data = true
+websocket = true
+grpc = true
+metrics = true
+
+[redis]
+url = "redis://redis:6379/0"
+
+[database]
+# Postgres for the experience store + janus_memories bootstrap.
+url = "postgres://janus:janus@postgres:5432/janus"
+
+[questdb]
+host = "questdb"
+
+[assets]
+enabled = ["BTC", "ETH", "SOL"]
+default_quote = "USD"
+
+[trading]
+mode = "simulation"

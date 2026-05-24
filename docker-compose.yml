@@ -1,0 +1,122 @@
+# fks-janus standalone compose
+#
+# Boots the janus binary together with the backing services it needs to
+# come up cleanly (Redis, Postgres, QuestDB). Alertmanager / JanusAI /
+# Ruby executor are intentionally NOT included here — they live in the
+# parent fks compose tree. Janus tolerates their absence: signal pushes
+# log warnings and continue.
+#
+# Usage:
+#   docker compose up -d           # start everything
+#   docker compose logs -f janus   # tail janus
+#   docker compose down            # stop & remove
+#
+# Override a build pin without editing this file:
+#   FKS_PROTO_REF=v0.4.0 docker compose build janus
+
+name: fks-janus
+
+services:
+  janus:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        FKS_PROTO_REF: ${FKS_PROTO_REF:-main}
+    image: fks-janus:dev
+    container_name: fks_janus
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      questdb:
+        condition: service_started
+    environment:
+      RUST_LOG: ${RUST_LOG:-info}
+      JANUS_ENVIRONMENT: ${JANUS_ENVIRONMENT:-development}
+      JANUS_AUTO_START: ${JANUS_AUTO_START:-false}
+      # Backing services — overrides config/janus.toml.
+      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgres://janus:janus@postgres:5432/janus
+      QUESTDB_HOST: questdb
+      # JFLOW-A: when set, the signal pipeline pushes per-cycle metrics
+      # to JanusAI. Leave unset for standalone runs.
+      JANUS_AI_URL: ${JANUS_AI_URL:-}
+      # JFLOW-D: memory bootstrap window (days, max records).
+      JANUS_BOOTSTRAP_DAYS: ${JANUS_BOOTSTRAP_DAYS:-30}
+      JANUS_BOOTSTRAP_LIMIT: ${JANUS_BOOTSTRAP_LIMIT:-500}
+    ports:
+      - "${JANUS_HTTP_PORT:-8080}:8080"      # REST API
+      - "${JANUS_WS_PORT:-8081}:8081"        # WebSocket
+      - "${JANUS_METRICS_PORT:-9090}:9090"   # Prometheus scrape
+      - "${JANUS_GRPC_PORT:-50051}:50051"    # gRPC
+    volumes:
+      - ./config:/opt/janus/config:ro
+      - janus_logs:/opt/janus/logs
+      - janus_checkpoints:/opt/janus/checkpoints
+    restart: unless-stopped
+    networks:
+      - janus_net
+
+  redis:
+    image: redis:7-alpine
+    container_name: fks_janus_redis
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - janus_net
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: fks_janus_postgres
+    environment:
+      POSTGRES_USER: janus
+      POSTGRES_PASSWORD: janus
+      POSTGRES_DB: janus
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./services/backward/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U janus -d janus"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - janus_net
+
+  questdb:
+    image: questdb/questdb:8.1.1
+    container_name: fks_janus_questdb
+    ports:
+      - "${QUESTDB_HTTP_PORT:-9000}:9000"   # REST / web console
+      - "${QUESTDB_ILP_PORT:-9009}:9009"    # InfluxDB line protocol
+      - "${QUESTDB_PG_PORT:-8812}:8812"     # Postgres wire protocol
+    volumes:
+      - questdb_data:/var/lib/questdb
+    restart: unless-stopped
+    networks:
+      - janus_net
+
+volumes:
+  redis_data:
+  postgres_data:
+  questdb_data:
+  janus_logs:
+  janus_checkpoints:
+
+networks:
+  janus_net:
+    driver: bridge
