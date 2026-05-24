@@ -1,0 +1,87 @@
+// Position feedback + trade-outcome service.
+// Reconstructed from janus call-site usage 2026-05-24.
+//
+// Janus (the forward service) is the server; the Ruby/JanusAI services are
+// the clients. PositionFeedback streams describe live position state; Janus
+// responds with TradeGuidance derived from the brain pipeline.
+
+syntax = "proto3";
+
+package fks.feedback.v1;
+
+// ─── Service ───────────────────────────────────────────────────────────────
+
+service PositionFeedbackService {
+  // Consume a client-streaming sequence of position updates and return a
+  // single guidance result based on the most recent message.
+  rpc StreamPositionUpdates(stream PositionFeedback) returns (TradeGuidance);
+
+  // One-shot variant: single position → single guidance.
+  rpc ReportPosition(PositionFeedback) returns (TradeGuidance);
+
+  // Record a completed trade lifecycle for downstream memory/learning.
+  rpc RecordTradeOutcome(TradeOutcome) returns (TradeOutcomeAck);
+}
+
+// ─── Enums ─────────────────────────────────────────────────────────────────
+
+enum GuidanceAction {
+  GUIDANCE_ACTION_UNSPECIFIED = 0;
+  GUIDANCE_ACTION_HOLD = 1;
+  GUIDANCE_ACTION_TAKE_PROFIT = 2;
+  GUIDANCE_ACTION_TRAIL_STOP = 3;
+  GUIDANCE_ACTION_REDUCE = 4;
+  GUIDANCE_ACTION_CLOSE = 5;
+}
+
+// ─── Messages ──────────────────────────────────────────────────────────────
+
+// Live position state pushed by Ruby's execution engine.
+message PositionFeedback {
+  string signal_id = 1;
+  string symbol = 2;
+  double entry_price = 3;
+  double current_price = 4;
+  double unrealized_pnl = 5;
+  double quantity = 6;
+  // ms since epoch
+  int64 timestamp_ms = 7;
+  string account_id = 8;
+  string strategy = 9;
+  // Optional regime label at observation time.
+  string regime = 10;
+}
+
+// Brain-derived guidance returned to the caller.
+message TradeGuidance {
+  string signal_id = 1;
+  GuidanceAction action = 2;
+  double confidence = 3;
+  string reason = 4;
+  int64 timestamp_ms = 5;
+  // Optional suggested target/stop adjustments.
+  optional double suggested_take_profit = 6;
+  optional double suggested_stop_loss = 7;
+}
+
+// Completed trade lifecycle. result: "win" | "loss" | "scratch".
+message TradeOutcome {
+  string signal_id = 1;
+  string symbol = 2;
+  string account_id = 3;
+  double pnl = 4;
+  double pnl_percent = 5;
+  string result = 6;
+  string exit_reason = 7;
+  string strategy = 8;
+  string regime = 9;
+  int64 duration_ms = 10;
+  int64 timestamp_ms = 11;
+}
+
+// Acknowledgement that the trade has been seen.
+message TradeOutcomeAck {
+  string signal_id = 1;
+  bool stored = 2;
+  string memory_id = 3;
+}

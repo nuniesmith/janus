@@ -1,0 +1,112 @@
+// Regime bridge — pushes hypothalamus/amygdala regime state between Janus
+// brain-pipeline stages and external consumers.
+// Reconstructed from janus call-site usage 2026-05-24.
+
+syntax = "proto3";
+
+package fks.janus.v1.bridge;
+
+// ─── Service ───────────────────────────────────────────────────────────────
+
+service RegimeBridgeService {
+  rpc PushRegimeState(PushRegimeStateRequest) returns (PushRegimeStateResponse);
+  rpc PushRegimeStateBatch(PushRegimeStateBatchRequest) returns (PushRegimeStateBatchResponse);
+  rpc GetCurrentRegime(GetCurrentRegimeRequest) returns (GetCurrentRegimeResponse);
+  rpc StreamRegimeUpdates(StreamRegimeUpdatesRequest) returns (stream RegimeState);
+}
+
+// ─── Enums ─────────────────────────────────────────────────────────────────
+
+enum HypothalamusRegime {
+  HYPOTHALAMUS_REGIME_UNSPECIFIED = 0;
+  HYPOTHALAMUS_REGIME_STRONG_BULLISH = 1;
+  HYPOTHALAMUS_REGIME_BULLISH = 2;
+  HYPOTHALAMUS_REGIME_NEUTRAL = 3;
+  HYPOTHALAMUS_REGIME_BEARISH = 4;
+  HYPOTHALAMUS_REGIME_STRONG_BEARISH = 5;
+  HYPOTHALAMUS_REGIME_HIGH_VOLATILITY = 6;
+  HYPOTHALAMUS_REGIME_LOW_VOLATILITY = 7;
+  HYPOTHALAMUS_REGIME_TRANSITIONAL = 8;
+  HYPOTHALAMUS_REGIME_CRISIS = 9;
+  HYPOTHALAMUS_REGIME_UNKNOWN = 10;
+}
+
+enum AmygdalaRegime {
+  AMYGDALA_REGIME_UNSPECIFIED = 0;
+  AMYGDALA_REGIME_LOW_VOL_TRENDING = 1;
+  AMYGDALA_REGIME_LOW_VOL_MEAN_REVERTING = 2;
+  AMYGDALA_REGIME_HIGH_VOL_TRENDING = 3;
+  AMYGDALA_REGIME_HIGH_VOL_MEAN_REVERTING = 4;
+  AMYGDALA_REGIME_CRISIS = 5;
+  AMYGDALA_REGIME_TRANSITIONAL = 6;
+  AMYGDALA_REGIME_UNKNOWN = 7;
+}
+
+// ─── Messages ──────────────────────────────────────────────────────────────
+
+message RegimeIndicators {
+  double trend = 1;
+  double trend_strength = 2;
+  double volatility = 3;
+  double volatility_percentile = 4;
+  double correlation = 5;
+  double breadth = 6;
+  double momentum = 7;
+  double relative_volume = 8;
+  double liquidity_score = 9;
+  double fear_index = 10;
+}
+
+message RegimeState {
+  string symbol = 1;
+  HypothalamusRegime hypothalamus_regime = 2;
+  AmygdalaRegime amygdala_regime = 3;
+  double position_scale = 4;
+  bool is_high_risk = 5;
+  double confidence = 6;
+  RegimeIndicators indicators = 7;
+  int64 timestamp_us = 8;
+  int64 sequence = 9;
+  bool is_transition = 10;
+  HypothalamusRegime previous_hypothalamus_regime = 11;
+  AmygdalaRegime previous_amygdala_regime = 12;
+}
+
+message PushRegimeStateRequest {
+  RegimeState state = 1;
+  string source_id = 2;
+}
+
+message PushRegimeStateResponse {
+  bool accepted = 1;
+  string message = 2;
+  uint64 processing_time_us = 3;
+}
+
+message PushRegimeStateBatchRequest {
+  repeated RegimeState states = 1;
+  string source_id = 2;
+}
+
+message PushRegimeStateBatchResponse {
+  uint32 accepted_count = 1;
+  uint32 rejected_count = 2;
+  string message = 3;
+  uint64 processing_time_us = 4;
+}
+
+message GetCurrentRegimeRequest {
+  repeated string symbols = 1;
+}
+
+message GetCurrentRegimeResponse {
+  repeated RegimeState states = 1;
+  int64 server_timestamp_us = 2;
+}
+
+message StreamRegimeUpdatesRequest {
+  string client_id = 1;
+  repeated string symbols = 2;
+  bool transitions_only = 3;
+  double min_confidence = 4;
+}

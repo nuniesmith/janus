@@ -52,10 +52,11 @@
 
 ## P2 — Build & Deployment
 
-- [x] Standalone `Dockerfile` for the unified `janus` binary (multi-stage, builds against an upstream `fks-proto` checkout).
+- [x] Standalone `Dockerfile` for the unified `janus` binary (multi-stage, no parent-repo clone needed).
 - [x] Standalone `docker-compose.yml` with Redis + QuestDB + Postgres so this repo can boot independently of the fks compose tree.
-- [ ] Publish a stub `fks-proto` crate (or vendor it under `crates/`) so the workspace builds without cloning the parent repo. Today `Cargo.toml` declares `fks-proto = { path = "../../src/proto" }` which only resolves when janus is nested inside `fks/src/janus`.
-- [ ] CI: add a GitHub Actions job that exercises the Dockerfile path on every PR.
+- [x] Vendored `fks-proto` crate at `crates/fks-proto/` — proto schemas reconstructed from janus call-site usage (2026-05-24). Workspace builds without cloning the parent fks repo.
+  - **Wire-compat note:** field numbers were chosen locally; talking to legacy upstream services may require schema alignment until the upstream catches up.
+- [ ] CI: add a GitHub Actions job that exercises `cargo check --workspace` + the Dockerfile build path + pushes to `nuniesmith/janus` on dockerhub on merges to main.
 
 ---
 

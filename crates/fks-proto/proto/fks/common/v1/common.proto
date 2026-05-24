@@ -1,0 +1,45 @@
+// Common types shared across FKS services.
+// Reconstructed from janus call-site usage 2026-05-24.
+
+syntax = "proto3";
+
+package fks.common.v1;
+
+// ─── Health check ──────────────────────────────────────────────────────────
+
+message HealthCheckRequest {}
+
+message HealthCheckResponse {
+  bool healthy = 1;
+  string status = 2;
+  map<string, string> components = 3;
+  int64 uptime_seconds = 4;
+  string version = 5;
+  int64 timestamp = 6;
+}
+
+// ─── Order primitives ──────────────────────────────────────────────────────
+
+// Trade side. Used in execution + position contexts.
+enum Side {
+  SIDE_UNSPECIFIED = 0;
+  SIDE_BUY = 1;
+  SIDE_SELL = 2;
+}
+
+enum OrderType {
+  ORDER_TYPE_UNSPECIFIED = 0;
+  ORDER_TYPE_MARKET = 1;
+  ORDER_TYPE_LIMIT = 2;
+  ORDER_TYPE_STOP_MARKET = 3;
+  ORDER_TYPE_STOP_LIMIT = 4;
+  ORDER_TYPE_TRAILING_STOP = 5;
+}
+
+enum TimeInForce {
+  TIME_IN_FORCE_UNSPECIFIED = 0;
+  TIME_IN_FORCE_GTC = 1;  // Good-til-cancelled
+  TIME_IN_FORCE_IOC = 2;  // Immediate-or-cancel
+  TIME_IN_FORCE_FOK = 3;  // Fill-or-kill
+  TIME_IN_FORCE_GTD = 4;  // Good-til-date
+}

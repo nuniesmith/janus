@@ -72,8 +72,8 @@ tonic-prost = { workspace = true }
 prost = "0.14"
 prost-types = "0.14"
 
-# Centralized proto definitions
-fks-proto = { path = "../../../src/proto" }
+# Centralized proto definitions (vendored at crates/fks-proto)
+fks-proto = { workspace = true }
 
 # NCCL bindings for GPU communication
 cudarc = { version = "0.18.2", features = ["nccl", "cuda-12050"], optional = true }
