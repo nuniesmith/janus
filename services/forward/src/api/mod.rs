@@ -20,7 +20,6 @@
 
 pub mod brain_rest;
 pub mod feedback_grpc;
-pub mod grpc;
 pub mod rest;
 pub mod risk_rest;
 pub mod server;
