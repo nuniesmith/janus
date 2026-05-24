@@ -422,10 +422,13 @@ mod tests {
     fn test_uptime() {
         let monitor = ProductionMonitor::default();
         let uptime_before = monitor.uptime_seconds();
-        std::thread::sleep(Duration::from_millis(100));
+        // uptime_seconds() truncates to whole seconds, so a sub-second
+        // sleep can leave both samples in the same second on a fast
+        // runner. Sleep past the boundary and assert the counter
+        // actually advanced.
+        std::thread::sleep(Duration::from_millis(1100));
 
-        // Verify uptime increased
-        assert!(monitor.uptime_seconds() > uptime_before);
+        assert!(monitor.uptime_seconds() >= uptime_before + 1);
     }
 
     #[test]
