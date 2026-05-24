@@ -171,12 +171,55 @@ async fn main() -> Result<()> {
                                     .min(2000);
 
                                 if bootstrap_days > 0 {
-                                    bootstrap_affinity_from_redis_ring(
-                                        pipeline,
-                                        store.config().redis_url.clone(),
-                                        bootstrap_limit,
-                                    )
-                                    .await;
+                                    // Prefer the direct Postgres path when a
+                                    // DATABASE_URL is configured (the persistence
+                                    // feature must be compiled in for sqlx to be
+                                    // available). Falls back to the Redis ring
+                                    // buffer when Postgres is absent, the
+                                    // janus_memories table is missing, the query
+                                    // errors, or it returns zero rows.
+                                    let mut replayed_from_pg: u64 = 0;
+                                    #[cfg(feature = "persistence")]
+                                    {
+                                        if let Ok(db_url) = std::env::var("DATABASE_URL") {
+                                            match bootstrap_affinity_from_postgres(
+                                                pipeline,
+                                                &db_url,
+                                                bootstrap_days,
+                                                bootstrap_limit as i64,
+                                            )
+                                            .await
+                                            {
+                                                Ok(n) if n > 0 => {
+                                                    info!(
+                                                        "🧠✅ Bootstrap: replayed {} memories from Postgres janus_memories",
+                                                        n
+                                                    );
+                                                    replayed_from_pg = n;
+                                                }
+                                                Ok(_) => {
+                                                    info!(
+                                                        "🧠 Bootstrap: Postgres janus_memories empty/absent — trying Redis ring"
+                                                    );
+                                                }
+                                                Err(e) => {
+                                                    warn!(
+                                                        "🧠 Bootstrap: Postgres query failed: {} — trying Redis ring",
+                                                        e
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    if replayed_from_pg == 0 {
+                                        bootstrap_affinity_from_redis_ring(
+                                            pipeline,
+                                            store.config().redis_url.clone(),
+                                            bootstrap_limit,
+                                        )
+                                        .await;
+                                    }
                                 }
                             }
                             Err(e) => {
@@ -904,4 +947,102 @@ async fn bootstrap_affinity_from_redis_ring(
         raw.len(),
         skipped,
     );
+}
+
+/// **JFLOW-D**: Bootstrap the strategy-affinity tracker directly from the
+/// Postgres `janus_memories` table.
+///
+/// This is the preferred path over `bootstrap_affinity_from_redis_ring` —
+/// the Redis ring buffer is a 500-entry intermediate written by the Python
+/// JanusAI service. Reading Postgres directly removes that hop and lets the
+/// brain replay older history than the ring retains.
+///
+/// Returns the number of memories replayed (0 if the table is absent / empty
+/// or the query failed in a tolerable way). Connection / query failures are
+/// returned as errors so the caller can fall through to the Redis ring.
+///
+/// Expected schema (the table is owned by the JanusAI service so the column
+/// set may evolve; missing optional columns degrade gracefully):
+/// ```text
+///   strategy   TEXT
+///   symbol     TEXT
+///   pnl        DOUBLE PRECISION
+///   result     TEXT          NULL  -- 'win' / 'loss' / NULL
+///   rr_ratio   DOUBLE PRECISION  NULL
+///   created_at TIMESTAMPTZ
+/// ```
+#[cfg(feature = "persistence")]
+async fn bootstrap_affinity_from_postgres(
+    pipeline: &Arc<janus_forward::TradingPipeline>,
+    database_url: &str,
+    days: u64,
+    limit: i64,
+) -> anyhow::Result<u64> {
+    use sqlx::Row;
+    use sqlx::postgres::PgPoolOptions;
+
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .acquire_timeout(std::time::Duration::from_secs(5))
+        .connect(database_url)
+        .await?;
+
+    // Probe for the table first — a missing table is the expected state on
+    // fresh deploys and shouldn't be reported as an error.
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM information_schema.tables
+             WHERE table_name = 'janus_memories'
+         )",
+    )
+    .fetch_one(&pool)
+    .await?;
+
+    if !exists {
+        return Ok(0);
+    }
+
+    let interval = format!("{days} days");
+    let rows = sqlx::query(
+        "SELECT strategy, symbol, pnl, result, rr_ratio
+         FROM janus_memories
+         WHERE created_at >= NOW() - $1::interval
+         ORDER BY created_at DESC
+         LIMIT $2",
+    )
+    .bind(&interval)
+    .bind(limit)
+    .fetch_all(&pool)
+    .await?;
+
+    if rows.is_empty() {
+        return Ok(0);
+    }
+
+    let mut replayed: u64 = 0;
+    let mut gate = pipeline.strategy_gate_mut().await;
+    let tracker = gate.tracker_mut();
+
+    for row in &rows {
+        let strategy: String = row
+            .try_get::<String, _>("strategy")
+            .unwrap_or_else(|_| "unknown".to_string());
+        let symbol_raw: String = row
+            .try_get::<String, _>("symbol")
+            .unwrap_or_else(|_| "UNKNOWN".to_string());
+        // Match the Redis-ring normalisation: "BTC/USD" → "BTCUSD".
+        let asset = symbol_raw.replace('/', "").to_uppercase();
+        let pnl: f64 = row.try_get::<f64, _>("pnl").unwrap_or(0.0);
+        let result: Option<String> = row.try_get::<Option<String>, _>("result").ok().flatten();
+        let is_winner = match result.as_deref() {
+            Some(s) => s.eq_ignore_ascii_case("win"),
+            None => pnl > 0.0,
+        };
+        let rr_ratio: Option<f64> = row.try_get::<Option<f64>, _>("rr_ratio").ok().flatten();
+
+        tracker.record_trade_result_with_rr(&strategy, &asset, pnl, is_winner, rr_ratio);
+        replayed += 1;
+    }
+
+    Ok(replayed)
 }

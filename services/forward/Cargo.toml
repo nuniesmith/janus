@@ -140,7 +140,7 @@ janus-cns = { path = "../../crates/cns" }
 janus-optimizer = { path = "../../crates/optimizer" }
 
 [features]
-default = ["redis"]
+default = ["redis", "persistence"]
 persistence = ["sqlx"]
 redis = []
 tls = ["tonic/tls-ring"]
