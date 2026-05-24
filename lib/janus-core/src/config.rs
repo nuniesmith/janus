@@ -1410,9 +1410,10 @@ impl Config {
     /// Load configuration from TOML file with environment variable overrides
     ///
     /// Priority order (highest to lowest):
-    /// 1. Environment variables
-    /// 2. TOML config file
-    /// 3. Default values
+    /// 1. Redis overlay at `fks:janus:config` (when `redis` feature enabled and key present)
+    /// 2. Environment variables
+    /// 3. TOML config file
+    /// 4. Default values
     pub fn load() -> anyhow::Result<Self> {
         // Try to load from TOML file
         let mut config = Self::load_from_file()?;
@@ -1422,6 +1423,12 @@ impl Config {
 
         // Normalize legacy fields
         config.normalize_legacy_fields();
+
+        // Apply Redis overlay (JanusAI session-driven config from Ruby).
+        // Best-effort: failures are warned and ignored so cold boot still
+        // works when Redis is unavailable.
+        #[cfg(feature = "redis")]
+        config.apply_redis_overlay_blocking();
 
         Ok(config)
     }
@@ -1735,6 +1742,92 @@ impl Config {
         }
     }
 
+    /// Apply an overlay sourced from the `fks:janus:config` Redis key.
+    ///
+    /// The overlay is a JSON object whose keys mirror the sections produced
+    /// by `Config::to_toml()`; only fields that are present in the JSON
+    /// document are touched (everything else keeps its prior value).
+    ///
+    /// This is the JFLOW-B handshake — Ruby writes session-specific config
+    /// (currently: which assets to trade) into Redis when a JanusAI session
+    /// starts; Janus picks it up on the next cold boot.
+    ///
+    /// Best-effort: connection or parse failures are logged and ignored so
+    /// the process can still boot when Redis is unavailable or the key is
+    /// malformed.
+    #[cfg(feature = "redis")]
+    fn apply_redis_overlay_blocking(&mut self) {
+        // Skip entirely when explicitly disabled so unit tests can opt out.
+        if matches!(
+            std::env::var("JANUS_REDIS_OVERLAY").as_deref(),
+            Ok("0" | "false" | "off" | "no")
+        ) {
+            return;
+        }
+
+        let url = self.redis.url.clone();
+        let key = std::env::var("JANUS_REDIS_CONFIG_KEY")
+            .unwrap_or_else(|_| "fks:janus:config".to_string());
+
+        // Run the async Redis fetch on a tiny single-threaded runtime so
+        // `Config::load()` stays synchronous (it's called before tokio's
+        // main runtime exists).
+        let fetched = std::thread::spawn(move || -> Option<String> {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .ok()?;
+            rt.block_on(async move {
+                let client = redis::Client::open(url.as_str()).ok()?;
+                let mut conn = client.get_multiplexed_async_connection().await.ok()?;
+                redis::cmd("GET")
+                    .arg(&key)
+                    .query_async::<Option<String>>(&mut conn)
+                    .await
+                    .ok()
+                    .flatten()
+            })
+        })
+        .join()
+        .ok()
+        .flatten();
+
+        let Some(json) = fetched else {
+            debug!("Redis config overlay: key not present, using env/file config");
+            return;
+        };
+
+        let overlay: serde_json::Value = match serde_json::from_str(&json) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("Redis config overlay: malformed JSON at {key} — {e}", key = "fks:janus:config");
+                return;
+            }
+        };
+
+        // Merge overlay into a JSON view of self, then deserialize back.
+        // Using JSON as the intermediate keeps the merge logic ignorant of
+        // the (large) Config schema — anything serde can round-trip works.
+        let mut base = match serde_json::to_value(&*self) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("Redis config overlay: failed to serialize current config — {e}");
+                return;
+            }
+        };
+        merge_json(&mut base, overlay);
+
+        match serde_json::from_value::<Config>(base) {
+            Ok(merged) => {
+                info!("Redis config overlay applied from key fks:janus:config");
+                *self = merged;
+            }
+            Err(e) => {
+                warn!("Redis config overlay: merged document failed to deserialize — {e}");
+            }
+        }
+    }
+
     /// Check if running in production
     pub fn is_production(&self) -> bool {
         self.service.environment == "production"
@@ -1810,6 +1903,25 @@ impl Config {
 
 fn parse_bool(s: &str) -> bool {
     matches!(s.to_lowercase().as_str(), "true" | "1" | "yes" | "on")
+}
+
+/// Deep-merge `overlay` into `base`. Objects are merged recursively; any
+/// other value type in `overlay` (including arrays and null) replaces the
+/// corresponding entry in `base`. Used by the Redis config overlay so a
+/// partial JSON document like `{"assets": {"enabled": ["BTC"]}}` only
+/// touches `assets.enabled`.
+#[cfg(feature = "redis")]
+fn merge_json(base: &mut serde_json::Value, overlay: serde_json::Value) {
+    match (base, overlay) {
+        (serde_json::Value::Object(base_map), serde_json::Value::Object(overlay_map)) => {
+            for (k, v) in overlay_map {
+                merge_json(base_map.entry(k).or_insert(serde_json::Value::Null), v);
+            }
+        }
+        (slot, value) => {
+            *slot = value;
+        }
+    }
 }
 
 // ============================================================================
@@ -1893,5 +2005,34 @@ mod tests {
         let mut config = Config::default();
         config.trading.mode = "invalid".to_string();
         assert!(config.validate().is_err());
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
+    fn test_merge_json_partial_overlay_only_touches_named_fields() {
+        let mut base = serde_json::json!({
+            "ports": { "http": 8080, "grpc": 50051 },
+            "assets": { "enabled": ["BTC", "ETH"], "default_quote": "USD" }
+        });
+        let overlay = serde_json::json!({
+            "assets": { "enabled": ["SOL"] }
+        });
+        merge_json(&mut base, overlay);
+
+        // Untouched fields survive.
+        assert_eq!(base["ports"]["http"], 8080);
+        assert_eq!(base["assets"]["default_quote"], "USD");
+        // Overlay field is replaced (array replacement, not concat).
+        assert_eq!(base["assets"]["enabled"], serde_json::json!(["SOL"]));
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
+    fn test_merge_json_replaces_scalars_and_handles_null() {
+        let mut base = serde_json::json!({ "service": { "name": "old" } });
+        let overlay = serde_json::json!({ "service": { "name": "new", "extra": null } });
+        merge_json(&mut base, overlay);
+        assert_eq!(base["service"]["name"], "new");
+        assert!(base["service"]["extra"].is_null());
     }
 }
