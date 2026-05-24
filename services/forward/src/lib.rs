@@ -783,12 +783,13 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                             continue;
                         }
                         let m = sg.metrics();
+                        let (p50_latency_us, p99_latency_us) = m.latency_percentiles_us();
                         let snapshot = janus_core::SessionMetrics {
                             signals_generated: m.total_generated(),
                             signals_filtered: m.total_filtered(),
-                            avg_confidence: 0.0,
-                            p50_latency_us: 0,
-                            p99_latency_us: 0,
+                            avg_confidence: m.avg_confidence(),
+                            p50_latency_us,
+                            p99_latency_us,
                             regime: None,
                         };
                         client.push(&session_id, &snapshot).await;

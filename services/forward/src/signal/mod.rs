@@ -444,6 +444,7 @@ impl SignalGenerator {
         analysis: &IndicatorAnalysis,
         current_price: f64,
     ) -> Result<Option<TradingSignal>> {
+        let started_at = std::time::Instant::now();
         debug!(
             "Generating signal from analysis for {} on {}",
             symbol,
@@ -550,15 +551,12 @@ impl SignalGenerator {
             && !signal.meets_threshold(self.config.min_confidence, self.config.min_strength)
         {
             debug!("Signal filtered out due to quality threshold");
-            self.metrics
-                .filtered_signals
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.metrics.record_filtered();
             return Ok(None);
         }
 
-        self.metrics
-            .generated_signals
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let elapsed_us = started_at.elapsed().as_micros() as u64;
+        self.metrics.record_generated(signal.confidence, elapsed_us);
         info!(
             "Generated signal: {:?} for {} (confidence: {:.3})",
             signal.signal_type, signal.symbol, signal.confidence
@@ -680,6 +678,7 @@ impl SignalGenerator {
         timeframe: Timeframe,
         indicator_values: IndicatorValues,
     ) -> Result<Option<TradingSignal>> {
+        let started_at = std::time::Instant::now();
         debug!(
             "Generating signal from indicators for {} on {}",
             symbol,
@@ -713,15 +712,12 @@ impl SignalGenerator {
             && !signal.meets_threshold(self.config.min_confidence, self.config.min_strength)
         {
             debug!("Signal filtered out due to quality threshold");
-            self.metrics
-                .filtered_signals
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.metrics.record_filtered();
             return Ok(None);
         }
 
-        self.metrics
-            .generated_signals
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let elapsed_us = started_at.elapsed().as_micros() as u64;
+        self.metrics.record_generated(signal.confidence, elapsed_us);
         info!(
             "Generated signal: {:?} for {}",
             signal.signal_type, signal.symbol
@@ -906,12 +902,29 @@ impl IndicatorValues {
 }
 
 /// Signal generation metrics
+///
+/// `generated_signals` / `filtered_signals` / `cached_signals` are public
+/// atomic counters for direct fetch_add use by call sites that don't have
+/// latency/confidence context. Prefer `record_generated()` /
+/// `record_filtered()` where you do — they also feed the histogram and
+/// confidence accumulator used by the JFLOW-A session metrics reporter.
 #[derive(Debug, Default)]
 pub struct SignalMetrics {
     pub generated_signals: std::sync::atomic::AtomicU64,
     pub filtered_signals: std::sync::atomic::AtomicU64,
     pub cached_signals: std::sync::atomic::AtomicU64,
+    /// Sum of `confidence * 1_000_000` over generated signals (fixed-point
+    /// so the field can stay a plain `AtomicU64`).
+    confidence_sum_micros: std::sync::atomic::AtomicU64,
+    /// Number of contributions to `confidence_sum_micros`.
+    confidence_count: std::sync::atomic::AtomicU64,
+    /// Ring buffer of the most recent generation latencies in microseconds.
+    /// Bounded to `LATENCY_RING_CAPACITY` entries; oldest is evicted on push.
+    latency_samples: std::sync::Mutex<std::collections::VecDeque<u64>>,
 }
+
+/// How many recent latency samples to retain for percentile computation.
+const LATENCY_RING_CAPACITY: usize = 1024;
 
 impl SignalMetrics {
     pub fn total_generated(&self) -> u64 {
@@ -933,6 +946,67 @@ impl SignalMetrics {
         } else {
             0.0
         }
+    }
+
+    /// Record a successfully generated signal: bumps the counter, folds
+    /// `confidence` into the running mean, and pushes `elapsed_us` into
+    /// the latency ring.
+    pub fn record_generated(&self, confidence: f64, elapsed_us: u64) {
+        use std::sync::atomic::Ordering;
+        self.generated_signals.fetch_add(1, Ordering::Relaxed);
+
+        let conf = confidence.clamp(0.0, 1.0);
+        let conf_fixed = (conf * 1_000_000.0).round() as u64;
+        self.confidence_sum_micros
+            .fetch_add(conf_fixed, Ordering::Relaxed);
+        self.confidence_count.fetch_add(1, Ordering::Relaxed);
+
+        if let Ok(mut buf) = self.latency_samples.lock() {
+            if buf.len() == LATENCY_RING_CAPACITY {
+                buf.pop_front();
+            }
+            buf.push_back(elapsed_us);
+        }
+    }
+
+    /// Record a signal that was generated and then filtered out by quality
+    /// gates. Only bumps the filtered counter.
+    pub fn record_filtered(&self) {
+        self.filtered_signals
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Mean confidence over all signals recorded via `record_generated`.
+    /// Returns `0.0` before any signal has been recorded.
+    pub fn avg_confidence(&self) -> f64 {
+        use std::sync::atomic::Ordering;
+        let count = self.confidence_count.load(Ordering::Relaxed);
+        if count == 0 {
+            return 0.0;
+        }
+        let sum_fixed = self.confidence_sum_micros.load(Ordering::Relaxed) as f64;
+        (sum_fixed / 1_000_000.0) / count as f64
+    }
+
+    /// `(p50, p99)` of the latency ring in microseconds. Returns `(0, 0)`
+    /// when the ring is empty.
+    pub fn latency_percentiles_us(&self) -> (u64, u64) {
+        let Ok(buf) = self.latency_samples.lock() else {
+            return (0, 0);
+        };
+        if buf.is_empty() {
+            return (0, 0);
+        }
+        let mut samples: Vec<u64> = buf.iter().copied().collect();
+        drop(buf);
+        samples.sort_unstable();
+        let n = samples.len();
+        // Nearest-rank percentile (1-indexed): idx = ceil(p * n) - 1.
+        let pick = |p: f64| -> u64 {
+            let rank = ((p * n as f64).ceil() as usize).saturating_sub(1).min(n - 1);
+            samples[rank]
+        };
+        (pick(0.50), pick(0.99))
     }
 }
 
@@ -1075,5 +1149,45 @@ mod tests {
         // Only high-quality signal should pass
         assert_eq!(batch.signals.len(), 1);
         assert_eq!(batch.signals[0].symbol, "BTC/USD");
+    }
+
+    #[test]
+    fn test_signal_metrics_avg_confidence() {
+        let m = SignalMetrics::default();
+        assert_eq!(m.avg_confidence(), 0.0);
+
+        m.record_generated(0.80, 1_000);
+        m.record_generated(0.60, 1_000);
+        m.record_generated(1.00, 1_000);
+        // (0.8 + 0.6 + 1.0) / 3 = 0.8 (with fixed-point rounding tolerance)
+        assert!((m.avg_confidence() - 0.8).abs() < 1e-5);
+        assert_eq!(m.total_generated(), 3);
+    }
+
+    #[test]
+    fn test_signal_metrics_latency_percentiles() {
+        let m = SignalMetrics::default();
+        assert_eq!(m.latency_percentiles_us(), (0, 0));
+
+        for us in [100u64, 200, 300, 400, 500, 600, 700, 800, 900, 1000] {
+            m.record_generated(0.5, us);
+        }
+        let (p50, p99) = m.latency_percentiles_us();
+        // p50 of 10 samples (nearest-rank, 1-indexed: ceil(0.5*10)=5 -> idx 4 -> 500us)
+        assert_eq!(p50, 500);
+        // p99 of 10 samples -> idx 9 -> 1000us
+        assert_eq!(p99, 1000);
+    }
+
+    #[test]
+    fn test_signal_metrics_record_filtered_does_not_touch_confidence() {
+        let m = SignalMetrics::default();
+        m.record_generated(0.9, 500);
+        m.record_filtered();
+        m.record_filtered();
+        assert_eq!(m.total_generated(), 1);
+        assert_eq!(m.total_filtered(), 2);
+        // Confidence accumulator only fed by record_generated.
+        assert!((m.avg_confidence() - 0.9).abs() < 1e-5);
     }
 }
