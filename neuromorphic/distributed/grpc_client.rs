@@ -499,6 +499,7 @@ pub fn create_node_capabilities(
         gpu_type,
         total_memory: 0,
         num_cpus: num_cpus::get() as u32,
+        framework_version: String::new(),
     }
 }
 
