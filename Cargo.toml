@@ -15,6 +15,8 @@
 
 [workspace]
 members = [
+    # Vendored proto crate (Janus is now self-contained)
+    "crates/fks-proto",
     # New unified JANUS infrastructure
     "bin/janus",
     "bin/backtest-cli",
@@ -80,9 +82,10 @@ rust-version = "1.92.0"
 
 [workspace.dependencies]
 # ===========================================================================
-# Shared Proto Crate (from root workspace)
+# Shared Proto Crate (local — vendored from upstream fks/src/proto, see
+# crates/fks-proto for the reconstructed proto definitions)
 # ===========================================================================
-fks-proto = { path = "../../src/proto" }
+fks-proto = { path = "crates/fks-proto" }
 
 # ===========================================================================
 # JANUS Local Dependencies

@@ -1,0 +1,17 @@
+[package]
+name = "fks-proto"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Janus-side reconstruction of the FKS protobuf surface. Wire-compatible with the schemas this crate compiles; talking to legacy fks-proto services may require alignment."
+
+[dependencies]
+prost = { workspace = true }
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
+
+[build-dependencies]
+tonic-prost-build = "0.14.2"

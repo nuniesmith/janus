@@ -1,0 +1,243 @@
+// Distributed training coordination service.
+// Reconstructed from janus call-site usage 2026-05-24.
+//
+// Parameter server / collective comms (push gradients, pull params, barrier,
+// heartbeat, all-reduce, broadcast, gather, register, cluster status).
+
+syntax = "proto3";
+
+package fks.neuromorphic.distributed.v1;
+
+// ─── Service ───────────────────────────────────────────────────────────────
+
+service DistributedTrainingService {
+  rpc PushGradients(PushGradientsRequest) returns (PushGradientsResponse);
+  rpc PullParameters(PullParametersRequest) returns (PullParametersResponse);
+  rpc Barrier(BarrierRequest) returns (BarrierResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  rpc AllReduce(AllReduceRequest) returns (AllReduceResponse);
+  rpc Broadcast(BroadcastRequest) returns (BroadcastResponse);
+  rpc Gather(GatherRequest) returns (GatherResponse);
+  rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse);
+  rpc GetClusterStatus(GetClusterStatusRequest) returns (GetClusterStatusResponse);
+}
+
+// ─── Enums ─────────────────────────────────────────────────────────────────
+
+enum Compression {
+  COMPRESSION_NONE = 0;
+  COMPRESSION_GZIP = 1;
+  COMPRESSION_ZSTD = 2;
+}
+
+enum ReduceOp {
+  REDUCE_OP_UNSPECIFIED = 0;
+  REDUCE_OP_SUM = 1;
+  REDUCE_OP_MEAN = 2;
+  REDUCE_OP_MAX = 3;
+  REDUCE_OP_MIN = 4;
+}
+
+enum ClusterHealthStatus {
+  CLUSTER_HEALTH_STATUS_UNSPECIFIED = 0;
+  CLUSTER_HEALTH_STATUS_HEALTHY = 1;
+  CLUSTER_HEALTH_STATUS_DEGRADED = 2;
+  CLUSTER_HEALTH_STATUS_UNHEALTHY = 3;
+}
+
+enum NodeStatusCode {
+  NODE_STATUS_CODE_UNSPECIFIED = 0;
+  NODE_STATUS_CODE_INITIALIZING = 1;
+  NODE_STATUS_CODE_READY = 2;
+  NODE_STATUS_CODE_BUSY = 3;
+  NODE_STATUS_CODE_FAILED = 4;
+}
+
+// ─── Shared types ──────────────────────────────────────────────────────────
+
+message TensorShape {
+  repeated uint64 dims = 1;
+}
+
+message ResourceUsage {
+  double cpu_percent = 1;
+  double memory_percent = 2;
+  double gpu_percent = 3;
+  double gpu_memory_percent = 4;
+}
+
+message NodeStatus {
+  int32 status = 1;
+  string message = 2;
+  uint64 last_update = 3;
+}
+
+message NodeCapabilities {
+  uint32 num_cpus = 1;
+  uint32 num_gpus = 2;
+  uint64 memory_bytes = 3;
+  repeated string gpu_models = 4;
+  string framework_version = 5;
+}
+
+message NodeInfo {
+  uint32 rank = 1;
+  string hostname = 2;
+  string ip_address = 3;
+  NodeStatus status = 4;
+  NodeCapabilities capabilities = 5;
+  ResourceUsage resources = 6;
+}
+
+message ClusterHealth {
+  int32 health = 1;
+  uint32 num_healthy_nodes = 2;
+  uint32 num_failed_nodes = 3;
+  string message = 4;
+}
+
+message ClusterConfig {
+  uint32 world_size = 1;
+  repeated string node_addresses = 2;
+  uint32 master_rank = 3;
+  string master_address = 4;
+}
+
+message GatheredData {
+  uint32 rank = 1;
+  repeated float data = 2;
+}
+
+// ─── Push / pull gradients ─────────────────────────────────────────────────
+
+message PushGradientsRequest {
+  string key = 1;
+  repeated float data = 2;
+  uint64 version = 3;
+  uint32 rank = 4;
+  TensorShape shape = 5;
+  Compression compression = 6;
+  bytes compressed_data = 7;
+}
+
+message PushGradientsResponse {
+  bool success = 1;
+  string message = 2;
+  uint64 version = 3;
+}
+
+message PullParametersRequest {
+  string key = 1;
+  optional uint64 version = 2;
+  uint32 rank = 3;
+}
+
+message PullParametersResponse {
+  bool success = 1;
+  string message = 2;
+  repeated float data = 3;
+  uint64 version = 4;
+  TensorShape shape = 5;
+}
+
+// ─── Barrier / heartbeat ───────────────────────────────────────────────────
+
+message BarrierRequest {
+  uint32 rank = 1;
+  uint64 barrier_id = 2;
+  uint64 timestamp = 3;
+}
+
+message BarrierResponse {
+  bool success = 1;
+  string message = 2;
+  uint64 barrier_id = 3;
+  uint32 num_waiting = 4;
+}
+
+message HeartbeatRequest {
+  uint32 rank = 1;
+  uint64 timestamp = 2;
+  NodeStatus status = 3;
+  ResourceUsage resources = 4;
+}
+
+message HeartbeatResponse {
+  bool success = 1;
+  string message = 2;
+  ClusterHealth cluster_health = 3;
+}
+
+// ─── Collective ops ────────────────────────────────────────────────────────
+
+message AllReduceRequest {
+  string key = 1;
+  repeated float data = 2;
+  int32 op = 3;  // ReduceOp
+  uint32 rank = 4;
+  TensorShape shape = 5;
+}
+
+message AllReduceResponse {
+  bool success = 1;
+  string message = 2;
+  repeated float data = 3;
+}
+
+message BroadcastRequest {
+  string key = 1;
+  repeated float data = 2;
+  uint32 root = 3;
+  uint32 rank = 4;
+  TensorShape shape = 5;
+}
+
+message BroadcastResponse {
+  bool success = 1;
+  string message = 2;
+  repeated float data = 3;
+}
+
+message GatherRequest {
+  string key = 1;
+  repeated float data = 2;
+  uint32 root = 3;
+  uint32 rank = 4;
+  TensorShape shape = 5;
+}
+
+message GatherResponse {
+  bool success = 1;
+  string message = 2;
+  repeated GatheredData gathered = 3;
+}
+
+// ─── Cluster lifecycle ─────────────────────────────────────────────────────
+
+message RegisterNodeRequest {
+  uint32 rank = 1;
+  string hostname = 2;
+  string ip_address = 3;
+  repeated uint32 gpu_ids = 4;
+  NodeCapabilities capabilities = 5;
+}
+
+message RegisterNodeResponse {
+  bool success = 1;
+  string message = 2;
+  uint32 assigned_rank = 3;
+  uint32 world_size = 4;
+  ClusterConfig cluster_config = 5;
+}
+
+message GetClusterStatusRequest {
+  uint32 rank = 1;
+}
+
+message GetClusterStatusResponse {
+  bool success = 1;
+  string message = 2;
+  uint32 world_size = 3;
+  repeated NodeInfo nodes = 4;
+  ClusterHealth health = 5;
+}

@@ -1,0 +1,225 @@
+// Order execution service.
+// Reconstructed from janus call-site usage 2026-05-24.
+
+syntax = "proto3";
+
+package fks.execution.v1;
+
+import "fks/common/v1/common.proto";
+
+// ─── Service ───────────────────────────────────────────────────────────────
+
+service ExecutionService {
+  rpc SubmitSignal(SubmitSignalRequest) returns (SubmitSignalResponse);
+  rpc GetOrderStatus(GetOrderStatusRequest) returns (GetOrderStatusResponse);
+  rpc GetActiveOrders(GetActiveOrdersRequest) returns (GetActiveOrdersResponse);
+  rpc CancelOrder(CancelOrderRequest) returns (CancelOrderResponse);
+  rpc CancelAllOrders(CancelAllOrdersRequest) returns (CancelAllOrdersResponse);
+  rpc GetPositions(GetPositionsRequest) returns (GetPositionsResponse);
+  rpc GetAccount(GetAccountRequest) returns (GetAccountResponse);
+  rpc StreamUpdates(StreamUpdatesRequest) returns (stream StreamUpdatesResponse);
+  rpc HealthCheck(fks.common.v1.HealthCheckRequest) returns (fks.common.v1.HealthCheckResponse);
+}
+
+// ─── Enums ─────────────────────────────────────────────────────────────────
+
+enum ExecutionStrategy {
+  EXECUTION_STRATEGY_UNSPECIFIED = 0;
+  EXECUTION_STRATEGY_IMMEDIATE = 1;
+  EXECUTION_STRATEGY_TWAP = 2;
+  EXECUTION_STRATEGY_VWAP = 3;
+  EXECUTION_STRATEGY_ALMGREN_CHRISS = 4;
+  EXECUTION_STRATEGY_ICEBERG = 5;
+}
+
+enum OrderStatus {
+  ORDER_STATUS_UNSPECIFIED = 0;
+  ORDER_STATUS_NEW = 1;
+  ORDER_STATUS_SUBMITTED = 2;
+  ORDER_STATUS_PARTIALLY_FILLED = 3;
+  ORDER_STATUS_FILLED = 4;
+  ORDER_STATUS_CANCELLED = 5;
+  ORDER_STATUS_REJECTED = 6;
+  ORDER_STATUS_EXPIRED = 7;
+  ORDER_STATUS_PENDING_CANCEL = 8;
+}
+
+enum UpdateType {
+  UPDATE_TYPE_UNSPECIFIED = 0;
+  UPDATE_TYPE_ORDER = 1;
+  UPDATE_TYPE_FILL = 2;
+  UPDATE_TYPE_POSITION = 3;
+  UPDATE_TYPE_ACCOUNT = 4;
+}
+
+// ─── Submit / cancel ───────────────────────────────────────────────────────
+
+message SubmitSignalRequest {
+  string signal_id = 1;
+  string symbol = 2;
+  string exchange = 3;
+  fks.common.v1.Side side = 4;
+  fks.common.v1.OrderType order_type = 5;
+  fks.common.v1.TimeInForce time_in_force = 6;
+  ExecutionStrategy strategy = 7;
+  double quantity = 8;
+  optional double price = 9;
+  optional double stop_price = 10;
+  map<string, string> metadata = 11;
+}
+
+message SubmitSignalResponse {
+  bool success = 1;
+  string order_id = 2;
+  string internal_order_id = 3;
+  string message = 4;
+  int64 timestamp = 5;
+  OrderStatus status = 6;
+}
+
+message CancelOrderRequest {
+  string order_id = 1;
+}
+
+message CancelOrderResponse {
+  bool success = 1;
+  string order_id = 2;
+  string message = 3;
+  int64 timestamp = 4;
+}
+
+message CancelAllOrdersRequest {
+  optional string symbol = 1;
+  optional string exchange = 2;
+}
+
+message CancelAllOrdersResponse {
+  bool success = 1;
+  uint32 cancelled_count = 2;
+  string message = 3;
+  repeated string cancelled_order_ids = 4;
+}
+
+// ─── Status queries ────────────────────────────────────────────────────────
+
+message GetOrderStatusRequest {
+  string order_id = 1;
+}
+
+message Fill {
+  string fill_id = 1;
+  string order_id = 2;
+  double quantity = 3;
+  double price = 4;
+  double fee = 5;
+  string fee_currency = 6;
+  fks.common.v1.Side side = 7;
+  int64 timestamp = 8;
+  bool is_maker = 9;
+}
+
+message GetOrderStatusResponse {
+  string order_id = 1;
+  string internal_order_id = 2;
+  string symbol = 3;
+  string exchange = 4;
+  fks.common.v1.Side side = 5;
+  fks.common.v1.OrderType order_type = 6;
+  OrderStatus status = 7;
+  double quantity = 8;
+  double filled_quantity = 9;
+  double remaining_quantity = 10;
+  optional double price = 11;
+  optional double average_fill_price = 12;
+  int64 created_at = 13;
+  optional int64 updated_at = 14;
+  repeated Fill fills = 15;
+}
+
+message GetActiveOrdersRequest {
+  optional string symbol = 1;
+  optional string exchange = 2;
+}
+
+message GetActiveOrdersResponse {
+  repeated GetOrderStatusResponse orders = 1;
+}
+
+// ─── Positions / account ───────────────────────────────────────────────────
+
+message Position {
+  string symbol = 1;
+  string exchange = 2;
+  fks.common.v1.Side side = 3;
+  double quantity = 4;
+  double average_entry_price = 5;
+  double current_price = 6;
+  double unrealized_pnl = 7;
+  double realized_pnl = 8;
+  double margin_used = 9;
+  double liquidation_price = 10;
+  int64 opened_at = 11;
+  optional int64 updated_at = 12;
+}
+
+message GetPositionsRequest {
+  optional string symbol = 1;
+  optional string exchange = 2;
+}
+
+message GetPositionsResponse {
+  repeated Position positions = 1;
+  double total_pnl = 2;
+}
+
+message GetAccountRequest {
+  optional string exchange = 1;
+}
+
+message GetAccountResponse {
+  double balance = 1;
+  double available_balance = 2;
+  double margin_used = 3;
+  double unrealized_pnl = 4;
+  double realized_pnl = 5;
+  map<string, double> balances_by_exchange = 6;
+}
+
+// ─── Streaming ─────────────────────────────────────────────────────────────
+
+message OrderUpdate {
+  string order_id = 1;
+  string internal_order_id = 2;
+  string symbol = 3;
+  OrderStatus old_status = 4;
+  OrderStatus new_status = 5;
+  string message = 6;
+}
+
+message FillUpdate {
+  Fill fill = 1;
+}
+
+message PositionUpdate {
+  Position position = 1;
+}
+
+message AccountUpdate {
+  GetAccountResponse account = 1;
+}
+
+message StreamUpdatesRequest {
+  repeated string symbols = 1;
+  repeated UpdateType types = 2;
+}
+
+message StreamUpdatesResponse {
+  UpdateType type = 1;
+  int64 timestamp = 2;
+  oneof update {
+    OrderUpdate order_update = 3;
+    FillUpdate fill_update = 4;
+    PositionUpdate position_update = 5;
+    AccountUpdate account_update = 6;
+  }
+}

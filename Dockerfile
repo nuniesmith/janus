@@ -2,49 +2,26 @@
 #
 # fks-janus standalone Dockerfile
 #
-# Builds the unified `janus` binary (bin/janus) which supervises the
-# forward / backward / cns / api / data modules in-process.
-#
-# The workspace declares `fks-proto = { path = "../../src/proto" }` —
-# i.e. it normally lives nested inside the parent fks repo at
-# `fks/src/janus`. To keep this Dockerfile self-contained we shallow-clone
-# the proto crate from the parent repo into the position the workspace
-# expects. Pin the ref via --build-arg FKS_PROTO_REF=<sha|tag|branch>.
+# The workspace is now self-contained — `fks-proto` lives at
+# `crates/fks-proto` and the binary `janus` (under `bin/janus`) is the
+# unified supervisor entry point. No parent-repo clone is needed.
 #
 # Build:
 #   docker build -t fks-janus:dev .
-#   docker build -t fks-janus:dev --build-arg FKS_PROTO_REF=v0.4.0 .
 #
-# Run (with companion services from docker-compose.yml):
+# Run (with the companion services from docker-compose.yml):
 #   docker compose up -d
 
 ARG RUST_VERSION=1.92.0
 ARG DEBIAN_RELEASE=bookworm
-ARG FKS_PROTO_REPO=https://github.com/nuniesmith/fks.git
-ARG FKS_PROTO_REF=main
 
 # ─────────────────────────────────────────────────────────────
-# Stage 1 — fetch fks-proto from the parent repo
-# ─────────────────────────────────────────────────────────────
-FROM debian:${DEBIAN_RELEASE}-slim AS proto-fetch
-ARG FKS_PROTO_REPO
-ARG FKS_PROTO_REF
-RUN apt-get update \
- && apt-get install -y --no-install-recommends git ca-certificates \
- && rm -rf /var/lib/apt/lists/*
-WORKDIR /fks
-RUN git init -q . \
- && git remote add origin "${FKS_PROTO_REPO}" \
- && git fetch --depth=1 origin "${FKS_PROTO_REF}" \
- && git checkout FETCH_HEAD -- src/proto
-
-# ─────────────────────────────────────────────────────────────
-# Stage 2 — build the janus workspace
+# Stage 1 — build the janus workspace
 # ─────────────────────────────────────────────────────────────
 FROM rust:${RUST_VERSION}-${DEBIAN_RELEASE} AS builder
 
-# Build deps: protoc for tonic build scripts, pkg-config + openssl for
-# crates that pull in native TLS, cmake for a few transitive deps.
+# Build deps: protoc for tonic build scripts, pkg-config + openssl for crates
+# that pull in native TLS, cmake for a few transitive deps.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         protobuf-compiler \
@@ -54,25 +31,20 @@ RUN apt-get update \
         clang \
  && rm -rf /var/lib/apt/lists/*
 
-# Position the working copy so `../../src/proto` from the workspace
-# resolves to the proto crate fetched in stage 1.
-WORKDIR /fks/src
-COPY --from=proto-fetch /fks/src/proto ./proto
-
-WORKDIR /fks/src/janus
+WORKDIR /build
 COPY . .
 
-# Build only the `janus` binary in release mode. Use BuildKit cache mounts
-# for the cargo registry/git db and the target dir so iterative rebuilds
-# are fast for developers.
+# Build only the `janus` binary in release mode. BuildKit cache mounts make
+# iterative rebuilds fast for developers; the resulting binary is copied out
+# of the cached target dir into a fixed path before stage 2 picks it up.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/fks/src/janus/target \
+    --mount=type=cache,target=/build/target \
     cargo build --release --locked -p janus \
  && cp target/release/janus /usr/local/bin/janus
 
 # ─────────────────────────────────────────────────────────────
-# Stage 3 — slim runtime image
+# Stage 2 — slim runtime image
 # ─────────────────────────────────────────────────────────────
 FROM debian:${DEBIAN_RELEASE}-slim AS runtime
 
@@ -82,8 +54,8 @@ RUN apt-get update \
         libssl3 \
         curl \
  && rm -rf /var/lib/apt/lists/* \
- && groupadd --system --gid 10001 janus \
- && useradd  --system --uid 10001 --gid janus --home /opt/janus --shell /usr/sbin/nologin janus \
+ && groupadd --system --gid 1000 janus \
+ && useradd  --system --uid 1000 --gid janus --home /opt/janus --shell /usr/sbin/nologin janus \
  && mkdir -p /opt/janus/logs /opt/janus/checkpoints /opt/janus/config \
  && chown -R janus:janus /opt/janus
 

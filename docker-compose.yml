@@ -10,9 +10,6 @@
 #   docker compose up -d           # start everything
 #   docker compose logs -f janus   # tail janus
 #   docker compose down            # stop & remove
-#
-# Override a build pin without editing this file:
-#   FKS_PROTO_REF=v0.4.0 docker compose build janus
 
 name: fks-janus
 
@@ -21,8 +18,6 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      args:
-        FKS_PROTO_REF: ${FKS_PROTO_REF:-main}
     image: fks-janus:dev
     container_name: fks_janus
     depends_on:
