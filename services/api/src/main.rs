@@ -31,7 +31,6 @@ use tracing::{info, warn};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 mod config;
-mod grpc;
 mod metrics;
 mod rate_limit;
 mod redis_dispatcher;

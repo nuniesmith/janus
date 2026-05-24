@@ -98,7 +98,6 @@
 //! ```
 
 pub mod config;
-pub mod grpc;
 pub mod metrics;
 pub mod rate_limit;
 pub mod redis_dispatcher;
