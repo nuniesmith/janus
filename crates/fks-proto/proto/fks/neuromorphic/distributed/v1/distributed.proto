@@ -60,10 +60,10 @@ message TensorShape {
 }
 
 message ResourceUsage {
-  double cpu_percent = 1;
-  double memory_percent = 2;
-  double gpu_percent = 3;
-  double gpu_memory_percent = 4;
+  double cpu_usage = 1;
+  double memory_usage = 2;
+  repeated double gpu_usage = 3;
+  double network_bandwidth = 4;
 }
 
 message NodeStatus {
@@ -75,9 +75,12 @@ message NodeStatus {
 message NodeCapabilities {
   uint32 num_cpus = 1;
   uint32 num_gpus = 2;
-  uint64 memory_bytes = 3;
-  repeated string gpu_models = 4;
+  uint64 total_memory = 3;
+  string gpu_type = 4;
   string framework_version = 5;
+  bool has_cuda = 6;
+  bool has_nccl = 7;
+  bool has_rdma = 8;
 }
 
 message NodeInfo {

@@ -3953,10 +3953,7 @@ name = "fks-proto"
 version = "0.1.0"
 dependencies = [
  "prost 0.14.3",
- "prost-build",
- "prost-types 0.14.3",
  "tonic 0.14.5",
- "tonic-build",
  "tonic-prost",
  "tonic-prost-build",
 ]
@@ -5722,6 +5719,7 @@ dependencies = [
  "chrono",
  "common",
  "config",
+ "fks-proto",
  "janus-cns",
  "janus-core",
  "janus-health",
@@ -5731,13 +5729,11 @@ dependencies = [
  "prometheus",
  "prost 0.14.3",
  "prost-types 0.14.3",
- "proto",
  "qdrant-client",
  "rayon",
  "redis",
  "serde",
  "serde_json",
- "shared_memory",
  "sqlx",
  "thiserror 2.0.18",
  "tokio",
@@ -5778,7 +5774,6 @@ dependencies = [
  "axum 0.8.8",
  "chrono",
  "futures",
- "lazy_static",
  "prometheus",
  "prost 0.14.3",
  "redis",
@@ -5842,6 +5837,7 @@ dependencies = [
  "prometheus",
  "rand 0.10.0",
  "redis",
+ "reqwest",
  "rust_decimal",
  "serde",
  "serde_json",
@@ -5877,10 +5873,8 @@ dependencies = [
  "janus-questdb-writer",
  "janus-rate-limiter",
  "jsonwebtoken",
- "lazy_static",
  "mockito",
  "nix 0.30.1",
- "once_cell",
  "parking_lot",
  "prometheus",
  "prost 0.14.3",
@@ -5985,7 +5979,6 @@ dependencies = [
  "janus-models",
  "janus-questdb-writer",
  "janus-risk",
- "lazy_static",
  "mockito",
  "parking_lot",
  "prometheus",
@@ -6009,7 +6002,6 @@ dependencies = [
  "tokio-tungstenite",
  "tonic 0.14.5",
  "tonic-prost",
- "tonic-prost-build",
  "tower 0.5.3",
  "tower-http",
  "tracing",
@@ -6054,7 +6046,6 @@ dependencies = [
  "rust_decimal",
  "serde",
  "serde_json",
- "shared_memory",
  "sqlx",
  "thiserror 2.0.18",
  "tokio",
@@ -6064,7 +6055,6 @@ dependencies = [
  "toml 0.9.12+spec-1.1.0",
  "tonic 0.14.5",
  "tonic-prost",
- "tonic-prost-build",
  "tonic-reflection",
  "tower-http",
  "tracing",
@@ -6108,6 +6098,7 @@ dependencies = [
  "common",
  "config",
  "dotenvy",
+ "fks-proto",
  "governor 0.8.1",
  "hyper 1.8.1",
  "hyper-util",
@@ -6115,7 +6106,6 @@ dependencies = [
  "prost 0.14.3",
  "prost-build",
  "prost-types 0.14.3",
- "proto",
  "redis",
  "serde",
  "serde_json",
@@ -6139,7 +6129,6 @@ dependencies = [
  "anyhow",
  "axum 0.8.8",
  "chrono",
- "lazy_static",
  "prometheus",
  "reqwest",
  "serde",
@@ -6157,6 +6146,28 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "janus-lob"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "approx",
+ "chrono",
+ "criterion 0.5.1",
+ "janus-core",
+ "rand 0.10.0",
+ "rust_decimal",
+ "rust_decimal_macros",
+ "serde",
+ "serde_json",
+ "statrs 0.18.0",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -6312,7 +6323,6 @@ dependencies = [
  "janus-exchanges",
  "janus-indicators",
  "janus-optimizer",
- "lazy_static",
  "mockito",
  "parking_lot",
  "polars",
@@ -7038,15 +7048,6 @@ dependencies = [
 
 [[package]]
 name = "memoffset"
-version = "0.6.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5aa361d4faea93603064a027415f07bd8e1d5c88c9fbf68bf56a285428fd79ce"
-dependencies = [
- "autocfg",
-]
-
-[[package]]
-name = "memoffset"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
@@ -7442,19 +7443,6 @@ name = "new_debug_unreachable"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
-
-[[package]]
-name = "nix"
-version = "0.23.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8f3790c00a0150112de0f4cd161e3d7fc4b2d8a5542ffc35f099a2562aecb35c"
-dependencies = [
- "bitflags 1.3.2",
- "cc",
- "cfg-if",
- "libc",
- "memoffset 0.6.5",
-]
 
 [[package]]
 name = "nix"
@@ -9329,19 +9317,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "proto"
-version = "0.1.0"
-dependencies = [
- "prost 0.14.3",
- "prost-build",
- "prost-types 0.14.3",
- "tonic 0.14.5",
- "tonic-build",
- "tonic-prost",
- "tonic-prost-build",
-]
-
-[[package]]
 name = "protobuf"
 version = "3.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9483,7 +9458,7 @@ dependencies = [
  "cfg-if",
  "indoc",
  "libc",
- "memoffset 0.9.1",
+ "memoffset",
  "parking_lot",
  "portable-atomic",
  "pyo3-build-config",
@@ -10823,19 +10798,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f40ca3c46823713e0d4209592e8d6e826aa57e928f09752619fc696c499637f6"
 dependencies = [
  "lazy_static",
-]
-
-[[package]]
-name = "shared_memory"
-version = "0.12.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba8593196da75d9dc4f69349682bd4c2099f8cde114257d1ef7ef1b33d1aba54"
-dependencies = [
- "cfg-if",
- "libc",
- "nix 0.23.2",
- "rand 0.8.5",
- "win-sys",
 ]
 
 [[package]]
@@ -13100,7 +13062,6 @@ dependencies = [
  "criterion 0.5.1",
  "csv",
  "image 0.25.10",
- "lazy_static",
  "log",
  "nalgebra 0.33.2",
  "ndarray 0.15.6",
@@ -13649,15 +13610,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "win-sys"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b7b128a98c1cfa201b09eb49ba285887deb3cbe7466a98850eb1adabb452be5"
-dependencies = [
- "windows 0.34.0",
-]
-
-[[package]]
 name = "winapi"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -13687,19 +13639,6 @@ name = "winapi-x86_64-pc-windows-gnu"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f"
-
-[[package]]
-name = "windows"
-version = "0.34.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "45296b64204227616fdbf2614cefa4c236b98ee64dfaaaa435207ed99fe7829f"
-dependencies = [
- "windows_aarch64_msvc 0.34.0",
- "windows_i686_gnu 0.34.0",
- "windows_i686_msvc 0.34.0",
- "windows_x86_64_gnu 0.34.0",
- "windows_x86_64_msvc 0.34.0",
-]
 
 [[package]]
 name = "windows"
@@ -14090,12 +14029,6 @@ checksum = "a9d8416fa8b42f5c947f8482c43e7d89e73a173cead56d044f6a56104a6d1b53"
 
 [[package]]
 name = "windows_aarch64_msvc"
-version = "0.34.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "17cffbe740121affb56fad0fc0e421804adf0ae00891205213b5cecd30db881d"
-
-[[package]]
-name = "windows_aarch64_msvc"
 version = "0.48.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc35310971f3b2dbbf3f0690a219f40e2d9afcf64f9ab7cc1be722937c26b4bc"
@@ -14111,12 +14044,6 @@ name = "windows_aarch64_msvc"
 version = "0.53.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b9d782e804c2f632e395708e99a94275910eb9100b2114651e04744e9b125006"
-
-[[package]]
-name = "windows_i686_gnu"
-version = "0.34.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2564fde759adb79129d9b4f54be42b32c89970c18ebf93124ca8870a498688ed"
 
 [[package]]
 name = "windows_i686_gnu"
@@ -14150,12 +14077,6 @@ checksum = "fa7359d10048f68ab8b09fa71c3daccfb0e9b559aed648a8f95469c27057180c"
 
 [[package]]
 name = "windows_i686_msvc"
-version = "0.34.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9cd9d32ba70453522332c14d38814bceeb747d80b3958676007acadd7e166956"
-
-[[package]]
-name = "windows_i686_msvc"
 version = "0.48.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f55c233f70c4b27f66c523580f78f1004e8b5a8b659e05a4eb49d4166cca406"
@@ -14171,12 +14092,6 @@ name = "windows_i686_msvc"
 version = "0.53.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e7ac75179f18232fe9c285163565a57ef8d3c89254a30685b57d83a38d326c2"
-
-[[package]]
-name = "windows_x86_64_gnu"
-version = "0.34.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cfce6deae227ee8d356d19effc141a509cc503dfd1f850622ec4b0f84428e1f4"
 
 [[package]]
 name = "windows_x86_64_gnu"
@@ -14213,12 +14128,6 @@ name = "windows_x86_64_gnullvm"
 version = "0.53.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ffa179e2d07eee8ad8f57493436566c7cc30ac536a3379fdf008f47f6bb7ae1"
-
-[[package]]
-name = "windows_x86_64_msvc"
-version = "0.34.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d19538ccc21819d01deaf88d6a17eae6596a12e9aafdbb97916fb49896d89de9"
 
 [[package]]
 name = "windows_x86_64_msvc"

@@ -386,7 +386,7 @@ impl ServerHandler {
 
 impl BridgeStateHandler for ServerHandler {
     async fn handle(&self, stream_id: &str, state: &StreamedBridgeState) -> Result<()> {
-        let seq = self.sequence.fetch_add(1, Ordering::Relaxed);
+        let seq = self.sequence.fetch_add(1, Ordering::Relaxed) as i64;
         let ingested = self.total_ingested.fetch_add(1, Ordering::Relaxed) + 1;
 
         // Build a proto RegimeState and push it through the embedded server
@@ -551,7 +551,7 @@ impl GrpcForwarderHandler {
     fn to_proto_state(&self, state: &StreamedBridgeState) -> RegimeState {
         let hypo = parse_hypothalamus_regime(&state.hypothalamus_regime);
         let amyg = parse_amygdala_regime(&state.amygdala_regime);
-        let seq = self.sequence.fetch_add(1, Ordering::Relaxed);
+        let seq = self.sequence.fetch_add(1, Ordering::Relaxed) as i64;
 
         RegimeState {
             symbol: state.symbol.clone(),

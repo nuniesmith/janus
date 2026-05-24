@@ -47,7 +47,7 @@ uuid = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "macros"] }
 approx = "0.5"
 tempfile = "3.8"
-criterion = { workspace = true }
+criterion = "0.5"
 rust_decimal_macros = "1.39"
 
 [features]
