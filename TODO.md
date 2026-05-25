@@ -38,9 +38,10 @@
 - [ ] Optimizer reads asset list from Ruby's asset registry via gRPC or Redis (currently env-only).
 
 ### JFLOW-C: Two-way position feedback (remaining)
-- [x] **Receive path foundation (2026-05-25)**: `PositionEvent` wire type in `lib/janus-core/src/position_events.rs`; `POST /api/v1/positions/event` on janus-api validates and logs. No guidance / persistence yet — endpoint pins the URL so the execution-side producer can wire up in parallel.
+- [x] **Receive path foundation (2026-05-25, #13)**: `PositionEvent` wire type in `lib/janus-core/src/position_events.rs`; `POST /api/v1/positions/event` on janus-api validates and logs.
+- [x] **Raw event persistence (2026-05-25)**: `PositionEventStore` in `lib/janus-api/src/position_store.rs` writes each received event into the Postgres `janus_position_events` ingest log. Best-effort: missing table or unreachable DB → disabled with warn (mirrors JFLOW-D probe pattern). Schema owned by the JanusAI Python service.
 - [ ] Guidance computation: take-profit suggestions based on regime changes, stop adjustment based on volatility, exit urgency from amygdala.
-- [ ] Persist position events + guidance decisions as execution memories for learning (`janus_memories`).
+- [ ] Compact `janus_position_events` raw log into closed-trade rows in `janus_memories` (JanusAI side, fks repo).
 
 ### JFLOW-D: Startup bootstrap  *(direct Postgres path landed 2026-05-24)*
 - [x] `bootstrap_affinity_from_postgres()` queries `janus_memories` via `sqlx` and replays into the strategy-affinity tracker. Probes for the table first so a missing schema isn't reported as an error.
