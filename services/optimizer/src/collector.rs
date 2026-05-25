@@ -574,7 +574,6 @@ impl OhlcCollector {
     }
 
     /// Get collection status for all assets
-    #[allow(dead_code)]
     pub async fn get_status(&self) -> Result<HashMap<String, HashMap<u32, CollectionMetadata>>> {
         let mut status = HashMap::new();
 
@@ -608,27 +607,24 @@ pub struct CollectionMetadata {
     pub last_updated: i64,
 }
 
+#[allow(dead_code)]
 impl CollectionMetadata {
     /// Get first timestamp as DateTime
-    #[allow(dead_code)]
     pub fn first_datetime(&self) -> DateTime<Utc> {
         Utc.timestamp_opt(self.first_timestamp, 0).unwrap()
     }
 
     /// Get last timestamp as DateTime
-    #[allow(dead_code)]
     pub fn last_datetime(&self) -> DateTime<Utc> {
         Utc.timestamp_opt(self.last_timestamp, 0).unwrap()
     }
 
     /// Get duration of data
-    #[allow(dead_code)]
     pub fn duration(&self) -> ChronoDuration {
         ChronoDuration::seconds(self.last_timestamp - self.first_timestamp)
     }
 
     /// Get duration in days
-    #[allow(dead_code)]
     pub fn days(&self) -> f64 {
         self.duration().num_seconds() as f64 / 86400.0
     }

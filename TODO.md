@@ -11,11 +11,13 @@
 
 ## P0 — Codebase Health
 
-- [ ] **318 `#[allow(dead_code)]` annotations** — audit results (2026-05-24):
-  - `services/forward/src/api/grpc.rs` — confirmed dead per `services/forward/build.rs:9-22` (audit 2026-03-26). **Intentionally retained** to keep impl type-checked until the signal-service ownership question (Option A vs B) is resolved. Do NOT delete without resolving STRUCT-C first.
-  - `services/api/src/grpc.rs` (11) — `GrpcClientManager` / `GatewayForwardService` scaffolding, never instantiated outside its own tests. Not benign serde — these are unused types. Decide: wire up or delete.
-  - `services/optimizer/src/collector.rs` (10) — mix of unused `OhlcCollector` methods (`fetch_ohlc`, `backfill`, etc.) and the `DataGap` struct. Some are reachable from `scheduler.rs`; verify before pruning.
-  - `services/optimizer/src/scheduler.rs` (7), `services/execution/tests/integration/scenarios.rs` (7), `services/data/src/api/auth.rs` (7), `services/api/src/rate_limit.rs` (7) — review each.
+- [ ] **303 `#[allow(dead_code)]` annotations** (down from 318) — audit results (2026-05-25):
+  - `services/api/src/grpc.rs` + `services/forward/src/api/grpc.rs` — deleted in #4 (confirmed dead scaffolding).
+  - `services/optimizer/src/collector.rs` — consolidated 10 → 6 in #10. Remaining: `datetime`, `DataGap`, `get_date_range`, `detect_gaps`, `vacuum`, and the whole `impl CollectionMetadata` block — all genuinely unused but useful API surface.
+  - `services/optimizer/src/scheduler.rs` (7) — empirical sweep confirmed every annotation is needed (`with_failure_config`, `get_state`, `get_stats`, `stop`, `is_running`, `interval`, `interval_str` accessors on `OptimizationScheduler` are real but unused).
+  - `services/data/src/api/auth.rs` (7), `services/api/src/rate_limit.rs` (7), `services/data/src/lib.rs` (6) — also empirically confirmed; each annotation guards a genuinely unused item (mostly disabled-mode constructors and serde-only struct fields).
+  - `neuromorphic/thalamus/sources/clients/openweathermap.rs` (13) — new hotspot; not yet audited.
+  - `services/execution/tests/integration/scenarios.rs` (7) — test scaffolding, low priority.
 - [ ] **Tonic version split** — workspace declares `0.14.2` but some crates resolve `0.10.2` transitively (via `apalis`). Track and resolve when `apalis` hits 1.0 stable.
 - [ ] Evaluate `shared_memory` IPC in containers — `/dev/shm` size limits may break Forward→Backward zero-copy Arrow IPC (removed crate, but protocol design question remains).
 - [ ] **STRUCT-C deferred:** Consolidate stray `services/forward/proto/janus/v1/janus.proto` → `proto/fks/janus/v1/signal_service.proto` once GrpcServer ownership is decided. See `services/forward/build.rs:14-19`.
