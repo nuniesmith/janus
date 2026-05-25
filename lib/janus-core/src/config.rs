@@ -27,7 +27,7 @@ const CONFIG_PATHS: &[&str] = &[
 
 /// Main configuration for the unified JANUS service
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// Service metadata
     pub service: ServiceConfig,
@@ -94,83 +94,6 @@ pub struct Config {
 
     /// Advanced settings
     pub advanced: AdvancedConfig,
-
-    // =========================================================================
-    // Legacy fields for backward compatibility
-    // =========================================================================
-    /// HTTP/REST API port (legacy - use ports.http instead)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub http_port: Option<u16>,
-    /// gRPC API port (legacy - use ports.grpc instead)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub grpc_port: Option<u16>,
-    /// WebSocket port (legacy - use ports.websocket instead)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub websocket_port: Option<u16>,
-    /// Metrics port (legacy - use ports.metrics instead)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub metrics_port: Option<u16>,
-    /// Enable forward module (legacy - use modules.forward instead)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub enable_forward: Option<bool>,
-    /// Enable backward module (legacy - use modules.backward instead)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub enable_backward: Option<bool>,
-    /// Enable CNS module (legacy - use modules.cns instead)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub enable_cns: Option<bool>,
-    /// Enable API module (legacy - use modules.api instead)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub enable_api: Option<bool>,
-    /// Enable Data module (legacy - use modules.data instead)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub enable_data: Option<bool>,
-    /// Redis URL (legacy - use redis.url instead)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub redis_url: Option<String>,
-    /// Database URL (legacy - use database.url instead)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub database_url: Option<String>,
-    /// QuestDB host (legacy - use questdb.host instead)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub questdb_host: Option<String>,
-    /// Environment (legacy - use service.environment instead)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub environment: Option<String>,
-    /// Service name (legacy - use service.name instead)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub service_name: Option<String>,
-    /// CORS origins (legacy - use security.cors_origins instead)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cors_origins: Option<String>,
-
-    // Legacy forward settings
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub forward_signal_interval: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub forward_ml_model_path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub forward_risk_threshold: Option<f64>,
-
-    // Legacy backward settings
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub backward_persist_batch_size: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub backward_analytics_interval: Option<u64>,
-
-    // Legacy CNS settings
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cns_health_interval: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cns_auto_recovery: Option<bool>,
-
-    // Legacy feature flags
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub enable_websocket: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub enable_grpc: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub enable_metrics: Option<bool>,
 }
 
 // ============================================================================
@@ -1421,9 +1344,6 @@ impl Config {
         // Apply environment variable overrides
         config.apply_env_overrides();
 
-        // Normalize legacy fields
-        config.normalize_legacy_fields();
-
         // Apply Redis overlay (JanusAI session-driven config from Ruby).
         // Best-effort: failures are warned and ignored so cold boot still
         // works when Redis is unavailable.
@@ -1433,11 +1353,10 @@ impl Config {
         Ok(config)
     }
 
-    /// Load configuration from environment variables only (legacy method)
+    /// Load configuration from environment variables only
     pub fn from_env() -> anyhow::Result<Self> {
         let mut config = Self::default();
         config.apply_env_overrides();
-        config.normalize_legacy_fields();
         Ok(config)
     }
 
@@ -1446,7 +1365,6 @@ impl Config {
         let contents = std::fs::read_to_string(path.as_ref())?;
         let mut config: Config = toml::from_str(&contents)?;
         config.apply_env_overrides();
-        config.normalize_legacy_fields();
         Ok(config)
     }
 
@@ -1648,97 +1566,6 @@ impl Config {
         }
         if let Ok(v) = std::env::var("LOG_FORMAT") {
             self.logging.format = v;
-        }
-    }
-
-    /// Normalize legacy fields to new structure
-    fn normalize_legacy_fields(&mut self) {
-        // Ports
-        if let Some(port) = self.http_port {
-            self.ports.http = port;
-        }
-        if let Some(port) = self.grpc_port {
-            self.ports.grpc = port;
-        }
-        if let Some(port) = self.websocket_port {
-            self.ports.websocket = port;
-        }
-        if let Some(port) = self.metrics_port {
-            self.ports.metrics = port;
-        }
-
-        // Modules
-        if let Some(enabled) = self.enable_forward {
-            self.modules.forward = enabled;
-        }
-        if let Some(enabled) = self.enable_backward {
-            self.modules.backward = enabled;
-        }
-        if let Some(enabled) = self.enable_cns {
-            self.modules.cns = enabled;
-        }
-        if let Some(enabled) = self.enable_api {
-            self.modules.api = enabled;
-        }
-        if let Some(enabled) = self.enable_data {
-            self.modules.data = enabled;
-        }
-        if let Some(enabled) = self.enable_websocket {
-            self.modules.websocket = enabled;
-        }
-        if let Some(enabled) = self.enable_grpc {
-            self.modules.grpc = enabled;
-        }
-        if let Some(enabled) = self.enable_metrics {
-            self.modules.metrics = enabled;
-        }
-
-        // External services
-        if let Some(ref url) = self.redis_url {
-            self.redis.url = url.clone();
-        }
-        if let Some(ref url) = self.database_url {
-            self.database.url = url.clone();
-        }
-        if let Some(ref host) = self.questdb_host {
-            self.questdb.host = host.clone();
-        }
-
-        // Service
-        if let Some(ref env) = self.environment {
-            self.service.environment = env.clone();
-        }
-        if let Some(ref name) = self.service_name {
-            self.service.name = name.clone();
-        }
-
-        // Security
-        if let Some(ref origins) = self.cors_origins {
-            self.security.cors_origins = origins.clone();
-        }
-
-        // Forward
-        if let Some(interval) = self.forward_signal_interval {
-            self.forward.signal_interval_secs = interval;
-        }
-        if let Some(ref path) = self.forward_ml_model_path {
-            self.forward.ml_model_path = path.clone();
-        }
-
-        // Backward
-        if let Some(size) = self.backward_persist_batch_size {
-            self.backward.persistence.batch_size = size;
-        }
-        if let Some(interval) = self.backward_analytics_interval {
-            self.backward.analytics.update_interval_secs = interval;
-        }
-
-        // CNS
-        if let Some(interval) = self.cns_health_interval {
-            self.cns.health_check_interval_secs = interval;
-        }
-        if let Some(enabled) = self.cns_auto_recovery {
-            self.cns.enable_reflexes = enabled;
         }
     }
 
@@ -2034,5 +1861,20 @@ mod tests {
         merge_json(&mut base, overlay);
         assert_eq!(base["service"]["name"], "new");
         assert!(base["service"]["extra"].is_null());
+    }
+
+    #[test]
+    fn test_legacy_top_level_field_rejected() {
+        // Old configs sometimes set ports at the top level (e.g. `http_port = 8080`)
+        // instead of inside `[ports]`. `deny_unknown_fields` should make this fail
+        // loudly rather than silently dropping the value.
+        let toml_str = r#"
+            http_port = 9000
+
+            [ports]
+            http = 8080
+        "#;
+        let result: Result<Config, _> = toml::from_str(toml_str);
+        assert!(result.is_err(), "legacy top-level http_port should be rejected");
     }
 }

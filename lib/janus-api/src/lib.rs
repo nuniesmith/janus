@@ -280,10 +280,10 @@ async fn status_handler(State(state): State<Arc<JanusState>>) -> impl IntoRespon
         "shutdown_requested": state.is_shutdown_requested(),
         "service_state": state.service_state(),
         "modules": {
-            "forward": state.config.enable_forward,
-            "backward": state.config.enable_backward,
-            "cns": state.config.enable_cns,
-            "api": state.config.enable_api,
+            "forward": state.config.modules.forward,
+            "backward": state.config.modules.backward,
+            "cns": state.config.modules.cns,
+            "api": state.config.modules.api,
         }
     }))
 }
