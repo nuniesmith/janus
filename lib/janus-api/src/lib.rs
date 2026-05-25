@@ -16,7 +16,10 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use janus_core::{JanusState, PositionEvent, ServiceState, Signal, compute_guidance};
+use janus_core::{
+    GuidanceThresholds, JanusState, ParamManager, PositionEvent, ServiceState, Signal, base_asset,
+    compute_guidance,
+};
 use position_store::PositionEventStore;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc};
@@ -40,8 +43,13 @@ pub async fn start_module(state: Arc<JanusState>) -> janus_core::Result<()> {
     // DB is unreachable or the table is missing.
     let position_store = Arc::new(PositionEventStore::connect(&state.config.database.url).await);
 
+    // Per-asset optimizer-tuned thresholds for guidance. Starts empty —
+    // populated by JFLOW-C/B follow-ups (Redis subscription, optimizer push).
+    // When empty, guidance falls back to default thresholds.
+    let param_manager = Arc::new(ParamManager::new(&state.config.service.name));
+
     // Build the main HTTP router
-    let app = create_router(state.clone(), position_store);
+    let app = create_router(state.clone(), position_store, param_manager);
 
     // Build the metrics router
     let metrics_app = create_metrics_router();
@@ -87,7 +95,11 @@ pub async fn start_module(state: Arc<JanusState>) -> janus_core::Result<()> {
 }
 
 /// Create the main HTTP API router
-fn create_router(state: Arc<JanusState>, position_store: Arc<PositionEventStore>) -> Router {
+fn create_router(
+    state: Arc<JanusState>,
+    position_store: Arc<PositionEventStore>,
+    param_manager: Arc<ParamManager>,
+) -> Router {
     // NOTE: Permissive CORS is acceptable for internal/paper-trading use.
     // For production, restrict origins via state.config.cors_origins.
     let cors = CorsLayer::permissive();
@@ -131,6 +143,7 @@ fn create_router(state: Arc<JanusState>, position_store: Arc<PositionEventStore>
         // Position event ingress (JFLOW-C foundation: receive + log, no guidance yet)
         .route("/api/v1/positions/event", post(position_event_handler))
         .layer(Extension(position_store))
+        .layer(Extension(param_manager))
         .layer(cors)
         .with_state(state)
 }
@@ -930,17 +943,19 @@ async fn log_level_set_handler(
 
 /// Receive a position snapshot from the execution side (JFLOW-C).
 ///
-/// Pipeline: validate at the boundary → log → best-effort persist via the
-/// `PositionEventStore` → compute advisory guidance from the current regime
-/// and unrealized P&L → return it in the 202 response. Guidance is advisory;
-/// the producer decides whether to act on it.
+/// Pipeline: validate at the boundary → look up per-asset optimizer-tuned
+/// thresholds (falling back to defaults) → log → best-effort persist via
+/// the `PositionEventStore` → compute advisory guidance from the current
+/// regime, P&L, and thresholds → return it in the 202 response. Guidance
+/// is advisory; the producer decides whether to act on it.
 #[tracing::instrument(
-    skip(event, store, state),
+    skip(event, store, state, params),
     fields(symbol = %event.symbol, side = ?event.side, qty = event.qty)
 )]
 async fn position_event_handler(
     State(state): State<Arc<JanusState>>,
     Extension(store): Extension<Arc<PositionEventStore>>,
+    Extension(params): Extension<Arc<ParamManager>>,
     Json(event): Json<PositionEvent>,
 ) -> impl IntoResponse {
     if let Err(reason) = event.validate() {
@@ -954,7 +969,12 @@ async fn position_event_handler(
     }
 
     let regime = state.current_regime().await;
-    let guidance = compute_guidance(&event, regime.as_deref());
+    let asset = base_asset(&event.symbol);
+    let thresholds = match params.get(asset).await {
+        Some(p) => GuidanceThresholds::from_optimized_params(&p),
+        None => GuidanceThresholds::default(),
+    };
+    let guidance = compute_guidance(&event, regime.as_deref(), thresholds);
 
     info!(
         symbol = %event.symbol,
@@ -967,6 +987,7 @@ async fn position_event_handler(
         session_id = event.session_id.as_deref().unwrap_or(""),
         regime = regime.as_deref().unwrap_or(""),
         guidance_action = ?guidance.action,
+        take_profit_ratio = thresholds.take_profit_ratio,
         persisted = store.is_enabled(),
         "position event received"
     );
@@ -1026,10 +1047,34 @@ mod tests {
     }
 
     /// Build the router backed by the given state, with a disabled
-    /// position event store (persistence is exercised in
-    /// `position_store::tests`, not in router-level tests).
+    /// position event store and an empty `ParamManager` (so guidance
+    /// uses default thresholds). Per-asset threshold paths are
+    /// exercised in `position_events::tests` and a dedicated handler
+    /// test below.
     fn test_router(state: Arc<JanusState>) -> Router {
-        create_router(state, Arc::new(PositionEventStore::disabled()))
+        create_router(
+            state,
+            Arc::new(PositionEventStore::disabled()),
+            Arc::new(ParamManager::new("test")),
+        )
+    }
+
+    /// Build the router with a pre-populated `ParamManager` so we can
+    /// assert the optimizer-tuned threshold path. Each `OptimizedParams`
+    /// carries its own `asset` field — that's the lookup key.
+    async fn test_router_with_params(
+        state: Arc<JanusState>,
+        params: Vec<janus_core::OptimizedParams>,
+    ) -> Router {
+        let manager = ParamManager::new("test");
+        for p in params {
+            manager.update(p).await;
+        }
+        create_router(
+            state,
+            Arc::new(PositionEventStore::disabled()),
+            Arc::new(manager),
+        )
     }
 
     /// Send a GET request to the router and return `(StatusCode, serde_json::Value)`.
@@ -1477,6 +1522,29 @@ mod tests {
                 .contains("regime"),
             "reason should mention regime, got: {}",
             value["guidance"]["reason"]
+        );
+    }
+
+    #[tokio::test]
+    async fn position_event_uses_per_asset_optimized_take_profit_threshold() {
+        // BTC params tuned to take-profit 10% — the producer's snapshot at
+        // +5% (1500 / 30_000) should now hold instead of reduce.
+        let mut params = janus_core::OptimizedParams::new("BTC");
+        params.take_profit_pct = 10.0;
+        let router = test_router_with_params(test_state().await, vec![params]).await;
+        let body = serde_json::json!({
+            "symbol": "BTC-USD",
+            "side": "Buy",
+            "qty": 0.5,
+            "entry_price": 60000.0,
+            "current_price": 63000.0,
+            "pnl_unrealized": 1500.0
+        });
+        let (status, value) = post_json(&router, "/api/v1/positions/event", body).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(
+            value["guidance"]["action"], "hold",
+            "tuned 10% take-profit should suppress the default 5% reduce trigger"
         );
     }
 }

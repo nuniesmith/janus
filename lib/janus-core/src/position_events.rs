@@ -7,6 +7,7 @@
 //! guidance refinement are follow-ups.
 
 use crate::market::Side;
+use crate::optimized_params::OptimizedParams;
 use serde::{Deserialize, Serialize};
 
 /// A snapshot of an open position pushed by the execution side.
@@ -102,21 +103,61 @@ impl Guidance {
     }
 }
 
+/// Threshold ratios used by [`compute_guidance`]. Decoupled from
+/// [`OptimizedParams`] so callers can supply optimizer-derived values when
+/// available and fall back to conservative defaults otherwise.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GuidanceThresholds {
+    /// Negative ratio of notional at which to exit on a loss (e.g. `-0.02`
+    /// = exit when unrealized loss reaches 2% of `entry_price * qty`).
+    pub stop_loss_ratio: f64,
+    /// Positive ratio of notional at which to reduce on profit (e.g. `0.05`
+    /// = trim when unrealized gain reaches 5% of `entry_price * qty`).
+    pub take_profit_ratio: f64,
+}
+
+impl Default for GuidanceThresholds {
+    fn default() -> Self {
+        Self {
+            stop_loss_ratio: -0.02,
+            take_profit_ratio: 0.05,
+        }
+    }
+}
+
+impl GuidanceThresholds {
+    /// Derive thresholds from optimizer-tuned params.
+    ///
+    /// Only `take_profit_ratio` is currently learnable —
+    /// [`OptimizedParams`] doesn't carry an explicit stop-loss field
+    /// (see TODO note in the position-feedback section of `TODO.md`),
+    /// so the stop ratio is kept at the conservative default until
+    /// the optimizer schema grows one.
+    pub fn from_optimized_params(params: &OptimizedParams) -> Self {
+        Self {
+            take_profit_ratio: params.take_profit_pct / 100.0,
+            ..Self::default()
+        }
+    }
+}
+
 /// Compute advisory guidance for an open position.
 ///
-/// First-pass rules, evaluated in priority order:
+/// Rules in priority order:
 /// 1. Crisis-flavoured regime ⇒ [`Exit`](GuidanceAction::Exit).
-/// 2. Unrealized loss exceeding `STOP_LOSS_RATIO` of notional ⇒ [`Exit`](GuidanceAction::Exit).
-/// 3. Unrealized gain exceeding `TAKE_PROFIT_RATIO` of notional ⇒
+/// 2. Unrealized loss ≤ `thresholds.stop_loss_ratio` of notional ⇒
+///    [`Exit`](GuidanceAction::Exit).
+/// 3. Unrealized gain ≥ `thresholds.take_profit_ratio` of notional ⇒
 ///    [`Reduce`](GuidanceAction::Reduce).
 /// 4. Otherwise ⇒ [`Hold`](GuidanceAction::Hold).
 ///
 /// `notional = entry_price * qty` (sign-agnostic; works for both Buy and
 /// Sell positions because `pnl_unrealized` is supplied with sign already).
-pub fn compute_guidance(event: &PositionEvent, regime: Option<&str>) -> Guidance {
-    const STOP_LOSS_RATIO: f64 = -0.02;
-    const TAKE_PROFIT_RATIO: f64 = 0.05;
-
+pub fn compute_guidance(
+    event: &PositionEvent,
+    regime: Option<&str>,
+    thresholds: GuidanceThresholds,
+) -> Guidance {
     if let Some(label) = regime
         && is_crisis_regime(label)
     {
@@ -126,17 +167,28 @@ pub fn compute_guidance(event: &PositionEvent, regime: Option<&str>) -> Guidance
     let notional = event.entry_price * event.qty;
     if notional > 0.0 {
         let ratio = event.pnl_unrealized / notional;
-        if ratio <= STOP_LOSS_RATIO {
+        if ratio <= thresholds.stop_loss_ratio {
             let pct = ratio * 100.0;
             return Guidance::exit(format!("stop loss: {pct:.2}% of notional"));
         }
-        if ratio >= TAKE_PROFIT_RATIO {
+        if ratio >= thresholds.take_profit_ratio {
             let pct = ratio * 100.0;
             return Guidance::reduce(format!("take profit: {pct:.2}% of notional"));
         }
     }
 
     Guidance::hold("within bounds")
+}
+
+/// Extract the base asset from a position symbol — `"BTC-USD"` → `"BTC"`,
+/// `"ETH/USDT"` → `"ETH"`, `"BTC"` → `"BTC"`. Used to look up per-asset
+/// [`OptimizedParams`] from a [`ParamManager`](crate::optimized_params::ParamManager).
+pub fn base_asset(symbol: &str) -> &str {
+    symbol
+        .split(['-', '/'])
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(symbol)
 }
 
 fn is_crisis_regime(label: &str) -> bool {
@@ -232,12 +284,16 @@ mod tests {
 
     // ── Guidance ─────────────────────────────────────────────────────
 
+    fn default_thresholds() -> GuidanceThresholds {
+        GuidanceThresholds::default()
+    }
+
     #[test]
     fn guidance_holds_when_within_bounds() {
         // 0.5 BTC at 60_000 = 30_000 notional. +100 pnl = 0.33% — below take-profit.
         let mut e = sample();
         e.pnl_unrealized = 100.0;
-        let g = compute_guidance(&e, None);
+        let g = compute_guidance(&e, None, default_thresholds());
         assert_eq!(g.action, GuidanceAction::Hold);
     }
 
@@ -246,7 +302,7 @@ mod tests {
         // Notional 30_000; -2% = -600. -700 trips the stop.
         let mut e = sample();
         e.pnl_unrealized = -700.0;
-        let g = compute_guidance(&e, None);
+        let g = compute_guidance(&e, None, default_thresholds());
         assert_eq!(g.action, GuidanceAction::Exit);
         assert!(g.reason.contains("stop loss"));
     }
@@ -256,7 +312,7 @@ mod tests {
         // Notional 30_000; +5% = +1500. +2000 trips the take-profit.
         let mut e = sample();
         e.pnl_unrealized = 2_000.0;
-        let g = compute_guidance(&e, None);
+        let g = compute_guidance(&e, None, default_thresholds());
         assert_eq!(g.action, GuidanceAction::Reduce);
         assert!(g.reason.contains("take profit"));
     }
@@ -266,7 +322,7 @@ mod tests {
         // Even with healthy pnl, a crisis regime triggers exit.
         let mut e = sample();
         e.pnl_unrealized = 100.0;
-        let g = compute_guidance(&e, Some("crisis_volatility_spike"));
+        let g = compute_guidance(&e, Some("crisis_volatility_spike"), default_thresholds());
         assert_eq!(g.action, GuidanceAction::Exit);
         assert!(g.reason.contains("regime"));
     }
@@ -276,7 +332,7 @@ mod tests {
         let e = sample();
         for label in ["PANIC", "Flash_Crash detected", "shockwave"] {
             assert_eq!(
-                compute_guidance(&e, Some(label)).action,
+                compute_guidance(&e, Some(label), default_thresholds()).action,
                 GuidanceAction::Exit,
                 "label {label:?} should trigger exit"
             );
@@ -288,7 +344,7 @@ mod tests {
         let e = sample();
         // "bullish_trend" isn't a crisis label, so guidance is pnl-driven.
         assert_eq!(
-            compute_guidance(&e, Some("bullish_trend")).action,
+            compute_guidance(&e, Some("bullish_trend"), default_thresholds()).action,
             GuidanceAction::Hold
         );
     }
@@ -298,5 +354,43 @@ mod tests {
         let g = Guidance::hold("ok");
         let json = serde_json::to_string(&g).unwrap();
         assert!(json.contains("\"action\":\"hold\""));
+    }
+
+    // ── GuidanceThresholds ───────────────────────────────────────────
+
+    #[test]
+    fn thresholds_from_optimized_params_overrides_take_profit_only() {
+        let mut params = OptimizedParams::default(); // take_profit_pct = 5.0
+        params.take_profit_pct = 8.0; // optimizer tuned to 8%
+        let t = GuidanceThresholds::from_optimized_params(&params);
+        assert!((t.take_profit_ratio - 0.08).abs() < 1e-9);
+        // stop_loss_ratio inherits the default until OptimizedParams grows one.
+        assert_eq!(t.stop_loss_ratio, GuidanceThresholds::default().stop_loss_ratio);
+    }
+
+    #[test]
+    fn guidance_take_profit_uses_supplied_threshold() {
+        // Bump take-profit to 10%. +1500 pnl on 30_000 notional = 5% — below the
+        // tuned threshold, so guidance should NOT reduce.
+        let mut e = sample();
+        e.pnl_unrealized = 1_500.0;
+        let tighter = GuidanceThresholds {
+            take_profit_ratio: 0.10,
+            ..GuidanceThresholds::default()
+        };
+        assert_eq!(
+            compute_guidance(&e, None, tighter).action,
+            GuidanceAction::Hold
+        );
+    }
+
+    // ── base_asset ───────────────────────────────────────────────────
+
+    #[test]
+    fn base_asset_strips_quote_currency_suffix() {
+        assert_eq!(base_asset("BTC-USD"), "BTC");
+        assert_eq!(base_asset("ETH/USDT"), "ETH");
+        assert_eq!(base_asset("SOL"), "SOL");
+        assert_eq!(base_asset(""), "");
     }
 }

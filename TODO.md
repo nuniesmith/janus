@@ -40,8 +40,11 @@
 ### JFLOW-C: Two-way position feedback (remaining)
 - [x] **Receive path foundation (2026-05-25, #13)**: `PositionEvent` wire type in `lib/janus-core/src/position_events.rs`; `POST /api/v1/positions/event` on janus-api validates and logs.
 - [x] **Raw event persistence (2026-05-25, #14)**: `PositionEventStore` in `lib/janus-api/src/position_store.rs` writes each received event into the Postgres `janus_position_events` ingest log. Best-effort: missing table or unreachable DB → disabled with warn (mirrors JFLOW-D probe pattern). Schema owned by the JanusAI Python service.
-- [x] **Guidance stub (2026-05-25)**: `compute_guidance(event, regime)` in `position_events.rs` returns hold/reduce/exit + reason from current regime + ±5% / -2% unrealized P&L thresholds; handler reads `state.current_regime()` and includes guidance in the 202 response.
-- [ ] Smarter guidance: pull volatility from market data, exit urgency from amygdala, take-profit zones from optimized params — current rules are first-pass thresholds.
+- [x] **Guidance stub (2026-05-25, #15)**: `compute_guidance(event, regime)` in `position_events.rs` returns hold/reduce/exit + reason from current regime + ±5% / -2% unrealized P&L thresholds; handler reads `state.current_regime()` and includes guidance in the 202 response.
+- [x] **Guidance ← OptimizedParams (2026-05-25)**: `GuidanceThresholds::from_optimized_params` lets per-asset optimizer-tuned `take_profit_pct` override the default 5%. `ParamManager` plumbed into janus-api as an Extension (empty at startup; populated by a future Redis-loader slice). Handler extracts the per-asset base symbol with `base_asset(&event.symbol)`. Stop-loss ratio stays at the conservative default until `OptimizedParams` grows an explicit `stop_loss_pct` field (Python-side coordination).
+- [ ] Wire `ParamManager` to its Redis source so per-asset thresholds actually flow from the optimizer (currently the Extension is always empty in production).
+- [ ] Add `stop_loss_pct` to `OptimizedParams` so guidance stop ratios are also learnable (requires Python optimizer schema bump).
+- [ ] Smarter guidance: volatility from market data, exit urgency from amygdala.
 - [ ] Compact `janus_position_events` raw log into closed-trade rows in `janus_memories` (JanusAI side, fks repo).
 
 ### JFLOW-D: Startup bootstrap  *(direct Postgres path landed 2026-05-24)*
