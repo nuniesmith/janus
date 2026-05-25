@@ -7,14 +7,17 @@
 //! - Signal query endpoints
 //! - WebSocket streaming (optional)
 
+pub mod position_store;
+
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use janus_core::{JanusState, PositionEvent, ServiceState, Signal};
+use position_store::PositionEventStore;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc};
 use tower_http::cors::CorsLayer;
@@ -32,8 +35,13 @@ pub async fn start_module(state: Arc<JanusState>) -> janus_core::Result<()> {
 
     tracing::info!("Starting API module on port {}", http_port);
 
+    // Position event persistence (JFLOW-C): connect best-effort. The store
+    // is always present in the request extensions — it's a no-op when the
+    // DB is unreachable or the table is missing.
+    let position_store = Arc::new(PositionEventStore::connect(&state.config.database.url).await);
+
     // Build the main HTTP router
-    let app = create_router(state.clone());
+    let app = create_router(state.clone(), position_store);
 
     // Build the metrics router
     let metrics_app = create_metrics_router();
@@ -79,7 +87,7 @@ pub async fn start_module(state: Arc<JanusState>) -> janus_core::Result<()> {
 }
 
 /// Create the main HTTP API router
-fn create_router(state: Arc<JanusState>) -> Router {
+fn create_router(state: Arc<JanusState>, position_store: Arc<PositionEventStore>) -> Router {
     // NOTE: Permissive CORS is acceptable for internal/paper-trading use.
     // For production, restrict origins via state.config.cors_origins.
     let cors = CorsLayer::permissive();
@@ -122,6 +130,7 @@ fn create_router(state: Arc<JanusState>) -> Router {
         .route("/api/log-level", post(log_level_set_handler))
         // Position event ingress (JFLOW-C foundation: receive + log, no guidance yet)
         .route("/api/v1/positions/event", post(position_event_handler))
+        .layer(Extension(position_store))
         .layer(cors)
         .with_state(state)
 }
@@ -919,17 +928,20 @@ async fn log_level_set_handler(
     }
 }
 
-/// Receive a position snapshot from the execution side (JFLOW-C foundation).
+/// Receive a position snapshot from the execution side (JFLOW-C).
 ///
-/// Current behavior: validate at the boundary and log. Guidance computation,
-/// regime-aware exit hints, and persistence into `janus_memories` are
-/// follow-ups — this endpoint reserves the URL and pins the wire shape so the
-/// execution side can wire up the producer in parallel.
+/// Pipeline: validate at the boundary → log → best-effort persist via the
+/// `PositionEventStore`. Persistence failures are logged inside the store
+/// and do not fail the response. Guidance computation and regime-aware exit
+/// hints are follow-ups.
 #[tracing::instrument(
-    skip(event),
+    skip(event, store),
     fields(symbol = %event.symbol, side = ?event.side, qty = event.qty)
 )]
-async fn position_event_handler(Json(event): Json<PositionEvent>) -> impl IntoResponse {
+async fn position_event_handler(
+    Extension(store): Extension<Arc<PositionEventStore>>,
+    Json(event): Json<PositionEvent>,
+) -> impl IntoResponse {
     if let Err(reason) = event.validate() {
         return (
             StatusCode::BAD_REQUEST,
@@ -948,8 +960,10 @@ async fn position_event_handler(Json(event): Json<PositionEvent>) -> impl IntoRe
         pnl_unrealized = event.pnl_unrealized,
         position_id = event.position_id.as_deref().unwrap_or(""),
         session_id = event.session_id.as_deref().unwrap_or(""),
+        persisted = store.is_enabled(),
         "position event received"
     );
+    store.record(&event).await;
     (
         StatusCode::ACCEPTED,
         Json(serde_json::json!({ "accepted": true })),
@@ -1001,9 +1015,11 @@ mod tests {
         Arc::new(JanusState::new(config).await.unwrap())
     }
 
-    /// Build the router backed by the given state.
+    /// Build the router backed by the given state, with a disabled
+    /// position event store (persistence is exercised in
+    /// `position_store::tests`, not in router-level tests).
     fn test_router(state: Arc<JanusState>) -> Router {
-        create_router(state)
+        create_router(state, Arc::new(PositionEventStore::disabled()))
     }
 
     /// Send a GET request to the router and return `(StatusCode, serde_json::Value)`.
