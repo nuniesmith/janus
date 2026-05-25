@@ -6,7 +6,10 @@ use burn::tensor::Tensor;
 type TestBackend = NdArray<f32>;
 
 use vision::diffgaf::combined::DiffGafLstmConfig;
-use vision::diffgaf::config::DiffGAFConfig;
+use vision::diffgaf::layers::DiffGAF;
+use vision::diffgaf::transforms::{
+    GramianLayerConfig, GramianMode, LearnableNormConfig, PolarEncoderConfig,
+};
 
 /// Benchmark the DiffGAF transform (time series → GAF image)
 fn bench_diffgaf_transform(c: &mut Criterion) {
@@ -23,12 +26,29 @@ fn bench_diffgaf_transform(c: &mut Criterion) {
         (4, 120, 5),
         (4, 60, 10),
     ] {
-        let config = DiffGAFConfig {
+        // DiffGAF is now built from three sub-component configs (the
+        // single-shot `DiffGAFConfig::init` was removed). Reproduces the
+        // construction the unit test in src/diffgaf/layers.rs uses.
+        let norm_config = LearnableNormConfig {
             num_features: features,
-            time_steps,
-            ..Default::default()
+            target_min: -1.0,
+            target_max: 1.0,
+            eps: 1e-7,
         };
-        let diffgaf = config.init::<TestBackend>(&device);
+        let encoder_config = PolarEncoderConfig {
+            num_features: features,
+            use_smooth: true,
+            eps: 1e-7,
+        };
+        let gramian_config = GramianLayerConfig {
+            use_efficient: true,
+            mode: GramianMode::Dual,
+        };
+        let diffgaf = DiffGAF::<TestBackend>::new(
+            norm_config.init(&device),
+            encoder_config.init(&device),
+            gramian_config.init(),
+        );
 
         let id = BenchmarkId::new(
             "transform",

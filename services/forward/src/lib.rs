@@ -784,13 +784,14 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                         }
                         let m = sg.metrics();
                         let (p50_latency_us, p99_latency_us) = m.latency_percentiles_us();
+                        let regime = state_for_metrics.current_regime().await;
                         let snapshot = janus_core::SessionMetrics {
                             signals_generated: m.total_generated(),
                             signals_filtered: m.total_filtered(),
                             avg_confidence: m.avg_confidence(),
                             p50_latency_us,
                             p99_latency_us,
-                            regime: None,
+                            regime,
                         };
                         client.push(&session_id, &snapshot).await;
                     }
@@ -1359,6 +1360,15 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                     let source_label = signal.metadata.get("data_source")
                         .map(|s| s.as_str())
                         .unwrap_or("unknown");
+
+                    // JFLOW-A: opportunistic regime capture for the session
+                    // metrics reporter. Any upstream producer that knows the
+                    // current regime can publish it by adding a "regime"
+                    // entry to the signal's metadata HashMap — no other API
+                    // hook required.
+                    if let Some(regime) = signal.metadata.get("regime") {
+                        state_clone.set_current_regime(regime.clone()).await;
+                    }
 
                     info!(
                         "Forward module received signal: {} {} {} (confidence: {:.2}, source: {}, data: {})",
