@@ -90,7 +90,7 @@ mod tests {
         };
         let gramian_config = super::super::transforms::GramianLayerConfig {
             use_efficient: true,
-            mode: GramianMode::Dual,
+            mode: super::super::transforms::GramianMode::Dual,
         };
 
         let diffgaf = DiffGAF::new(
