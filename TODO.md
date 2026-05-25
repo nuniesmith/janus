@@ -38,8 +38,9 @@
 - [ ] Optimizer reads asset list from Ruby's asset registry via gRPC or Redis (currently env-only).
 
 ### JFLOW-C: Two-way position feedback (remaining)
-- [ ] Janus receives live position data and provides guidance: take-profit suggestions based on regime changes, stop adjustment based on volatility, exit urgency from amygdala.
-- [ ] All feedback stored as execution memories for learning.
+- [x] **Receive path foundation (2026-05-25)**: `PositionEvent` wire type in `lib/janus-core/src/position_events.rs`; `POST /api/v1/positions/event` on janus-api validates and logs. No guidance / persistence yet — endpoint pins the URL so the execution-side producer can wire up in parallel.
+- [ ] Guidance computation: take-profit suggestions based on regime changes, stop adjustment based on volatility, exit urgency from amygdala.
+- [ ] Persist position events + guidance decisions as execution memories for learning (`janus_memories`).
 
 ### JFLOW-D: Startup bootstrap  *(direct Postgres path landed 2026-05-24)*
 - [x] `bootstrap_affinity_from_postgres()` queries `janus_memories` via `sqlx` and replays into the strategy-affinity tracker. Probes for the table first so a missing schema isn't reported as an error.
@@ -67,7 +68,7 @@
 ## P2 — Housekeeping
 
 - [ ] Proto: Consolidate dual `ForwardService` — `fks.janus.v1.ForwardService` (4 RPCs) vs `fks.forward.v1.ForwardService` (7 RPCs) — **deferred**: see STRUCT-C above.
-- [ ] Reduce legacy fields in `Config` (lines 99-145 of `lib/janus-core/src/config.rs`): `http_port`, `grpc_port`, `enable_forward`, `redis_url`, … — these duplicate the new nested config. Cleanup blocked on confirming no external TOMLs still rely on them.
+- [x] Reduce legacy fields in `Config` (was lines 99-145 of `lib/janus-core/src/config.rs`): `http_port`, `grpc_port`, `enable_forward`, `redis_url`, … — **dropped 2026-05-25 (#12)**, replaced with `#[serde(deny_unknown_fields)]` so stale TOMLs fail loudly. Fixed a latent bug in `janus-api`'s `/status` that read the always-`None` legacy module flags.
 
 ---
 

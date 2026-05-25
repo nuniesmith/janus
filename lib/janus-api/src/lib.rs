@@ -14,7 +14,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use janus_core::{JanusState, ServiceState, Signal};
+use janus_core::{JanusState, PositionEvent, ServiceState, Signal};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc};
 use tower_http::cors::CorsLayer;
@@ -120,6 +120,8 @@ fn create_router(state: Arc<JanusState>) -> Router {
         // Runtime log level control
         .route("/api/log-level", get(log_level_get_handler))
         .route("/api/log-level", post(log_level_set_handler))
+        // Position event ingress (JFLOW-C foundation: receive + log, no guidance yet)
+        .route("/api/v1/positions/event", post(position_event_handler))
         .layer(cors)
         .with_state(state)
 }
@@ -917,6 +919,43 @@ async fn log_level_set_handler(
     }
 }
 
+/// Receive a position snapshot from the execution side (JFLOW-C foundation).
+///
+/// Current behavior: validate at the boundary and log. Guidance computation,
+/// regime-aware exit hints, and persistence into `janus_memories` are
+/// follow-ups — this endpoint reserves the URL and pins the wire shape so the
+/// execution side can wire up the producer in parallel.
+#[tracing::instrument(
+    skip(event),
+    fields(symbol = %event.symbol, side = ?event.side, qty = event.qty)
+)]
+async fn position_event_handler(Json(event): Json<PositionEvent>) -> impl IntoResponse {
+    if let Err(reason) = event.validate() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "accepted": false,
+                "error": reason,
+            })),
+        );
+    }
+    info!(
+        symbol = %event.symbol,
+        side = ?event.side,
+        qty = event.qty,
+        entry_price = event.entry_price,
+        current_price = event.current_price,
+        pnl_unrealized = event.pnl_unrealized,
+        position_id = event.position_id.as_deref().unwrap_or(""),
+        session_id = event.session_id.as_deref().unwrap_or(""),
+        "position event received"
+    );
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "accepted": true })),
+    )
+}
+
 // =============================================================================
 // Error Handling
 // =============================================================================
@@ -1348,5 +1387,42 @@ mod tests {
 
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ── Position event endpoint (JFLOW-C) ────────────────────────────
+
+    #[tokio::test]
+    async fn position_event_accepts_valid_payload() {
+        let router = test_router(test_state().await);
+        let body = serde_json::json!({
+            "symbol": "BTC-USD",
+            "side": "Buy",
+            "qty": 0.5,
+            "entry_price": 60000.0,
+            "current_price": 61000.0,
+            "pnl_unrealized": 500.0,
+            "position_id": "pos-1",
+            "session_id": "sess-1"
+        });
+        let (status, value) = post_json(&router, "/api/v1/positions/event", body).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(value["accepted"], serde_json::Value::Bool(true));
+    }
+
+    #[tokio::test]
+    async fn position_event_rejects_invalid_payload() {
+        let router = test_router(test_state().await);
+        let body = serde_json::json!({
+            "symbol": "BTC-USD",
+            "side": "Buy",
+            "qty": -1.0,
+            "entry_price": 60000.0,
+            "current_price": 61000.0,
+            "pnl_unrealized": 0.0
+        });
+        let (status, value) = post_json(&router, "/api/v1/positions/event", body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(value["accepted"], serde_json::Value::Bool(false));
+        assert!(value["error"].as_str().unwrap().contains("qty"));
     }
 }
