@@ -3,7 +3,7 @@
 use burn::module::Module;
 use burn::tensor::backend::Backend;
 
-use super::transforms::{GramianLayer, GramianMode, LearnableNorm, PolarEncoder};
+use super::transforms::{GramianLayer, LearnableNorm, PolarEncoder};
 
 /// Differentiable Gramian Angular Field layer
 ///
