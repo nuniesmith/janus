@@ -67,7 +67,7 @@
 ## P2 — Housekeeping
 
 - [ ] Proto: Consolidate dual `ForwardService` — `fks.janus.v1.ForwardService` (4 RPCs) vs `fks.forward.v1.ForwardService` (7 RPCs) — **deferred**: see STRUCT-C above.
-- [ ] Reduce legacy fields in `Config` (lines 99-145 of `lib/janus-core/src/config.rs`): `http_port`, `grpc_port`, `enable_forward`, `redis_url`, … — these duplicate the new nested config. Cleanup blocked on confirming no external TOMLs still rely on them.
+- [x] Reduce legacy fields in `Config` (was lines 99-145 of `lib/janus-core/src/config.rs`): `http_port`, `grpc_port`, `enable_forward`, `redis_url`, … — **dropped 2026-05-25**, replaced with `#[serde(deny_unknown_fields)]` so stale TOMLs fail loudly. Fixed a latent bug in `janus-api`'s `/status` that read the always-`None` legacy module flags.
 
 ---
 
