@@ -14,6 +14,7 @@ pub mod logging;
 pub mod market;
 pub mod metrics;
 pub mod optimized_params;
+pub mod position_events;
 pub mod session_metrics;
 pub mod signal;
 pub mod state;
@@ -31,6 +32,7 @@ pub use market::{
     MarketType, OrderBookEvent, PriceLevel, Side, Symbol, TickerEvent, TradeEvent,
 };
 pub use optimized_params::{OptimizedParams, ParamManager, ParamNotification};
+pub use position_events::PositionEvent;
 pub use session_metrics::{SessionMetrics, SessionMetricsClient};
 pub use signal::{Signal, SignalBus, SignalType};
 pub use state::{JanusState, LogLevelController, ServiceState};
