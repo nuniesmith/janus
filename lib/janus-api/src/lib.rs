@@ -16,7 +16,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use janus_core::{JanusState, PositionEvent, ServiceState, Signal};
+use janus_core::{JanusState, PositionEvent, ServiceState, Signal, compute_guidance};
 use position_store::PositionEventStore;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc};
@@ -931,14 +931,15 @@ async fn log_level_set_handler(
 /// Receive a position snapshot from the execution side (JFLOW-C).
 ///
 /// Pipeline: validate at the boundary → log → best-effort persist via the
-/// `PositionEventStore`. Persistence failures are logged inside the store
-/// and do not fail the response. Guidance computation and regime-aware exit
-/// hints are follow-ups.
+/// `PositionEventStore` → compute advisory guidance from the current regime
+/// and unrealized P&L → return it in the 202 response. Guidance is advisory;
+/// the producer decides whether to act on it.
 #[tracing::instrument(
-    skip(event, store),
+    skip(event, store, state),
     fields(symbol = %event.symbol, side = ?event.side, qty = event.qty)
 )]
 async fn position_event_handler(
+    State(state): State<Arc<JanusState>>,
     Extension(store): Extension<Arc<PositionEventStore>>,
     Json(event): Json<PositionEvent>,
 ) -> impl IntoResponse {
@@ -951,6 +952,10 @@ async fn position_event_handler(
             })),
         );
     }
+
+    let regime = state.current_regime().await;
+    let guidance = compute_guidance(&event, regime.as_deref());
+
     info!(
         symbol = %event.symbol,
         side = ?event.side,
@@ -960,13 +965,18 @@ async fn position_event_handler(
         pnl_unrealized = event.pnl_unrealized,
         position_id = event.position_id.as_deref().unwrap_or(""),
         session_id = event.session_id.as_deref().unwrap_or(""),
+        regime = regime.as_deref().unwrap_or(""),
+        guidance_action = ?guidance.action,
         persisted = store.is_enabled(),
         "position event received"
     );
     store.record(&event).await;
     (
         StatusCode::ACCEPTED,
-        Json(serde_json::json!({ "accepted": true })),
+        Json(serde_json::json!({
+            "accepted": true,
+            "guidance": guidance,
+        })),
     )
 }
 
@@ -1423,6 +1433,8 @@ mod tests {
         let (status, value) = post_json(&router, "/api/v1/positions/event", body).await;
         assert_eq!(status, StatusCode::ACCEPTED);
         assert_eq!(value["accepted"], serde_json::Value::Bool(true));
+        // Notional 30_000, pnl +500 = 1.67% — within bounds, no regime ⇒ hold.
+        assert_eq!(value["guidance"]["action"], "hold");
     }
 
     #[tokio::test]
@@ -1440,5 +1452,31 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(value["accepted"], serde_json::Value::Bool(false));
         assert!(value["error"].as_str().unwrap().contains("qty"));
+    }
+
+    #[tokio::test]
+    async fn position_event_returns_exit_guidance_when_regime_is_crisis() {
+        let state = test_state().await;
+        state.set_current_regime("crisis_volatility_spike").await;
+        let router = test_router(state);
+        let body = serde_json::json!({
+            "symbol": "BTC-USD",
+            "side": "Buy",
+            "qty": 0.5,
+            "entry_price": 60000.0,
+            "current_price": 61000.0,
+            "pnl_unrealized": 500.0
+        });
+        let (status, value) = post_json(&router, "/api/v1/positions/event", body).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(value["guidance"]["action"], "exit");
+        assert!(
+            value["guidance"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("regime"),
+            "reason should mention regime, got: {}",
+            value["guidance"]["reason"]
+        );
     }
 }
