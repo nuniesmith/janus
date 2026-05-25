@@ -39,8 +39,9 @@
 
 ### JFLOW-C: Two-way position feedback (remaining)
 - [x] **Receive path foundation (2026-05-25, #13)**: `PositionEvent` wire type in `lib/janus-core/src/position_events.rs`; `POST /api/v1/positions/event` on janus-api validates and logs.
-- [x] **Raw event persistence (2026-05-25)**: `PositionEventStore` in `lib/janus-api/src/position_store.rs` writes each received event into the Postgres `janus_position_events` ingest log. Best-effort: missing table or unreachable DB → disabled with warn (mirrors JFLOW-D probe pattern). Schema owned by the JanusAI Python service.
-- [ ] Guidance computation: take-profit suggestions based on regime changes, stop adjustment based on volatility, exit urgency from amygdala.
+- [x] **Raw event persistence (2026-05-25, #14)**: `PositionEventStore` in `lib/janus-api/src/position_store.rs` writes each received event into the Postgres `janus_position_events` ingest log. Best-effort: missing table or unreachable DB → disabled with warn (mirrors JFLOW-D probe pattern). Schema owned by the JanusAI Python service.
+- [x] **Guidance stub (2026-05-25)**: `compute_guidance(event, regime)` in `position_events.rs` returns hold/reduce/exit + reason from current regime + ±5% / -2% unrealized P&L thresholds; handler reads `state.current_regime()` and includes guidance in the 202 response.
+- [ ] Smarter guidance: pull volatility from market data, exit urgency from amygdala, take-profit zones from optimized params — current rules are first-pass thresholds.
 - [ ] Compact `janus_position_events` raw log into closed-trade rows in `janus_memories` (JanusAI side, fks repo).
 
 ### JFLOW-D: Startup bootstrap  *(direct Postgres path landed 2026-05-24)*
