@@ -32,7 +32,9 @@ pub use market::{
     MarketType, OrderBookEvent, PriceLevel, Side, Symbol, TickerEvent, TradeEvent,
 };
 pub use optimized_params::{OptimizedParams, ParamManager, ParamNotification};
-pub use position_events::{Guidance, GuidanceAction, PositionEvent, compute_guidance};
+pub use position_events::{
+    Guidance, GuidanceAction, GuidanceThresholds, PositionEvent, base_asset, compute_guidance,
+};
 pub use session_metrics::{SessionMetrics, SessionMetricsClient};
 pub use signal::{Signal, SignalBus, SignalType};
 pub use state::{JanusState, LogLevelController, ServiceState};
