@@ -43,10 +43,31 @@ pub async fn start_module(state: Arc<JanusState>) -> janus_core::Result<()> {
     // DB is unreachable or the table is missing.
     let position_store = Arc::new(PositionEventStore::connect(&state.config.database.url).await);
 
-    // Per-asset optimizer-tuned thresholds for guidance. Starts empty —
-    // populated by JFLOW-C/B follow-ups (Redis subscription, optimizer push).
-    // When empty, guidance falls back to default thresholds.
+    // Per-asset optimizer-tuned thresholds for guidance. Best-effort
+    // load from Redis at startup: missing connection or empty hash →
+    // manager stays empty and guidance falls back to default thresholds.
+    // Live updates from the optimizer aren't subscribed here yet — that's
+    // a follow-up (services/forward already subscribes for its own use).
     let param_manager = Arc::new(ParamManager::new(&state.config.service.name));
+    match state.redis_client().await {
+        Ok(client) => match param_manager.load_from_redis(&client).await {
+            Ok(count) => {
+                tracing::info!(count, "Loaded optimized params from Redis for guidance");
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to load optimized params from Redis; guidance will use defaults"
+                );
+            }
+        },
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "Redis unavailable at startup; guidance will use default thresholds"
+            );
+        }
+    }
 
     // Build the main HTTP router
     let app = create_router(state.clone(), position_store, param_manager);
