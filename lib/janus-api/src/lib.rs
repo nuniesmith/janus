@@ -7,6 +7,7 @@
 //! - Signal query endpoints
 //! - WebSocket streaming (optional)
 
+mod param_updates;
 pub mod position_store;
 
 use axum::{
@@ -44,10 +45,10 @@ pub async fn start_module(state: Arc<JanusState>) -> janus_core::Result<()> {
     let position_store = Arc::new(PositionEventStore::connect(&state.config.database.url).await);
 
     // Per-asset optimizer-tuned thresholds for guidance. Best-effort
-    // load from Redis at startup: missing connection or empty hash →
-    // manager stays empty and guidance falls back to default thresholds.
-    // Live updates from the optimizer aren't subscribed here yet — that's
-    // a follow-up (services/forward already subscribes for its own use).
+    // initial load from Redis, then a background subscription so live
+    // optimizer pushes refresh the cache without a restart. Missing
+    // connection or empty hash → manager stays empty and guidance falls
+    // back to default thresholds.
     let param_manager = Arc::new(ParamManager::new(&state.config.service.name));
     match state.redis_client().await {
         Ok(client) => match param_manager.load_from_redis(&client).await {
@@ -68,6 +69,7 @@ pub async fn start_module(state: Arc<JanusState>) -> janus_core::Result<()> {
             );
         }
     }
+    let param_updates_task = param_updates::spawn(state.clone(), param_manager.clone());
 
     // Build the main HTTP router
     let app = create_router(state.clone(), position_store, param_manager);
@@ -111,6 +113,7 @@ pub async fn start_module(state: Arc<JanusState>) -> janus_core::Result<()> {
     tracing::info!("API module shutting down...");
     http_server.abort();
     metrics_server.abort();
+    param_updates_task.abort();
 
     Ok(())
 }
