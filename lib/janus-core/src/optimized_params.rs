@@ -593,6 +593,33 @@ mod tests {
         assert_eq!(manager.updates_channel(), "fks:personal:param_updates");
     }
 
+    #[tokio::test]
+    async fn process_notification_applies_param_update_to_cache() {
+        // Simulates a Redis pub/sub payload from the optimizer: a
+        // `ParamUpdate` JSON should land in the cache and be visible
+        // via `get`. This is the path the janus-api live-update
+        // subscriber relies on.
+        let manager = ParamManager::new("test");
+        let mut params = OptimizedParams::new("BTC");
+        params.take_profit_pct = 7.5;
+        let payload = serde_json::to_string(&ParamNotification::ParamUpdate {
+            asset: "BTC".into(),
+            timestamp: "2026-05-25T00:00:00Z".into(),
+            params: params.clone(),
+        })
+        .unwrap();
+        manager.process_notification(&payload).await.unwrap();
+        let cached = manager.get("BTC").await.unwrap();
+        assert!((cached.take_profit_pct - 7.5).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn process_notification_rejects_malformed_json() {
+        let manager = ParamManager::new("test");
+        let err = manager.process_notification("{ not valid json").await;
+        assert!(matches!(err, Err(ParamError::Serialization(_))));
+    }
+
     #[test]
     fn test_trading_enabled() {
         let mut params = OptimizedParams::new("BTC");

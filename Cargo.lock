@@ -5656,6 +5656,7 @@ dependencies = [
  "anyhow",
  "axum 0.8.8",
  "chrono",
+ "futures-util",
  "http 1.4.0",
  "http-body-util",
  "janus-core",
