@@ -447,6 +447,7 @@ impl OptimizerService {
             min_ema_spread_pct: params.get("min_ema_spread_pct").unwrap_or(0.2),
             min_profit_pct: params.get("min_profit_pct").unwrap_or(0.4),
             take_profit_pct: params.get("take_profit_pct").unwrap_or(5.0),
+            stop_loss_pct: params.get("stop_loss_pct").unwrap_or(2.0),
             trade_cooldown_seconds: (params.get_int("cooldown_bars").unwrap_or(5) * 300) as u64,
             require_htf_alignment: params.get_bool("require_htf_alignment").unwrap_or(true),
             htf_timeframe_minutes: params.get_int("htf_period").unwrap_or(15) as u32,

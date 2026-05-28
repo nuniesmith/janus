@@ -45,7 +45,7 @@
 - [x] **Redis bootstrap load (2026-05-25, #17)**: `janus-api::start_module` now best-effort `HGETALL`s `fks:{instance}:optimized_params` at boot so production guidance actually uses tuned thresholds. Missing/empty hash or unreachable Redis → warn + fall back to defaults.
 - [x] **Live param-update subscription (2026-05-25)**: `janus-api::param_updates` spawns a tokio task that subscribes to `fks:{instance}:param_updates` and applies notifications to the shared `ParamManager` via `process_notification`. Exponential backoff with reconnect on Redis disconnect; aborts cleanly on shutdown.
 - [ ] Dedupe with `services/forward`: both modules now subscribe to the same Redis channel + maintain separate `ParamManager` caches. Promoting `ParamManager` onto `JanusState` would collapse them to one — deferred since it touches forward's `ParamReloadManager` (which also owns appliers).
-- [ ] Add `stop_loss_pct` to `OptimizedParams` so guidance stop ratios are also learnable (requires Python optimizer schema bump).
+- [x] **`stop_loss_pct` in `OptimizedParams` (2026-05-28)**: New field with serde default `2.0` (matching the old hardcoded `-2%` threshold). `GuidanceThresholds::from_optimized_params` now maps both `stop_loss_pct` and `take_profit_pct` to their signed ratios. Validation rejects out-of-range values. Python optimizer schema bump needed to start emitting the field; until then serde default keeps existing behaviour.
 - [ ] Smarter guidance: volatility from market data, exit urgency from amygdala.
 - [ ] Compact `janus_position_events` raw log into closed-trade rows in `janus_memories` (JanusAI side, fks repo).
 
