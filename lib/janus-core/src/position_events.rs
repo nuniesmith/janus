@@ -128,15 +128,15 @@ impl Default for GuidanceThresholds {
 impl GuidanceThresholds {
     /// Derive thresholds from optimizer-tuned params.
     ///
-    /// Only `take_profit_ratio` is currently learnable —
-    /// [`OptimizedParams`] doesn't carry an explicit stop-loss field
-    /// (see TODO note in the position-feedback section of `TODO.md`),
-    /// so the stop ratio is kept at the conservative default until
-    /// the optimizer schema grows one.
+    /// Both `stop_loss_ratio` and `take_profit_ratio` are now learnable
+    /// via [`OptimizedParams::stop_loss_pct`] and
+    /// [`OptimizedParams::take_profit_pct`] respectively.
+    /// `stop_loss_pct` is stored as a positive percentage (e.g. `2.0`)
+    /// and converted to a negative ratio here (`-0.02`).
     pub fn from_optimized_params(params: &OptimizedParams) -> Self {
         Self {
+            stop_loss_ratio: -(params.stop_loss_pct / 100.0),
             take_profit_ratio: params.take_profit_pct / 100.0,
-            ..Self::default()
         }
     }
 }
@@ -359,13 +359,24 @@ mod tests {
     // ── GuidanceThresholds ───────────────────────────────────────────
 
     #[test]
-    fn thresholds_from_optimized_params_overrides_take_profit_only() {
-        let mut params = OptimizedParams::default(); // take_profit_pct = 5.0
-        params.take_profit_pct = 8.0; // optimizer tuned to 8%
+    fn thresholds_from_optimized_params_overrides_both_ratios() {
+        let mut params = OptimizedParams::default();
+        params.take_profit_pct = 8.0;
+        params.stop_loss_pct = 3.0; // optimizer tuned to tighter stop
         let t = GuidanceThresholds::from_optimized_params(&params);
         assert!((t.take_profit_ratio - 0.08).abs() < 1e-9);
-        // stop_loss_ratio inherits the default until OptimizedParams grows one.
+        // stop_loss_pct is positive; ratio must be negative.
+        assert!((t.stop_loss_ratio - (-0.03)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn thresholds_default_stop_loss_matches_optimized_params_default() {
+        // Ensure serde default (2.0%) and GuidanceThresholds::default (-0.02)
+        // stay in sync — a divergence would silently change live behaviour.
+        let params = OptimizedParams::default();
+        let t = GuidanceThresholds::from_optimized_params(&params);
         assert_eq!(t.stop_loss_ratio, GuidanceThresholds::default().stop_loss_ratio);
+        assert_eq!(t.take_profit_ratio, GuidanceThresholds::default().take_profit_ratio);
     }
 
     #[test]
@@ -381,6 +392,31 @@ mod tests {
         assert_eq!(
             compute_guidance(&e, None, tighter).action,
             GuidanceAction::Hold
+        );
+    }
+
+    #[test]
+    fn guidance_stop_loss_uses_supplied_threshold() {
+        // Tighten stop to 1%. -200 pnl on 30_000 notional ≈ -0.67% —
+        // below the default -2% but above the tighter -1%, so it should hold.
+        let mut e = sample();
+        e.pnl_unrealized = -200.0;
+        let tighter = GuidanceThresholds {
+            stop_loss_ratio: -0.01,
+            ..GuidanceThresholds::default()
+        };
+        assert_eq!(
+            compute_guidance(&e, None, tighter).action,
+            GuidanceAction::Hold,
+            "-0.67% loss should hold under a 1% stop threshold"
+        );
+        // But -350 pnl ≈ -1.17% should now trip the tighter stop.
+        let mut e2 = sample();
+        e2.pnl_unrealized = -350.0;
+        assert_eq!(
+            compute_guidance(&e2, None, tighter).action,
+            GuidanceAction::Exit,
+            "-1.17% loss should exit under a 1% stop threshold"
         );
     }
 

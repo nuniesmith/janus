@@ -68,6 +68,13 @@ pub struct OptimizedParams {
     #[serde(default = "default_take_profit")]
     pub take_profit_pct: f64,
 
+    /// Stop loss percentage (positive value; e.g. `2.0` = exit when
+    /// unrealized loss reaches 2% of notional). Defaults to `2.0` so
+    /// existing optimizer payloads that lack this field keep the same
+    /// conservative behaviour as the original hardcoded threshold.
+    #[serde(default = "default_stop_loss")]
+    pub stop_loss_pct: f64,
+
     /// Cooldown between trades in seconds
     #[serde(default = "default_cooldown")]
     pub trade_cooldown_seconds: u64,
@@ -148,6 +155,9 @@ fn default_min_profit() -> f64 {
 fn default_take_profit() -> f64 {
     5.0
 }
+fn default_stop_loss() -> f64 {
+    2.0
+}
 fn default_cooldown() -> u64 {
     1800
 }
@@ -182,6 +192,7 @@ impl Default for OptimizedParams {
             min_ema_spread_pct: default_min_ema_spread(),
             min_profit_pct: default_min_profit(),
             take_profit_pct: default_take_profit(),
+            stop_loss_pct: default_stop_loss(),
             trade_cooldown_seconds: default_cooldown(),
             require_htf_alignment: default_require_htf(),
             htf_timeframe_minutes: default_htf_timeframe(),
@@ -226,6 +237,18 @@ impl OptimizedParams {
         if self.min_ema_spread_pct < 0.0 || self.min_ema_spread_pct > 10.0 {
             return Err(ParamError::InvalidConfig(
                 "Min EMA spread must be between 0 and 10%".into(),
+            ));
+        }
+
+        if self.stop_loss_pct <= 0.0 || self.stop_loss_pct > 100.0 {
+            return Err(ParamError::InvalidConfig(
+                "Stop loss must be a positive percentage (e.g. 2.0 = 2%)".into(),
+            ));
+        }
+
+        if self.take_profit_pct <= 0.0 || self.take_profit_pct > 100.0 {
+            return Err(ParamError::InvalidConfig(
+                "Take profit must be a positive percentage (e.g. 5.0 = 5%)".into(),
             ));
         }
 
