@@ -993,6 +993,7 @@ async fn position_event_handler(
     }
 
     let regime = state.current_regime().await;
+    let fear = state.current_threat().await;
     let asset = base_asset(&event.symbol);
     // Per-asset tuned thresholds + the optimizer's ATR multiplier (used to
     // size the volatility band below). Fall back to defaults when the asset
@@ -1009,7 +1010,7 @@ async fn position_event_handler(
     if let Some(atr_pct) = event.atr_pct {
         thresholds = thresholds.widen_for_volatility(atr_pct, atr_multiplier);
     }
-    let guidance = compute_guidance(&event, regime.as_deref(), thresholds);
+    let guidance = compute_guidance(&event, regime.as_deref(), thresholds, fear);
 
     info!(
         symbol = %event.symbol,
@@ -1021,6 +1022,7 @@ async fn position_event_handler(
         position_id = event.position_id.as_deref().unwrap_or(""),
         session_id = event.session_id.as_deref().unwrap_or(""),
         regime = regime.as_deref().unwrap_or(""),
+        fear = fear.unwrap_or(f64::NAN),
         guidance_action = ?guidance.action,
         take_profit_ratio = thresholds.take_profit_ratio,
         stop_loss_ratio = thresholds.stop_loss_ratio,
@@ -1560,6 +1562,50 @@ mod tests {
             "reason should mention regime, got: {}",
             value["guidance"]["reason"]
         );
+    }
+
+    #[tokio::test]
+    async fn position_event_high_fear_forces_exit() {
+        // Healthy +500 pnl, but a high amygdala threat forces an exit.
+        let state = test_state().await;
+        state.set_current_threat(0.9).await;
+        let router = test_router(state);
+        let body = serde_json::json!({
+            "symbol": "BTC-USD",
+            "side": "Buy",
+            "qty": 0.5,
+            "entry_price": 60000.0,
+            "current_price": 61000.0,
+            "pnl_unrealized": 500.0
+        });
+        let (status, value) = post_json(&router, "/api/v1/positions/event", body).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(value["guidance"]["action"], "exit");
+        assert!(
+            value["guidance"]["reason"].as_str().unwrap().contains("fear"),
+            "reason should mention fear, got: {}",
+            value["guidance"]["reason"]
+        );
+    }
+
+    #[tokio::test]
+    async fn position_event_elevated_fear_banks_a_winner() {
+        // +500 pnl is under the 5% take-profit, but elevated fear (0.6)
+        // banks it early via Reduce.
+        let state = test_state().await;
+        state.set_current_threat(0.6).await;
+        let router = test_router(state);
+        let body = serde_json::json!({
+            "symbol": "BTC-USD",
+            "side": "Buy",
+            "qty": 0.5,
+            "entry_price": 60000.0,
+            "current_price": 61000.0,
+            "pnl_unrealized": 500.0
+        });
+        let (status, value) = post_json(&router, "/api/v1/positions/event", body).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(value["guidance"]["action"], "reduce");
     }
 
     #[tokio::test]

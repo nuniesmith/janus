@@ -179,29 +179,86 @@ impl GuidanceThresholds {
             ..self
         }
     }
+
+    /// Tighten the stop toward break-even in proportion to elevated fear.
+    ///
+    /// The inverse of [`widen_for_volatility`]: under amygdala stress we
+    /// want a losing position on a shorter leash. `fear` is expected in
+    /// the elevated band `[FEAR_ELEVATED_LEVEL, FEAR_EXIT_LEVEL)`; the
+    /// stop magnitude scales linearly from full width (at the bottom of
+    /// the band) down to [`STOP_TIGHTEN_FLOOR`] of its width (at the top).
+    /// It never reaches zero, so a position isn't exited on the first
+    /// tick of an adverse move. Fear below the elevated band is a no-op.
+    pub fn tighten_stop_for_fear(self, fear: f64) -> Self {
+        if !fear.is_finite() || fear < FEAR_ELEVATED_LEVEL {
+            return self;
+        }
+        let span = FEAR_EXIT_LEVEL - FEAR_ELEVATED_LEVEL;
+        let t = ((fear - FEAR_ELEVATED_LEVEL) / span).clamp(0.0, 1.0);
+        let factor = 1.0 - t * (1.0 - STOP_TIGHTEN_FLOOR);
+        Self {
+            stop_loss_ratio: self.stop_loss_ratio * factor,
+            ..self
+        }
+    }
 }
+
+/// Fear level (inclusive) at or above which guidance exits outright,
+/// regardless of P&L — the amygdala equivalent of a crisis regime.
+pub const FEAR_EXIT_LEVEL: f64 = 0.8;
+
+/// Fear level (inclusive) at or above which guidance escalates: banks
+/// open profit (Reduce) or tightens the stop on a losing position.
+pub const FEAR_ELEVATED_LEVEL: f64 = 0.5;
+
+/// Floor for the stop-tightening factor at the top of the elevated band
+/// (just below [`FEAR_EXIT_LEVEL`]). `0.25` ⇒ the stop tightens to a
+/// quarter of its configured width but never to break-even.
+const STOP_TIGHTEN_FLOOR: f64 = 0.25;
 
 /// Compute advisory guidance for an open position.
 ///
 /// Rules in priority order:
 /// 1. Crisis-flavoured regime ⇒ [`Exit`](GuidanceAction::Exit).
-/// 2. Unrealized loss ≤ `thresholds.stop_loss_ratio` of notional ⇒
+/// 2. High amygdala fear (≥ [`FEAR_EXIT_LEVEL`]) ⇒ [`Exit`](GuidanceAction::Exit).
+/// 3. Elevated fear (≥ [`FEAR_ELEVATED_LEVEL`]): if in profit ⇒
+///    [`Reduce`](GuidanceAction::Reduce) (bank it early); if at a loss ⇒
+///    tighten the stop toward break-even before the P&L checks below.
+/// 4. Unrealized loss ≤ `thresholds.stop_loss_ratio` of notional ⇒
 ///    [`Exit`](GuidanceAction::Exit).
-/// 3. Unrealized gain ≥ `thresholds.take_profit_ratio` of notional ⇒
+/// 5. Unrealized gain ≥ `thresholds.take_profit_ratio` of notional ⇒
 ///    [`Reduce`](GuidanceAction::Reduce).
-/// 4. Otherwise ⇒ [`Hold`](GuidanceAction::Hold).
+/// 6. Otherwise ⇒ [`Hold`](GuidanceAction::Hold).
 ///
-/// `notional = entry_price * qty` (sign-agnostic; works for both Buy and
-/// Sell positions because `pnl_unrealized` is supplied with sign already).
+/// `fear` is the latest amygdala threat level (`0.0..=1.0`), or `None`
+/// when no producer has reported one. `notional = entry_price * qty`
+/// (sign-agnostic; works for both Buy and Sell positions because
+/// `pnl_unrealized` is supplied with sign already).
 pub fn compute_guidance(
     event: &PositionEvent,
     regime: Option<&str>,
     thresholds: GuidanceThresholds,
+    fear: Option<f64>,
 ) -> Guidance {
     if let Some(label) = regime
         && is_crisis_regime(label)
     {
         return Guidance::exit(format!("regime: {label}"));
+    }
+
+    // Amygdala fear escalation (graduated: bank winners, tighten losers).
+    let mut thresholds = thresholds;
+    if let Some(fear) = fear.filter(|f| f.is_finite()) {
+        if fear >= FEAR_EXIT_LEVEL {
+            return Guidance::exit(format!("fear {fear:.2} ≥ {FEAR_EXIT_LEVEL}"));
+        }
+        if fear >= FEAR_ELEVATED_LEVEL {
+            if event.pnl_unrealized > 0.0 {
+                return Guidance::reduce(format!("fear {fear:.2}: banking open profit"));
+            }
+            // At a loss or flat: shorten the leash before the P&L checks.
+            thresholds = thresholds.tighten_stop_for_fear(fear);
+        }
     }
 
     let notional = event.entry_price * event.qty;
@@ -334,7 +391,7 @@ mod tests {
         // 0.5 BTC at 60_000 = 30_000 notional. +100 pnl = 0.33% — below take-profit.
         let mut e = sample();
         e.pnl_unrealized = 100.0;
-        let g = compute_guidance(&e, None, default_thresholds());
+        let g = compute_guidance(&e, None, default_thresholds(), None);
         assert_eq!(g.action, GuidanceAction::Hold);
     }
 
@@ -343,7 +400,7 @@ mod tests {
         // Notional 30_000; -2% = -600. -700 trips the stop.
         let mut e = sample();
         e.pnl_unrealized = -700.0;
-        let g = compute_guidance(&e, None, default_thresholds());
+        let g = compute_guidance(&e, None, default_thresholds(), None);
         assert_eq!(g.action, GuidanceAction::Exit);
         assert!(g.reason.contains("stop loss"));
     }
@@ -353,7 +410,7 @@ mod tests {
         // Notional 30_000; +5% = +1500. +2000 trips the take-profit.
         let mut e = sample();
         e.pnl_unrealized = 2_000.0;
-        let g = compute_guidance(&e, None, default_thresholds());
+        let g = compute_guidance(&e, None, default_thresholds(), None);
         assert_eq!(g.action, GuidanceAction::Reduce);
         assert!(g.reason.contains("take profit"));
     }
@@ -363,7 +420,7 @@ mod tests {
         // Even with healthy pnl, a crisis regime triggers exit.
         let mut e = sample();
         e.pnl_unrealized = 100.0;
-        let g = compute_guidance(&e, Some("crisis_volatility_spike"), default_thresholds());
+        let g = compute_guidance(&e, Some("crisis_volatility_spike"), default_thresholds(), None);
         assert_eq!(g.action, GuidanceAction::Exit);
         assert!(g.reason.contains("regime"));
     }
@@ -373,7 +430,7 @@ mod tests {
         let e = sample();
         for label in ["PANIC", "Flash_Crash detected", "shockwave"] {
             assert_eq!(
-                compute_guidance(&e, Some(label), default_thresholds()).action,
+                compute_guidance(&e, Some(label), default_thresholds(), None).action,
                 GuidanceAction::Exit,
                 "label {label:?} should trigger exit"
             );
@@ -385,7 +442,7 @@ mod tests {
         let e = sample();
         // "bullish_trend" isn't a crisis label, so guidance is pnl-driven.
         assert_eq!(
-            compute_guidance(&e, Some("bullish_trend"), default_thresholds()).action,
+            compute_guidance(&e, Some("bullish_trend"), default_thresholds(), None).action,
             GuidanceAction::Hold
         );
     }
@@ -459,14 +516,14 @@ mod tests {
         let mut e = sample();
         e.pnl_unrealized = -800.0;
         assert_eq!(
-            compute_guidance(&e, None, GuidanceThresholds::default()).action,
+            compute_guidance(&e, None, GuidanceThresholds::default(), None).action,
             GuidanceAction::Exit
         );
         // But with ATR 2% × multiplier 2.0 = 4% band, the stop widens to -4%
         // and the same -2.67% move is now treated as noise → hold.
         let widened = GuidanceThresholds::default().widen_for_volatility(2.0, 2.0);
         assert_eq!(
-            compute_guidance(&e, None, widened).action,
+            compute_guidance(&e, None, widened, None).action,
             GuidanceAction::Hold
         );
     }
@@ -493,7 +550,7 @@ mod tests {
             ..GuidanceThresholds::default()
         };
         assert_eq!(
-            compute_guidance(&e, None, tighter).action,
+            compute_guidance(&e, None, tighter, None).action,
             GuidanceAction::Hold
         );
     }
@@ -509,7 +566,7 @@ mod tests {
             ..GuidanceThresholds::default()
         };
         assert_eq!(
-            compute_guidance(&e, None, tighter).action,
+            compute_guidance(&e, None, tighter, None).action,
             GuidanceAction::Hold,
             "-0.67% loss should hold under a 1% stop threshold"
         );
@@ -517,10 +574,89 @@ mod tests {
         let mut e2 = sample();
         e2.pnl_unrealized = -350.0;
         assert_eq!(
-            compute_guidance(&e2, None, tighter).action,
+            compute_guidance(&e2, None, tighter, None).action,
             GuidanceAction::Exit,
             "-1.17% loss should exit under a 1% stop threshold"
         );
+    }
+
+    // ── Amygdala fear escalation ─────────────────────────────────────
+
+    #[test]
+    fn guidance_high_fear_exits_regardless_of_pnl() {
+        // Healthy +100 pnl, but fear ≥ 0.8 forces an exit.
+        let mut e = sample();
+        e.pnl_unrealized = 100.0;
+        let g = compute_guidance(&e, None, default_thresholds(), Some(0.85));
+        assert_eq!(g.action, GuidanceAction::Exit);
+        assert!(g.reason.contains("fear"), "reason was: {}", g.reason);
+    }
+
+    #[test]
+    fn guidance_elevated_fear_banks_open_profit() {
+        // In profit but below the take-profit threshold; elevated fear
+        // (0.6) banks it early via Reduce rather than waiting.
+        let mut e = sample();
+        e.pnl_unrealized = 100.0; // 0.33% of notional — under the 5% TP
+        let g = compute_guidance(&e, None, default_thresholds(), Some(0.6));
+        assert_eq!(g.action, GuidanceAction::Reduce);
+        assert!(g.reason.contains("banking"), "reason was: {}", g.reason);
+    }
+
+    #[test]
+    fn guidance_elevated_fear_tightens_stop_on_a_loser() {
+        // -300 pnl ≈ -1% of notional — inside the default -2% stop, so a
+        // calm market holds. At fear 0.8-ε the stop tightens to ~25% of
+        // its width (≈ -0.5%), so the same -1% loss now exits.
+        let mut e = sample();
+        e.pnl_unrealized = -300.0;
+        assert_eq!(
+            compute_guidance(&e, None, default_thresholds(), None).action,
+            GuidanceAction::Hold,
+            "-1% loss holds with no fear"
+        );
+        let g = compute_guidance(&e, None, default_thresholds(), Some(0.79));
+        assert_eq!(
+            g.action,
+            GuidanceAction::Exit,
+            "tightened stop under high-elevated fear should exit a -1% loser"
+        );
+    }
+
+    #[test]
+    fn guidance_low_fear_is_inert() {
+        // Fear below the elevated band changes nothing.
+        let mut e = sample();
+        e.pnl_unrealized = 100.0;
+        assert_eq!(
+            compute_guidance(&e, None, default_thresholds(), Some(0.3)).action,
+            GuidanceAction::Hold
+        );
+    }
+
+    #[test]
+    fn guidance_crisis_regime_outranks_fear_reduce() {
+        // A crisis regime exits even when fear would only Reduce a winner.
+        let mut e = sample();
+        e.pnl_unrealized = 100.0;
+        let g = compute_guidance(&e, Some("crisis"), default_thresholds(), Some(0.6));
+        assert_eq!(g.action, GuidanceAction::Exit);
+        assert!(g.reason.contains("regime"), "reason was: {}", g.reason);
+    }
+
+    #[test]
+    fn tighten_stop_for_fear_scales_within_band() {
+        let base = GuidanceThresholds::default(); // stop -0.02
+        // Bottom of band: no change.
+        assert!(
+            (base.tighten_stop_for_fear(FEAR_ELEVATED_LEVEL).stop_loss_ratio - (-0.02)).abs()
+                < 1e-9
+        );
+        // Top of band (→ exit level): tightened to STOP_TIGHTEN_FLOOR (0.25) of width.
+        let top = base.tighten_stop_for_fear(FEAR_EXIT_LEVEL - 1e-9).stop_loss_ratio;
+        assert!((top - (-0.005)).abs() < 1e-4, "got {top}");
+        // Below band: inert.
+        assert_eq!(base.tighten_stop_for_fear(0.2), base);
     }
 
     // ── base_asset ───────────────────────────────────────────────────

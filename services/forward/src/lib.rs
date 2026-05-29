@@ -1370,6 +1370,20 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                         state_clone.set_current_regime(regime.clone()).await;
                     }
 
+                    // JFLOW-C: opportunistic amygdala threat capture. A
+                    // producer that has run the fear network can publish a
+                    // "fear" entry (0.0..=1.0) in the signal metadata; the
+                    // position-guidance handler reads it to escalate under
+                    // stress. Non-numeric values are ignored.
+                    if let Some(fear) = signal
+                        .metadata
+                        .get("fear")
+                        .and_then(|v| v.parse::<f64>().ok())
+                        .filter(|f| f.is_finite())
+                    {
+                        state_clone.set_current_threat(fear).await;
+                    }
+
                     info!(
                         "Forward module received signal: {} {} {} (confidence: {:.2}, source: {}, data: {})",
                         signal.symbol,
