@@ -123,6 +123,12 @@ pub struct JanusState {
     /// carries `regime` instead of `None`. Defaults to `None` until a
     /// producer calls [`set_current_regime`].
     current_regime: RwLock<Option<String>>,
+
+    /// Latest amygdala threat / fear level in `0.0..=1.0` (higher = more
+    /// fear). Updated by the brain pipeline; consumed by position
+    /// guidance to escalate under stress. `None` until a producer calls
+    /// [`set_current_threat`].
+    current_threat: RwLock<Option<f64>>,
 }
 
 impl JanusState {
@@ -151,6 +157,7 @@ impl JanusState {
             service_state_rx,
             log_level_controller: RwLock::new(None),
             current_regime: RwLock::new(None),
+            current_threat: RwLock::new(None),
         })
     }
 
@@ -171,6 +178,25 @@ impl JanusState {
     pub async fn set_current_regime(&self, regime: impl Into<String>) {
         let mut guard = self.current_regime.write().await;
         *guard = Some(regime.into());
+    }
+
+    /// Get the most recently published amygdala threat / fear level.
+    ///
+    /// A scalar in `0.0..=1.0` (higher = more fear), or `None` if no
+    /// producer has reported one yet. Consumed by position guidance to
+    /// escalate under stress. Kept as a plain `f64` so `janus-core` stays
+    /// free of any dependency on the neuromorphic crate that produces it.
+    pub async fn current_threat(&self) -> Option<f64> {
+        *self.current_threat.read().await
+    }
+
+    /// Publish the latest amygdala threat / fear level.
+    ///
+    /// Intended to be called by the brain pipeline as new amygdala
+    /// assessments land. Snapshot semantics, like [`set_current_regime`].
+    pub async fn set_current_threat(&self, fear: f64) {
+        let mut guard = self.current_threat.write().await;
+        *guard = Some(fear);
     }
 
     // ── Log level control ─────────────────────────────────────────────
