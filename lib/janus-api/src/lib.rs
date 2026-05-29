@@ -18,8 +18,8 @@ use axum::{
     routing::{get, post},
 };
 use janus_core::{
-    GuidanceThresholds, JanusState, ParamManager, PositionEvent, ServiceState, Signal, base_asset,
-    compute_guidance,
+    DEFAULT_ATR_MULTIPLIER, GuidanceThresholds, JanusState, ParamManager, PositionEvent,
+    ServiceState, Signal, base_asset, compute_guidance,
 };
 use position_store::PositionEventStore;
 use serde::{Deserialize, Serialize};
@@ -994,10 +994,21 @@ async fn position_event_handler(
 
     let regime = state.current_regime().await;
     let asset = base_asset(&event.symbol);
-    let thresholds = match params.get(asset).await {
-        Some(p) => GuidanceThresholds::from_optimized_params(&p),
-        None => GuidanceThresholds::default(),
+    // Per-asset tuned thresholds + the optimizer's ATR multiplier (used to
+    // size the volatility band below). Fall back to defaults when the asset
+    // has no optimized params yet.
+    let (mut thresholds, atr_multiplier) = match params.get(asset).await {
+        Some(p) => (
+            GuidanceThresholds::from_optimized_params(&p),
+            p.atr_multiplier,
+        ),
+        None => (GuidanceThresholds::default(), DEFAULT_ATR_MULTIPLIER),
     };
+    // If the producer attached a volatility hint, widen the stop so normal
+    // ATR-sized noise doesn't trip an exit. Absent hint → thresholds unchanged.
+    if let Some(atr_pct) = event.atr_pct {
+        thresholds = thresholds.widen_for_volatility(atr_pct, atr_multiplier);
+    }
     let guidance = compute_guidance(&event, regime.as_deref(), thresholds);
 
     info!(
@@ -1012,6 +1023,8 @@ async fn position_event_handler(
         regime = regime.as_deref().unwrap_or(""),
         guidance_action = ?guidance.action,
         take_profit_ratio = thresholds.take_profit_ratio,
+        stop_loss_ratio = thresholds.stop_loss_ratio,
+        atr_pct = event.atr_pct.unwrap_or(f64::NAN),
         persisted = store.is_enabled(),
         "position event received"
     );
@@ -1570,5 +1583,45 @@ mod tests {
             value["guidance"]["action"], "hold",
             "tuned 10% take-profit should suppress the default 5% reduce trigger"
         );
+    }
+
+    #[tokio::test]
+    async fn position_event_volatility_hint_widens_stop() {
+        // -800 pnl on 30_000 notional ≈ -2.67%, which trips the default -2%
+        // stop. With atr_pct=2.0 and the default 2.0 multiplier, the band is
+        // 4%, so the stop widens past the move → hold instead of exit.
+        let router = test_router(test_state().await);
+        let body = serde_json::json!({
+            "symbol": "BTC-USD",
+            "side": "Buy",
+            "qty": 0.5,
+            "entry_price": 60000.0,
+            "current_price": 58400.0,
+            "pnl_unrealized": -800.0,
+            "atr_pct": 2.0
+        });
+        let (status, value) = post_json(&router, "/api/v1/positions/event", body).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(
+            value["guidance"]["action"], "hold",
+            "volatility band should widen the stop past a -2.67% move"
+        );
+    }
+
+    #[tokio::test]
+    async fn position_event_rejects_invalid_atr_pct() {
+        let router = test_router(test_state().await);
+        let body = serde_json::json!({
+            "symbol": "BTC-USD",
+            "side": "Buy",
+            "qty": 0.5,
+            "entry_price": 60000.0,
+            "current_price": 61000.0,
+            "pnl_unrealized": 500.0,
+            "atr_pct": -1.0
+        });
+        let (status, value) = post_json(&router, "/api/v1/positions/event", body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(value["accepted"], false);
     }
 }

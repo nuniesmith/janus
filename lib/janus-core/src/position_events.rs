@@ -34,6 +34,12 @@ pub struct PositionEvent {
     /// Optional JanusAI session id (groups positions under one run).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// Optional volatility hint: recent ATR expressed as a percentage of
+    /// `current_price` (e.g. `1.5` = ATR is 1.5% of price). When present,
+    /// guidance widens the stop-loss to sit outside normal ATR-sized
+    /// noise. Producers that don't track ATR simply omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub atr_pct: Option<f64>,
 }
 
 impl PositionEvent {
@@ -53,6 +59,11 @@ impl PositionEvent {
         }
         if !self.pnl_unrealized.is_finite() {
             return Err("pnl_unrealized must be finite");
+        }
+        if let Some(atr) = self.atr_pct
+            && (!atr.is_finite() || atr < 0.0)
+        {
+            return Err("atr_pct must be a non-negative finite percentage");
         }
         Ok(())
     }
@@ -139,6 +150,35 @@ impl GuidanceThresholds {
             take_profit_ratio: params.take_profit_pct / 100.0,
         }
     }
+
+    /// Loosen the stop-loss so it sits outside normal ATR-sized noise.
+    ///
+    /// `atr_pct` is recent ATR as a percentage of price (the volatility
+    /// hint carried on [`PositionEvent`]); `atr_multiplier` is how many
+    /// ATRs the optimizer places its trailing stop (reused here so the
+    /// band matches the strategy's own notion of "normal" movement). If
+    /// the ATR band (`atr_multiplier * atr_pct`) is wider than the
+    /// configured stop, the stop is widened to match — otherwise the
+    /// configured stop is already conservative and is kept.
+    ///
+    /// Take-profit is intentionally left untouched: it's a target, not
+    /// noise protection. Non-positive inputs are a no-op, so callers can
+    /// pass values straight through without pre-checking.
+    pub fn widen_for_volatility(self, atr_pct: f64, atr_multiplier: f64) -> Self {
+        // Guard non-positive / non-finite inputs (NaN fails `is_finite`),
+        // so callers can pass producer-supplied values straight through.
+        if !atr_pct.is_finite() || atr_pct <= 0.0 || atr_multiplier <= 0.0 {
+            return self;
+        }
+        // ATR band as a positive ratio of notional, then signed negative
+        // to match `stop_loss_ratio`'s convention.
+        let atr_floor = -(atr_multiplier * atr_pct / 100.0);
+        Self {
+            // Both negative; the more-negative (wider) stop wins.
+            stop_loss_ratio: self.stop_loss_ratio.min(atr_floor),
+            ..self
+        }
+    }
 }
 
 /// Compute advisory guidance for an open position.
@@ -212,6 +252,7 @@ mod tests {
             pnl_unrealized: 500.0,
             position_id: Some("pos-1".to_string()),
             session_id: Some("sess-1".to_string()),
+            atr_pct: None,
         }
     }
 
@@ -360,9 +401,11 @@ mod tests {
 
     #[test]
     fn thresholds_from_optimized_params_overrides_both_ratios() {
-        let mut params = OptimizedParams::default();
-        params.take_profit_pct = 8.0;
-        params.stop_loss_pct = 3.0; // optimizer tuned to tighter stop
+        let params = OptimizedParams {
+            take_profit_pct: 8.0,
+            stop_loss_pct: 3.0, // optimizer tuned to tighter stop
+            ..OptimizedParams::new("BTC")
+        };
         let t = GuidanceThresholds::from_optimized_params(&params);
         assert!((t.take_profit_ratio - 0.08).abs() < 1e-9);
         // stop_loss_pct is positive; ratio must be negative.
@@ -377,6 +420,66 @@ mod tests {
         let t = GuidanceThresholds::from_optimized_params(&params);
         assert_eq!(t.stop_loss_ratio, GuidanceThresholds::default().stop_loss_ratio);
         assert_eq!(t.take_profit_ratio, GuidanceThresholds::default().take_profit_ratio);
+    }
+
+    // ── widen_for_volatility ─────────────────────────────────────────
+
+    #[test]
+    fn widen_for_volatility_loosens_stop_when_atr_band_is_wider() {
+        // Default stop -2%. ATR 1.5% × multiplier 2.0 = 3% band → wider,
+        // so the stop should loosen to -3%. Take-profit untouched.
+        let t = GuidanceThresholds::default().widen_for_volatility(1.5, 2.0);
+        assert!((t.stop_loss_ratio - (-0.03)).abs() < 1e-9);
+        assert_eq!(t.take_profit_ratio, GuidanceThresholds::default().take_profit_ratio);
+    }
+
+    #[test]
+    fn widen_for_volatility_keeps_stop_when_already_wider() {
+        // Configured stop -5%. ATR band 0.5% × 2.0 = 1% → narrower, so the
+        // already-conservative configured stop is kept.
+        let base = GuidanceThresholds {
+            stop_loss_ratio: -0.05,
+            ..GuidanceThresholds::default()
+        };
+        let t = base.widen_for_volatility(0.5, 2.0);
+        assert!((t.stop_loss_ratio - (-0.05)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn widen_for_volatility_is_noop_for_nonpositive_inputs() {
+        let base = GuidanceThresholds::default();
+        assert_eq!(base.widen_for_volatility(0.0, 2.0), base);
+        assert_eq!(base.widen_for_volatility(1.5, 0.0), base);
+        assert_eq!(base.widen_for_volatility(-1.0, 2.0), base);
+    }
+
+    #[test]
+    fn guidance_volatility_widened_stop_avoids_noise_exit() {
+        // Notional 30_000. -800 pnl ≈ -2.67% → trips the default -2% stop.
+        let mut e = sample();
+        e.pnl_unrealized = -800.0;
+        assert_eq!(
+            compute_guidance(&e, None, GuidanceThresholds::default()).action,
+            GuidanceAction::Exit
+        );
+        // But with ATR 2% × multiplier 2.0 = 4% band, the stop widens to -4%
+        // and the same -2.67% move is now treated as noise → hold.
+        let widened = GuidanceThresholds::default().widen_for_volatility(2.0, 2.0);
+        assert_eq!(
+            compute_guidance(&e, None, widened).action,
+            GuidanceAction::Hold
+        );
+    }
+
+    #[test]
+    fn validate_rejects_negative_atr_pct() {
+        let mut e = sample();
+        e.atr_pct = Some(-0.5);
+        assert!(e.validate().is_err());
+        e.atr_pct = Some(f64::NAN);
+        assert!(e.validate().is_err());
+        e.atr_pct = Some(0.0); // zero is allowed (flat / unknown)
+        assert!(e.validate().is_ok());
     }
 
     #[test]

@@ -140,8 +140,13 @@ fn default_ema_slow() -> u32 {
 fn default_atr_length() -> u32 {
     14
 }
+/// Default ATR multiplier (number of ATRs to the trailing stop). Exposed
+/// so volatility-aware guidance can size its noise band with the same
+/// baseline an un-optimized asset would use.
+pub const DEFAULT_ATR_MULTIPLIER: f64 = 2.0;
+
 fn default_atr_multiplier() -> f64 {
-    2.0
+    DEFAULT_ATR_MULTIPLIER
 }
 fn default_min_trailing_stop() -> f64 {
     0.5

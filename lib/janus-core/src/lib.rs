@@ -31,7 +31,9 @@ pub use market::{
     Exchange, FundingRateEvent, KlineEvent, LiquidationEvent, MarketDataBus, MarketDataEvent,
     MarketType, OrderBookEvent, PriceLevel, Side, Symbol, TickerEvent, TradeEvent,
 };
-pub use optimized_params::{OptimizedParams, ParamManager, ParamNotification};
+pub use optimized_params::{
+    DEFAULT_ATR_MULTIPLIER, OptimizedParams, ParamManager, ParamNotification,
+};
 pub use position_events::{
     Guidance, GuidanceAction, GuidanceThresholds, PositionEvent, base_asset, compute_guidance,
 };
