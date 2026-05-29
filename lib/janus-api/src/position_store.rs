@@ -179,6 +179,7 @@ mod tests {
             pnl_unrealized: 100.0,
             position_id: None,
             session_id: None,
+            atr_pct: None,
         }
     }
 
