@@ -32,10 +32,6 @@ use crate::thalamus::sources::weather::{
 /// OpenWeatherMap API base URL
 const OWM_BASE_URL: &str = "https://api.openweathermap.org/data/2.5";
 
-/// OpenWeatherMap One Call API base URL (for comprehensive data)
-#[allow(dead_code)]
-const OWM_ONECALL_URL: &str = "https://api.openweathermap.org/data/3.0/onecall";
-
 /// Units for temperature and other measurements
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Units {

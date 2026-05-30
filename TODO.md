@@ -11,12 +11,12 @@
 
 ## P0 — Codebase Health
 
-- [ ] **303 `#[allow(dead_code)]` annotations** (down from 318) — audit results (2026-05-25):
+- [ ] **302 `#[allow(dead_code)]` annotations** (down from 318) — audit results (2026-05-25, 2026-05-29):
   - `services/api/src/grpc.rs` + `services/forward/src/api/grpc.rs` — deleted in #4 (confirmed dead scaffolding).
   - `services/optimizer/src/collector.rs` — consolidated 10 → 6 in #10. Remaining: `datetime`, `DataGap`, `get_date_range`, `detect_gaps`, `vacuum`, and the whole `impl CollectionMetadata` block — all genuinely unused but useful API surface.
   - `services/optimizer/src/scheduler.rs` (7) — empirical sweep confirmed every annotation is needed (`with_failure_config`, `get_state`, `get_stats`, `stop`, `is_running`, `interval`, `interval_str` accessors on `OptimizationScheduler` are real but unused).
   - `services/data/src/api/auth.rs` (7), `services/api/src/rate_limit.rs` (7), `services/data/src/lib.rs` (6) — also empirically confirmed; each annotation guards a genuinely unused item (mostly disabled-mode constructors and serde-only struct fields).
-  - `neuromorphic/thalamus/sources/clients/openweathermap.rs` (13) — new hotspot; not yet audited.
+  - `neuromorphic/thalamus/sources/clients/openweathermap.rs` (13 → 12, audited 2026-05-29): removed the genuinely-dead `OWM_ONECALL_URL` const (One Call 3.0 placeholder, zero references — client uses the 2.5 `OWM_BASE_URL`). Remaining 12 are serde wire-shape DTOs (`OwmCurrentWeatherResponse`/`OwmForecastResponse` are deserialized; the rest are their nested fields) — the lint fires only on individually-unread fields, so `#[allow(dead_code)]` is the right tool. Kept.
   - `services/execution/tests/integration/scenarios.rs` (7) — test scaffolding, low priority.
 - [ ] **Tonic version split** — workspace declares `0.14.2` but some crates resolve `0.10.2` transitively (via `apalis`). Track and resolve when `apalis` hits 1.0 stable.
 - [ ] Evaluate `shared_memory` IPC in containers — `/dev/shm` size limits may break Forward→Backward zero-copy Arrow IPC (removed crate, but protocol design question remains).
