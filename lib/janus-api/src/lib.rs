@@ -19,7 +19,7 @@ use axum::{
 };
 use janus_core::{
     DEFAULT_ATR_MULTIPLIER, GuidanceThresholds, JanusState, ParamManager, PositionEvent,
-    ServiceState, Signal, base_asset, compute_guidance,
+    PositionTracker, ServiceState, Signal, base_asset, compute_guidance,
 };
 use position_store::PositionEventStore;
 use serde::{Deserialize, Serialize};
@@ -71,8 +71,12 @@ pub async fn start_module(state: Arc<JanusState>) -> janus_core::Result<()> {
     }
     let param_updates_task = param_updates::spawn(state.clone(), param_manager.clone());
 
+    // Per-position guidance state: trailing give-back + sticky exits across
+    // the repeated snapshots a producer pushes for one position_id.
+    let position_tracker = Arc::new(PositionTracker::new());
+
     // Build the main HTTP router
-    let app = create_router(state.clone(), position_store, param_manager);
+    let app = create_router(state.clone(), position_store, param_manager, position_tracker);
 
     // Build the metrics router
     let metrics_app = create_metrics_router();
@@ -123,6 +127,7 @@ fn create_router(
     state: Arc<JanusState>,
     position_store: Arc<PositionEventStore>,
     param_manager: Arc<ParamManager>,
+    position_tracker: Arc<PositionTracker>,
 ) -> Router {
     // NOTE: Permissive CORS is acceptable for internal/paper-trading use.
     // For production, restrict origins via state.config.cors_origins.
@@ -168,6 +173,7 @@ fn create_router(
         .route("/api/v1/positions/event", post(position_event_handler))
         .layer(Extension(position_store))
         .layer(Extension(param_manager))
+        .layer(Extension(position_tracker))
         .layer(cors)
         .with_state(state)
 }
@@ -973,13 +979,14 @@ async fn log_level_set_handler(
 /// regime, P&L, and thresholds → return it in the 202 response. Guidance
 /// is advisory; the producer decides whether to act on it.
 #[tracing::instrument(
-    skip(event, store, state, params),
+    skip(event, store, state, params, tracker),
     fields(symbol = %event.symbol, side = ?event.side, qty = event.qty)
 )]
 async fn position_event_handler(
     State(state): State<Arc<JanusState>>,
     Extension(store): Extension<Arc<PositionEventStore>>,
     Extension(params): Extension<Arc<ParamManager>>,
+    Extension(tracker): Extension<Arc<PositionTracker>>,
     Json(event): Json<PositionEvent>,
 ) -> impl IntoResponse {
     if let Err(reason) = event.validate() {
@@ -1010,7 +1017,11 @@ async fn position_event_handler(
     if let Some(atr_pct) = event.atr_pct {
         thresholds = thresholds.widen_for_volatility(atr_pct, atr_multiplier);
     }
-    let guidance = compute_guidance(&event, regime.as_deref(), thresholds, fear);
+    // Stateless score, then refine with this position's history (trailing
+    // give-back, sticky exit). Untracked positions (no position_id) pass
+    // through unchanged.
+    let base = compute_guidance(&event, regime.as_deref(), thresholds, fear);
+    let guidance = tracker.observe(&event, base).await;
 
     info!(
         symbol = %event.symbol,
@@ -1095,6 +1106,7 @@ mod tests {
             state,
             Arc::new(PositionEventStore::disabled()),
             Arc::new(ParamManager::new("test")),
+            Arc::new(PositionTracker::new()),
         )
     }
 
@@ -1113,6 +1125,7 @@ mod tests {
             state,
             Arc::new(PositionEventStore::disabled()),
             Arc::new(manager),
+            Arc::new(PositionTracker::new()),
         )
     }
 
@@ -1669,5 +1682,43 @@ mod tests {
         let (status, value) = post_json(&router, "/api/v1/positions/event", body).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(value["accepted"], false);
+    }
+
+    #[tokio::test]
+    async fn position_event_trailing_reduces_a_fading_winner() {
+        // Two snapshots for the same position_id hit the same router, so they
+        // share one PositionTracker (Extension is Arc-shared across oneshot
+        // calls). The position peaks at +10% (a take-profit Reduce), then
+        // fades to +2% — a level the stateless rule would Hold, but the
+        // trailing give-back rule banks the fading winner.
+        let router = test_router(test_state().await);
+        let peak = serde_json::json!({
+            "symbol": "BTC-USD", "side": "Buy", "qty": 0.5,
+            "entry_price": 60000.0, "current_price": 66000.0,
+            "pnl_unrealized": 3000.0, "position_id": "pos-trail"
+        });
+        let (s1, v1) = post_json(&router, "/api/v1/positions/event", peak).await;
+        assert_eq!(s1, StatusCode::ACCEPTED);
+        assert_eq!(v1["guidance"]["action"], "reduce"); // +10% take-profit
+
+        let giveback = serde_json::json!({
+            "symbol": "BTC-USD", "side": "Buy", "qty": 0.5,
+            "entry_price": 60000.0, "current_price": 61200.0,
+            "pnl_unrealized": 600.0, "position_id": "pos-trail"
+        });
+        let (s2, v2) = post_json(&router, "/api/v1/positions/event", giveback).await;
+        assert_eq!(s2, StatusCode::ACCEPTED);
+        assert_eq!(
+            v2["guidance"]["action"], "reduce",
+            "trailing give-back should bank a fading winner the stateless rule would hold"
+        );
+        assert!(
+            v2["guidance"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("trailing"),
+            "reason was: {}",
+            v2["guidance"]["reason"]
+        );
     }
 }
