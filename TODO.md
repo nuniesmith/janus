@@ -41,6 +41,13 @@
   - `services/execution/tests/integration/scenarios.rs` (7) — test scaffolding, low priority.
   - **Next:** the 107 neuromorphic annotations have never been swept — that's the biggest untouched cluster.
 - [ ] **Panic-safety sweep.** Thousands of `.unwrap()` calls outside tests (a rough grep counts ~8K). A signal engine should not panic on a malformed payload or a dropped connection. Triage the hot paths first (signal generation, position-event handler, Redis/Postgres IO, exchange clients) and convert to `Result` + `tracing`. Track as a rolling effort, not one PR.
+- [ ] **Triage `cargo audit` advisories, then make the gate blocking.** First run (2026-05-31) found **10 vulnerabilities + 11 warnings**. The gate is non-blocking until these are cleared. Notable:
+  - `rustls-webpki 0.103.10` (×3: RUSTSEC-2026-0098/0099/0104 — name-constraint bypass + CRL-parse panic) — **has a fix, bump it.**
+  - `rsa 0.9.10` (RUSTSEC-2023-0071 Marvin timing sidechannel) — no upstream fix yet; transitive via a TLS/DB driver. Assess RSA-signing exposure.
+  - `astral-tokio-tar 0.5.6` (×4: PAX/symlink extraction) — only relevant if untrusted tars are extracted; confirm it's build/ML-only, not a request path.
+  - `pyo3 0.21.2`, `fast-float 0.2.0` — buffer/segfault in specific APIs; transitive, ML-adjacent.
+  - Warnings: unmaintained (`paste`, `bincode`, `rustls-pemfile`, `atomic-polyfill`, `core2`-yanked) + unsound (`rand` ×3 custom-logger edge, `rkyv`). Consider a `deny.toml` to triage/allowlist deliberately.
+  - Context: Janus generates signals and **never executes orders / isn't a public web service**, so exploitability of most of these is low — but the webpki bump and `rsa` assessment are worth doing.
 - [x] **Reconciled `services/data/docs/TODO_IMPLEMENTATION_PLAN.md` (2026-05-31).** Added a "SUPERSEDED" banner mapping its stale "NOT IMPLEMENTED" P0/P1 items to the code that actually implements them (backfill lock/throttle, circuit breaker, Prometheus export, dedup, Docker secrets, rate limiter, QuestDB writer), and pointing at this file as the single source of truth. Kept non-destructively — ~9 sibling docs in that dir cross-link it, and the code templates remain useful for the genuinely-open items.
 - [ ] **Tonic version split.** Workspace declares `0.14.2` but some crates resolve `0.10.2` transitively via `apalis`. Track and resolve when `apalis` hits 1.0 stable.
 - [ ] **STRUCT-C: proto consolidation.** Fold the stray `services/forward/proto/janus/v1/janus.proto` into `proto/fks/janus/v1/signal_service.proto` once `GrpcServer` ownership is decided (`services/forward/build.rs:14-19`). Also resolves the dual `ForwardService` (`fks.janus.v1` 4 RPCs vs `fks.forward.v1` 7 RPCs).
