@@ -1061,10 +1061,11 @@ async fn position_event_handler(
 /// the closed-trade record the JanusAI service later compacts into
 /// `janus_memories` so guidance quality can be evaluated and tuned.
 #[tracing::instrument(
-    skip(close, store, tracker),
+    skip(close, store, tracker, state),
     fields(symbol = %close.symbol, side = ?close.side, qty = close.qty)
 )]
 async fn position_close_handler(
+    State(state): State<Arc<JanusState>>,
     Extension(store): Extension<Arc<PositionEventStore>>,
     Extension(tracker): Extension<Arc<PositionTracker>>,
     Json(close): Json<PositionClose>,
@@ -1081,11 +1082,30 @@ async fn position_close_handler(
 
     // Pull (and drop) this position's accumulated guidance history so the
     // outcome can be joined with it. Untracked positions → None.
-    let state = match &close.position_id {
+    let position_state = match &close.position_id {
         Some(id) => tracker.finalize(id).await,
         None => None,
     };
-    let outcome = PositionOutcome::from_close(&close, state.as_ref());
+    let outcome = PositionOutcome::from_close(&close, position_state.as_ref());
+
+    // Feed the realized outcome back into affinity learning, if a recorder is
+    // installed (forward service) and the producer named the strategy. The
+    // affinity tracker is keyed by (strategy, asset), so a close without a
+    // strategy is persisted but can't be recorded.
+    let recorded = match outcome.strategy.as_deref() {
+        Some(strategy) => {
+            state
+                .record_affinity_outcome(
+                    strategy,
+                    base_asset(&outcome.symbol),
+                    outcome.pnl_realized,
+                    outcome.is_winner(),
+                    outcome.rr_ratio,
+                )
+                .await
+        }
+        None => false,
+    };
 
     info!(
         symbol = %outcome.symbol,
@@ -1093,12 +1113,14 @@ async fn position_close_handler(
         pnl_realized = outcome.pnl_realized,
         realized_ratio = outcome.realized_ratio,
         result = outcome.result.as_str(),
+        strategy = outcome.strategy.as_deref().unwrap_or(""),
         peak_pnl_ratio = outcome.peak_pnl_ratio.unwrap_or(f64::NAN),
         samples = outcome.samples,
         last_guidance = outcome.last_guidance.map(|g| g.as_str()).unwrap_or(""),
         time_in_position_secs = outcome.time_in_position_secs.unwrap_or(f64::NAN),
         position_id = outcome.position_id.as_deref().unwrap_or(""),
         persisted = store.is_outcomes_enabled(),
+        affinity_recorded = recorded,
         "position close received"
     );
     store.record_outcome(&outcome).await;
@@ -1845,5 +1867,83 @@ mod tests {
         assert_eq!(o["result"], "win"); // +500 realized
         let peak = o["peak_pnl_ratio"].as_f64().expect("peak recorded");
         assert!((peak - 0.10).abs() < 1e-6, "peak was {peak}");
+    }
+
+    /// One captured `record_trade` call: (strategy, asset, pnl, is_winner, rr_ratio).
+    type RecordedCall = (String, String, f64, bool, Option<f64>);
+
+    /// Captures affinity calls so we can assert the close handler feeds them.
+    struct CapturingRecorder {
+        calls: Arc<std::sync::Mutex<Vec<RecordedCall>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl janus_core::AffinityRecorder for CapturingRecorder {
+        async fn record_trade(
+            &self,
+            strategy: &str,
+            asset: &str,
+            pnl: f64,
+            is_winner: bool,
+            rr_ratio: Option<f64>,
+        ) {
+            self.calls.lock().unwrap().push((
+                strategy.to_string(),
+                asset.to_string(),
+                pnl,
+                is_winner,
+                rr_ratio,
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn position_close_with_strategy_feeds_affinity() {
+        let state = test_state().await;
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        state
+            .set_affinity_recorder(Box::new(CapturingRecorder {
+                calls: calls.clone(),
+            }))
+            .await;
+        let router = test_router(state);
+
+        let close = serde_json::json!({
+            "symbol": "BTC-USD", "side": "Buy", "qty": 0.5,
+            "entry_price": 60000.0, "exit_price": 61000.0,
+            "pnl_realized": 500.0, "strategy": "ema_cross", "rr_ratio": 2.5
+        });
+        let (status, value) = post_json(&router, "/api/v1/positions/close", close).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(value["outcome"]["strategy"], "ema_cross");
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "affinity recorder should be called once");
+        // base_asset("BTC-USD") == "BTC"; +500 realized = win; rr passed through.
+        assert_eq!(
+            calls[0],
+            ("ema_cross".to_string(), "BTC".to_string(), 500.0, true, Some(2.5))
+        );
+    }
+
+    #[tokio::test]
+    async fn position_close_without_strategy_skips_affinity() {
+        let state = test_state().await;
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        state
+            .set_affinity_recorder(Box::new(CapturingRecorder {
+                calls: calls.clone(),
+            }))
+            .await;
+        let router = test_router(state);
+
+        // No "strategy" field → affinity recording is skipped, close still ok.
+        let close = serde_json::json!({
+            "symbol": "BTC-USD", "side": "Buy", "qty": 0.5,
+            "entry_price": 60000.0, "exit_price": 61000.0, "pnl_realized": 500.0
+        });
+        let (status, _) = post_json(&router, "/api/v1/positions/close", close).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert!(calls.lock().unwrap().is_empty(), "no strategy ⇒ no affinity call");
     }
 }

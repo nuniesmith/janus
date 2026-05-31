@@ -35,6 +35,43 @@ pub trait LogLevelController: Send + Sync {
     fn current_filter(&self) -> Option<String>;
 }
 
+// ---------------------------------------------------------------------------
+// AffinityRecorder — trait-object interface for feeding closed-trade outcomes
+// back into the strategy-affinity tracker.
+// ---------------------------------------------------------------------------
+
+/// A type-erased interface for recording a realized trade outcome into the
+/// strategy-affinity tracker.
+///
+/// Stored in [`JanusState`] so the API module's position-close handler can
+/// feed outcomes back into affinity learning in real time **without**
+/// `janus-core` (or `janus-api`) depending on `janus-strategies` — the
+/// concrete tracker lives in the forward service's `TradingPipeline`, which
+/// installs an adapter via [`set_affinity_recorder`](JanusState::set_affinity_recorder).
+/// Mirrors the [`LogLevelController`] pattern.
+///
+/// # Thread Safety
+///
+/// Implementations must be `Send + Sync` because `JanusState` is shared
+/// across Tokio tasks. The method is `async` + `&self` so the adapter can
+/// acquire the concrete tracker's own (async) lock internally.
+#[async_trait::async_trait]
+pub trait AffinityRecorder: Send + Sync {
+    /// Record a closed trade for `(strategy, asset)`.
+    ///
+    /// - `pnl`: realized P&L in quote currency (signed).
+    /// - `is_winner`: whether the trade closed in profit.
+    /// - `rr_ratio`: realized risk-reward ratio, when known.
+    async fn record_trade(
+        &self,
+        strategy: &str,
+        asset: &str,
+        pnl: f64,
+        is_winner: bool,
+        rr_ratio: Option<f64>,
+    );
+}
+
 /// Service lifecycle state — controls whether processing modules are active.
 ///
 /// On startup JANUS enters `Standby`: the API is live but Forward, Backward,
@@ -129,6 +166,15 @@ pub struct JanusState {
     /// guidance to escalate under stress. `None` until a producer calls
     /// [`set_current_threat`].
     current_threat: RwLock<Option<f64>>,
+
+    /// Optional strategy-affinity recorder.
+    ///
+    /// Installed by the forward service via [`set_affinity_recorder`] so the
+    /// API's position-close handler can feed realized outcomes into affinity
+    /// learning in real time. `None` until installed (e.g. API-only
+    /// deployments), in which case outcomes are persisted but not recorded
+    /// live. See [`AffinityRecorder`].
+    affinity_recorder: RwLock<Option<Box<dyn AffinityRecorder>>>,
 }
 
 impl JanusState {
@@ -158,6 +204,7 @@ impl JanusState {
             log_level_controller: RwLock::new(None),
             current_regime: RwLock::new(None),
             current_threat: RwLock::new(None),
+            affinity_recorder: RwLock::new(None),
         })
     }
 
@@ -197,6 +244,46 @@ impl JanusState {
     pub async fn set_current_threat(&self, fear: f64) {
         let mut guard = self.current_threat.write().await;
         *guard = Some(fear);
+    }
+
+    // ── Affinity recording ────────────────────────────────────────────
+
+    /// Install a strategy-affinity recorder.
+    ///
+    /// Called once by the forward service after its `TradingPipeline` is
+    /// constructed, so the API's position-close handler can feed realized
+    /// outcomes into affinity learning. Replaces any previously installed
+    /// recorder.
+    pub async fn set_affinity_recorder(&self, recorder: Box<dyn AffinityRecorder>) {
+        let mut guard = self.affinity_recorder.write().await;
+        *guard = Some(recorder);
+    }
+
+    /// Whether an affinity recorder is installed (for diagnostics / logging).
+    pub async fn has_affinity_recorder(&self) -> bool {
+        self.affinity_recorder.read().await.is_some()
+    }
+
+    /// Record a closed trade into the affinity tracker, if a recorder is
+    /// installed. No-op otherwise. Returns whether the outcome was recorded.
+    pub async fn record_affinity_outcome(
+        &self,
+        strategy: &str,
+        asset: &str,
+        pnl: f64,
+        is_winner: bool,
+        rr_ratio: Option<f64>,
+    ) -> bool {
+        let guard = self.affinity_recorder.read().await;
+        match guard.as_ref() {
+            Some(recorder) => {
+                recorder
+                    .record_trade(strategy, asset, pnl, is_winner, rr_ratio)
+                    .await;
+                true
+            }
+            None => false,
+        }
     }
 
     // ── Log level control ─────────────────────────────────────────────
@@ -611,5 +698,68 @@ mod tests {
 
         assert_eq!(state.signals_generated(), 2);
         assert_eq!(state.signals_persisted(), 1);
+    }
+
+    /// One captured `record_trade` call: (strategy, asset, pnl, is_winner, rr_ratio).
+    type RecordedCall = (String, String, f64, bool, Option<f64>);
+
+    /// Records each call so we can assert the recorder is reached.
+    struct CountingRecorder {
+        calls: std::sync::Arc<std::sync::Mutex<Vec<RecordedCall>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl AffinityRecorder for CountingRecorder {
+        async fn record_trade(
+            &self,
+            strategy: &str,
+            asset: &str,
+            pnl: f64,
+            is_winner: bool,
+            rr_ratio: Option<f64>,
+        ) {
+            self.calls.lock().unwrap().push((
+                strategy.to_string(),
+                asset.to_string(),
+                pnl,
+                is_winner,
+                rr_ratio,
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn record_affinity_outcome_no_op_without_recorder() {
+        let state = JanusState::new(Config::default()).await.unwrap();
+        assert!(!state.has_affinity_recorder().await);
+        // No recorder installed → returns false, doesn't panic.
+        let recorded = state
+            .record_affinity_outcome("ema_cross", "BTC", 100.0, true, Some(2.0))
+            .await;
+        assert!(!recorded);
+    }
+
+    #[tokio::test]
+    async fn record_affinity_outcome_reaches_installed_recorder() {
+        let state = JanusState::new(Config::default()).await.unwrap();
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        state
+            .set_affinity_recorder(Box::new(CountingRecorder {
+                calls: calls.clone(),
+            }))
+            .await;
+        assert!(state.has_affinity_recorder().await);
+
+        let recorded = state
+            .record_affinity_outcome("ema_cross", "BTC", -25.0, false, None)
+            .await;
+        assert!(recorded);
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0],
+            ("ema_cross".to_string(), "BTC".to_string(), -25.0, false, None)
+        );
     }
 }

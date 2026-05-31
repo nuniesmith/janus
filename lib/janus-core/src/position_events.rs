@@ -99,6 +99,15 @@ pub struct PositionClose {
     pub exit_price: f64,
     /// Realized P&L in quote currency (signed).
     pub pnl_realized: f64,
+    /// Optional realized risk-reward ratio for this trade, when the producer
+    /// tracks it. Fed straight into affinity learning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rr_ratio: Option<f64>,
+    /// Optional strategy name that opened this position. Required for the
+    /// outcome to be fed back into the per-`(strategy, asset)` affinity
+    /// tracker; omitted closes are still persisted, just not recorded live.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strategy: Option<String>,
     /// Client position id, used to correlate with the open snapshots so the
     /// outcome can be joined with this position's guidance history.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -188,6 +197,13 @@ pub struct PositionOutcome {
     pub realized_ratio: f64,
     /// Win / loss / breakeven from the sign of `realized_ratio`.
     pub result: OutcomeResult,
+    /// Realized risk-reward ratio, when the producer reported one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rr_ratio: Option<f64>,
+    /// Strategy that opened the position, when reported. Affinity recording
+    /// is skipped when this is absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strategy: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub position_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -219,6 +235,8 @@ impl PositionOutcome {
             pnl_realized: close.pnl_realized,
             realized_ratio,
             result: OutcomeResult::from_ratio(realized_ratio),
+            rr_ratio: close.rr_ratio,
+            strategy: close.strategy.clone(),
             position_id: close.position_id.clone(),
             session_id: close.session_id.clone(),
             peak_pnl_ratio: state.map(|s| s.peak_pnl_ratio),
@@ -226,6 +244,12 @@ impl PositionOutcome {
             last_guidance: state.map(|s| s.last_action),
             time_in_position_secs: state.map(|s| s.time_in_position().as_secs_f64()),
         }
+    }
+
+    /// Whether this trade closed in profit (a `Win`). `Breakeven` and `Loss`
+    /// both count as not-a-winner for affinity purposes.
+    pub fn is_winner(&self) -> bool {
+        self.result == OutcomeResult::Win
     }
 }
 
@@ -1125,6 +1149,8 @@ mod tests {
             entry_price: 60_000.0,
             exit_price: 60_500.0,
             pnl_realized,
+            rr_ratio: None,
+            strategy: None,
             position_id: position_id.map(String::from),
             session_id: None,
         }
@@ -1188,6 +1214,20 @@ mod tests {
         assert_eq!(o.last_guidance, Some(GuidanceAction::Reduce));
         assert!(o.time_in_position_secs.is_some());
         assert_eq!(o.result, OutcomeResult::Win); // +300 / 30_000 = +1%
+    }
+
+    #[test]
+    fn outcome_carries_strategy_and_rr_for_affinity() {
+        let mut close = close_ev(Some("p"), 900.0);
+        close.strategy = Some("ema_cross".to_string());
+        close.rr_ratio = Some(2.5);
+        let o = PositionOutcome::from_close(&close, None);
+        assert_eq!(o.strategy.as_deref(), Some("ema_cross"));
+        assert_eq!(o.rr_ratio, Some(2.5));
+        assert!(o.is_winner(), "+900 realized is a win");
+        // Breakeven and losses are not winners.
+        assert!(!PositionOutcome::from_close(&close_ev(None, 0.0), None).is_winner());
+        assert!(!PositionOutcome::from_close(&close_ev(None, -50.0), None).is_winner());
     }
 
     #[tokio::test]

@@ -40,6 +40,8 @@
 //!   pnl_realized           DOUBLE PRECISION NOT NULL
 //!   realized_ratio         DOUBLE PRECISION NOT NULL
 //!   result                 TEXT             NOT NULL    -- 'win'/'loss'/'breakeven'
+//!   rr_ratio               DOUBLE PRECISION NULL
+//!   strategy               TEXT             NULL
 //!   peak_pnl_ratio         DOUBLE PRECISION NULL
 //!   samples                BIGINT           NOT NULL
 //!   last_guidance          TEXT             NULL        -- 'hold'/'reduce'/'exit'
@@ -222,8 +224,9 @@ impl PositionEventStore {
         let result = sqlx::query(
             "INSERT INTO janus_position_outcomes
              (symbol, side, qty, entry_price, exit_price, pnl_realized, realized_ratio, result,
-              peak_pnl_ratio, samples, last_guidance, time_in_position_secs, position_id, session_id)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+              rr_ratio, strategy, peak_pnl_ratio, samples, last_guidance, time_in_position_secs,
+              position_id, session_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
         )
         .bind(&outcome.symbol)
         .bind(side_str)
@@ -233,6 +236,8 @@ impl PositionEventStore {
         .bind(outcome.pnl_realized)
         .bind(outcome.realized_ratio)
         .bind(outcome.result.as_str())
+        .bind(outcome.rr_ratio)
+        .bind(outcome.strategy.as_deref())
         .bind(outcome.peak_pnl_ratio)
         .bind(outcome.samples as i64)
         .bind(outcome.last_guidance.map(|g| g.as_str()))

@@ -36,6 +36,7 @@
 //! └─────────────────────────────────────────────────────────────┘
 //! ```
 
+pub mod affinity_recorder;
 pub mod api;
 pub mod brain_runtime;
 pub mod brain_wiring;
@@ -622,6 +623,17 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                 info!("✅ Brain Runtime booted: {}", report.summary());
 
                 if let Some(pipeline) = runtime.pipeline() {
+                    // --- Wire real-time affinity feedback (JFLOW-C) ---
+                    // Install an adapter so the API's position-close handler
+                    // can record realized outcomes into this pipeline's
+                    // affinity tracker without depending on janus-strategies.
+                    state
+                        .set_affinity_recorder(Box::new(
+                            affinity_recorder::PipelineAffinityRecorder::new(Arc::clone(pipeline)),
+                        ))
+                        .await;
+                    info!("🧠✅ Affinity recorder installed (live close→affinity feedback)");
+
                     // --- Wire brain-gated execution into SignalGenerator ---
                     if let Some(ref exec_cfg) = forward_config.execution_config {
                         match ExecutionClient::new(exec_cfg.clone()).await {
