@@ -7,6 +7,13 @@ name: Security audit
 #   - weekly, so a freshly-published advisory against an unchanged tree is
 #     still caught
 #   - manually via the Actions tab
+#
+# Informational (non-enforcing) for now: the step reports advisories in the
+# job summary but exits 0, so the check stays green while the advisory
+# backlog is triaged (see TODO.md "Triage cargo audit advisories"). A red,
+# by-design-failing check would just train everyone to ignore CI. Flip to a
+# hard gate by removing the `|| true` / `exit 0` below and marking this check
+# required in branch protection.
 on:
   push:
     branches: [main]
@@ -29,24 +36,35 @@ concurrency:
 
 permissions:
   contents: read
-  # Lets the action surface advisories as PR checks / annotations.
-  checks: write
-  issues: write
 
 jobs:
   cargo-audit:
     name: cargo audit
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    # Non-blocking for now: the action reports advisories as annotations but
-    # a finding won't red-line main while the existing dependency backlog
-    # (e.g. the tonic 0.10/0.14 split via apalis — see TODO.md) is triaged.
-    # Flip to a hard gate by removing this once the tree is clean.
-    continue-on-error: true
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
-      - name: Run cargo-audit
-        uses: rustsec/audit-check@v2
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          tool: cargo-audit
+
+      - name: Run cargo audit (advisory report, non-blocking)
+        shell: bash
+        run: |
+          {
+            echo "## cargo audit"
+            echo ""
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          # Capture findings without failing the job (informational gate).
+          set +e
+          cargo audit 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+          code=${PIPESTATUS[0]}
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          if [ "$code" -ne 0 ]; then
+            echo "::warning::cargo audit reported advisories — see the job summary and TODO.md (non-blocking)"
+          fi
+          # Always succeed; this gate is informational until the backlog is cleared.
+          exit 0
