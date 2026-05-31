@@ -73,9 +73,9 @@ dedupe.
 Natural follow-ups now that the guidance engine exists. These make it *learn*
 and *close the loop* instead of being a stateless suggestion.
 
-- [ ] **Guidance outcome feedback.** Record whether the producer acted on a `reduce`/`exit` hint and what happened (→ affinity tracker / `janus_memories`). Without this, guidance can't be evaluated or tuned.
-- [ ] **Per-position state.** Snapshots arrive repeatedly for the same `position_id`; today each is scored independently. Track time-in-position, peak P&L, and prior guidance so we can do trailing stops / "already told you to exit" escalation.
-- [ ] **Learnable fear/volatility constants.** `FEAR_EXIT_LEVEL` (0.8), `FEAR_ELEVATED_LEVEL` (0.5), `STOP_TIGHTEN_FLOOR` (0.25) are hardcoded. Consider moving them into `OptimizedParams` so the optimizer can tune them per-asset, the way stop/take-profit already are.
+- [x] **Per-position state (2026-05-31).** `PositionTracker` in `lib/janus-core/src/position_events.rs` accumulates per-`position_id` history (peak P&L ratio, sample count, `first_seen`/`last_seen`, last action) with TTL + max-entries eviction. Wired into `janus-api` as an `Extension`. Adds two history-dependent rules `compute_guidance` (still pure/stateless) can't do: **trailing give-back** (bank a fading winner that's surrendered ≥ `giveback_frac` of an armed peak) and **sticky exit** (don't rescind an `Exit` on a one-tick bounce). Id-less events pass through unchanged.
+- [ ] **Guidance outcome feedback.** Foundation exists (`PositionState` already records peak / samples / last action). Still missing: a *close* signal — the `PositionEvent` wire type only carries open snapshots, so we can't yet record "producer acted → realized P&L." Add a close/flat event (or infer from eviction) and feed outcomes into the affinity tracker / `janus_memories` so guidance can be evaluated and tuned.
+- [ ] **Learnable trailing + fear/volatility constants.** `TrailingConfig` (`arm_ratio` 0.03, `giveback_frac` 0.5) and `FEAR_EXIT_LEVEL` (0.8) / `FEAR_ELEVATED_LEVEL` (0.5) / `STOP_TIGHTEN_FLOOR` (0.25) are hardcoded. Consider moving them into `OptimizedParams` so the optimizer can tune them per-asset, the way stop/take-profit already are.
 - [ ] **Optimizer schema bump.** `OptimizedParams` carries `stop_loss_pct` (serde default 2.0) and `take_profit_pct`, but the Python optimizer doesn't emit them yet — until it does, defaults apply. Coordinate the search-space + payload change (fks repo).
 
 ---

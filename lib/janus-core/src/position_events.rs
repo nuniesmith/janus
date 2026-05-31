@@ -9,6 +9,9 @@
 use crate::market::Side;
 use crate::optimized_params::OptimizedParams;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+use tokio::sync::RwLock;
 
 /// A snapshot of an open position pushed by the execution side.
 ///
@@ -66,6 +69,16 @@ impl PositionEvent {
             return Err("atr_pct must be a non-negative finite percentage");
         }
         Ok(())
+    }
+
+    /// Unrealized P&L as a ratio of entry notional (`entry_price * qty`).
+    ///
+    /// Returns `None` when notional is non-positive. Sign-agnostic — the
+    /// sign of `pnl_unrealized` already encodes direction for Buy/Sell, so
+    /// `+0.05` is a 5% gain whether long or short.
+    pub fn pnl_ratio(&self) -> Option<f64> {
+        let notional = self.entry_price * self.qty;
+        (notional > 0.0).then(|| self.pnl_unrealized / notional)
     }
 }
 
@@ -261,9 +274,7 @@ pub fn compute_guidance(
         }
     }
 
-    let notional = event.entry_price * event.qty;
-    if notional > 0.0 {
-        let ratio = event.pnl_unrealized / notional;
+    if let Some(ratio) = event.pnl_ratio() {
         if ratio <= thresholds.stop_loss_ratio {
             let pct = ratio * 100.0;
             return Guidance::exit(format!("stop loss: {pct:.2}% of notional"));
@@ -293,6 +304,176 @@ fn is_crisis_regime(label: &str) -> bool {
     ["crisis", "panic", "flash_crash", "shock"]
         .iter()
         .any(|needle| lower.contains(needle))
+}
+
+/// Rolling per-position state, accumulated across the repeated snapshots a
+/// producer pushes for the same `position_id`. Lets guidance depend on a
+/// position's *history* (peak profit, prior advice) rather than scoring each
+/// snapshot in isolation.
+#[derive(Debug, Clone)]
+pub struct PositionState {
+    /// Instant the first snapshot for this position arrived.
+    pub first_seen: Instant,
+    /// Instant the most recent snapshot arrived (drives TTL eviction).
+    pub last_seen: Instant,
+    /// Number of snapshots observed for this position.
+    pub samples: u64,
+    /// Highest unrealized-P&L ratio (`pnl / notional`) seen so far.
+    pub peak_pnl_ratio: f64,
+    /// Most recent guidance action issued for this position.
+    pub last_action: GuidanceAction,
+}
+
+impl PositionState {
+    /// How long this position has been reported.
+    pub fn time_in_position(&self) -> Duration {
+        self.last_seen.duration_since(self.first_seen)
+    }
+}
+
+/// Tunables for the stateful guidance layer in [`PositionTracker`].
+#[derive(Debug, Clone, Copy)]
+pub struct TrailingConfig {
+    /// Peak gain (ratio of notional) a position must reach before the
+    /// trailing give-back rule arms. Peaks below this are too small to act on.
+    pub arm_ratio: f64,
+    /// Fraction of the peak gain that, once surrendered, triggers a `Reduce`
+    /// to lock in what's left. `0.5` ⇒ "gave back half the peak".
+    pub giveback_frac: f64,
+    /// Evict positions not seen within this window (presumed closed/stale).
+    pub ttl: Duration,
+    /// Hard cap on tracked positions, so a misbehaving producer can't grow
+    /// the map without bound.
+    pub max_entries: usize,
+}
+
+impl Default for TrailingConfig {
+    fn default() -> Self {
+        Self {
+            arm_ratio: 0.03,
+            giveback_frac: 0.5,
+            ttl: Duration::from_secs(3600),
+            max_entries: 10_000,
+        }
+    }
+}
+
+/// Stateful refinement layer on top of [`compute_guidance`].
+///
+/// [`compute_guidance`] is pure and scores a single snapshot. The tracker
+/// remembers each position (keyed by `position_id`) and adds two rules that
+/// require history:
+///
+/// 1. **Trailing give-back** — once a position has been a meaningful winner
+///    (peak ≥ [`TrailingConfig::arm_ratio`]) and then surrenders enough of
+///    that peak ([`TrailingConfig::giveback_frac`]), upgrade a `Hold` to
+///    `Reduce` to bank the remaining profit. The stateless rule can't see the
+///    prior peak, so it would just `Hold`.
+/// 2. **Sticky exit** — once we've advised `Exit`, a later snapshot that
+///    merely drifts back inside the bands keeps `Exit` rather than flip-
+///    flopping to `Hold` on a one-tick bounce.
+///
+/// Snapshots without a `position_id` are not tracked; their guidance passes
+/// through unchanged (fully backward compatible).
+pub struct PositionTracker {
+    states: RwLock<HashMap<String, PositionState>>,
+    config: TrailingConfig,
+}
+
+impl Default for PositionTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PositionTracker {
+    /// New tracker with default [`TrailingConfig`].
+    pub fn new() -> Self {
+        Self::with_config(TrailingConfig::default())
+    }
+
+    /// New tracker with explicit config.
+    pub fn with_config(config: TrailingConfig) -> Self {
+        Self {
+            states: RwLock::new(HashMap::new()),
+            config,
+        }
+    }
+
+    /// Number of positions currently tracked (after pruning). For metrics/tests.
+    pub async fn tracked(&self) -> usize {
+        self.states.read().await.len()
+    }
+
+    /// Refine stateless `base` guidance using this position's history, record
+    /// the updated state, and return the (possibly upgraded) guidance.
+    ///
+    /// Positions without a `position_id` are returned unchanged and not
+    /// tracked. The critical section is pure (no `.await` while the lock is
+    /// held), so this stays cheap under load.
+    pub async fn observe(&self, event: &PositionEvent, base: Guidance) -> Guidance {
+        let Some(key) = event.position_id.clone() else {
+            return base;
+        };
+        let ratio = event.pnl_ratio().unwrap_or(0.0);
+        let now = Instant::now();
+
+        let mut states = self.states.write().await;
+
+        // Best-effort TTL prune, then a hard cap (evict the least-recently
+        // seen) so the map can't grow without bound on a long-lived process.
+        states.retain(|_, s| now.duration_since(s.last_seen) <= self.config.ttl);
+        if !states.contains_key(&key)
+            && states.len() >= self.config.max_entries
+            && let Some(oldest) = states
+                .iter()
+                .min_by_key(|(_, s)| s.last_seen)
+                .map(|(k, _)| k.clone())
+        {
+            states.remove(&oldest);
+        }
+
+        let entry = states.entry(key).or_insert_with(|| PositionState {
+            first_seen: now,
+            last_seen: now,
+            samples: 0,
+            peak_pnl_ratio: ratio,
+            last_action: GuidanceAction::Hold,
+        });
+        let prior_action = entry.last_action;
+        entry.last_seen = now;
+        entry.samples += 1;
+        entry.peak_pnl_ratio = entry.peak_pnl_ratio.max(ratio);
+        let peak = entry.peak_pnl_ratio;
+
+        let mut action = base.action;
+        let mut reason = base.reason;
+
+        // (1) Trailing give-back: only ever *upgrades* a Hold while still in
+        // profit. A loss is the stop-loss's job, and we never downgrade a
+        // Reduce/Exit.
+        if action == GuidanceAction::Hold
+            && ratio > 0.0
+            && peak >= self.config.arm_ratio
+            && ratio <= peak * (1.0 - self.config.giveback_frac)
+        {
+            action = GuidanceAction::Reduce;
+            reason = format!(
+                "trailing: gave back to {:.2}% from {:.2}% peak",
+                ratio * 100.0,
+                peak * 100.0
+            );
+        }
+
+        // (2) Sticky exit: don't rescind a prior Exit on a small bounce.
+        if prior_action == GuidanceAction::Exit && action != GuidanceAction::Exit {
+            action = GuidanceAction::Exit;
+            reason = "prior exit still standing".to_string();
+        }
+
+        entry.last_action = action;
+        Guidance { action, reason }
+    }
 }
 
 #[cfg(test)]
@@ -667,5 +848,104 @@ mod tests {
         assert_eq!(base_asset("ETH/USDT"), "ETH");
         assert_eq!(base_asset("SOL"), "SOL");
         assert_eq!(base_asset(""), "");
+    }
+
+    // ── PositionTracker (stateful guidance) ──────────────────────────
+
+    /// Event with a fixed 30_000 notional (entry 60_000 × qty 0.5), so
+    /// `pnl_ratio() == pnl / 30_000`.
+    fn ev(position_id: Option<&str>, pnl: f64) -> PositionEvent {
+        PositionEvent {
+            symbol: "BTC-USD".to_string(),
+            side: Side::Buy,
+            qty: 0.5,
+            entry_price: 60_000.0,
+            current_price: 60_000.0,
+            pnl_unrealized: pnl,
+            position_id: position_id.map(String::from),
+            session_id: None,
+            atr_pct: None,
+        }
+    }
+
+    #[test]
+    fn pnl_ratio_uses_entry_notional() {
+        assert!((ev(None, 1500.0).pnl_ratio().unwrap() - 0.05).abs() < 1e-9);
+        // Non-positive notional → None (guards a divide-by-zero downstream).
+        let mut e = ev(None, 100.0);
+        e.entry_price = 0.0;
+        assert!(e.pnl_ratio().is_none());
+    }
+
+    #[tokio::test]
+    async fn tracker_passes_through_untracked_when_no_position_id() {
+        let tracker = PositionTracker::new();
+        let g = tracker
+            .observe(&ev(None, 600.0), Guidance::hold("within bounds"))
+            .await;
+        assert_eq!(g.action, GuidanceAction::Hold);
+        assert_eq!(tracker.tracked().await, 0);
+    }
+
+    #[tokio::test]
+    async fn tracker_trailing_reduces_after_giveback() {
+        let tracker = PositionTracker::new();
+        // Peaks at +10% (a legit take-profit Reduce), establishing the peak.
+        let g1 = tracker
+            .observe(&ev(Some("p1"), 3000.0), Guidance::reduce("take profit"))
+            .await;
+        assert_eq!(g1.action, GuidanceAction::Reduce);
+        // Fades to +4%: the stateless rule would Hold, but half of the 10%
+        // peak is gone → trailing upgrades to Reduce.
+        let g2 = tracker
+            .observe(&ev(Some("p1"), 1200.0), Guidance::hold("within bounds"))
+            .await;
+        assert_eq!(g2.action, GuidanceAction::Reduce);
+        assert!(g2.reason.contains("trailing"), "reason was: {}", g2.reason);
+    }
+
+    #[tokio::test]
+    async fn tracker_trailing_inert_when_peak_below_arm() {
+        let tracker = PositionTracker::new();
+        // Peak only +2% — below the 3% arm threshold, so give-back is ignored.
+        tracker
+            .observe(&ev(Some("p2"), 600.0), Guidance::hold("within bounds"))
+            .await;
+        let g = tracker
+            .observe(&ev(Some("p2"), 150.0), Guidance::hold("within bounds"))
+            .await;
+        assert_eq!(g.action, GuidanceAction::Hold);
+    }
+
+    #[tokio::test]
+    async fn tracker_sticky_exit_survives_a_bounce() {
+        let tracker = PositionTracker::new();
+        // First snapshot exits (e.g. crisis regime); small pnl so trailing
+        // never arms and can't be the cause of a later non-Hold.
+        let g1 = tracker
+            .observe(&ev(Some("p3"), 100.0), Guidance::exit("regime: crisis"))
+            .await;
+        assert_eq!(g1.action, GuidanceAction::Exit);
+        // Price drifts back inside the bands → stateless Hold, but the prior
+        // Exit still stands.
+        let g2 = tracker
+            .observe(&ev(Some("p3"), 100.0), Guidance::hold("within bounds"))
+            .await;
+        assert_eq!(g2.action, GuidanceAction::Exit);
+        assert!(g2.reason.contains("prior exit"), "reason was: {}", g2.reason);
+    }
+
+    #[tokio::test]
+    async fn tracker_caps_tracked_positions() {
+        let tracker = PositionTracker::with_config(TrailingConfig {
+            max_entries: 2,
+            ..TrailingConfig::default()
+        });
+        for id in ["a", "b", "c"] {
+            tracker
+                .observe(&ev(Some(id), 600.0), Guidance::hold("within bounds"))
+                .await;
+        }
+        assert_eq!(tracker.tracked().await, 2, "oldest entry should be evicted");
     }
 }

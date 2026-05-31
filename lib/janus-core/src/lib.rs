@@ -35,7 +35,8 @@ pub use optimized_params::{
     DEFAULT_ATR_MULTIPLIER, OptimizedParams, ParamManager, ParamNotification,
 };
 pub use position_events::{
-    Guidance, GuidanceAction, GuidanceThresholds, PositionEvent, base_asset, compute_guidance,
+    Guidance, GuidanceAction, GuidanceThresholds, PositionEvent, PositionState, PositionTracker,
+    TrailingConfig, base_asset, compute_guidance,
 };
 pub use session_metrics::{SessionMetrics, SessionMetricsClient};
 pub use signal::{Signal, SignalBus, SignalType};
