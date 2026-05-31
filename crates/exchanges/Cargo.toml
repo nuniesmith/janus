@@ -7,7 +7,7 @@ license.workspace = true
 
 [dependencies]
 # Janus internal
-janus-core = { path = "../../lib/janus-core" }
+janus-core = { path = "../../lib/janus-core", package = "jflow-core" }
 janus-cns = { path = "../cns", optional = true }
 
 # Async runtime

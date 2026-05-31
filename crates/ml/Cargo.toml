@@ -56,7 +56,7 @@ anyhow = "1.0"
 tracing = "0.1"
 
 # JANUS dependencies
-janus-core = { path = "../../lib/janus-core" }
+janus-core = { path = "../../lib/janus-core", package = "jflow-core" }
 janus-data-quality = { path = "../data-quality" }
 
 [dev-dependencies]

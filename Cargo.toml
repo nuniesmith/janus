@@ -90,7 +90,7 @@ fks-proto = { path = "crates/fks-proto" }
 # ===========================================================================
 # JANUS Local Dependencies
 # ===========================================================================
-janus-core = { path = "lib/janus-core" }
+janus-core = { path = "lib/janus-core", package = "jflow-core" }
 janus-api = { path = "lib/janus-api" }
 janus-dsp = { path = "crates/dsp" }
 janus-exchanges = { path = "crates/exchanges" }
