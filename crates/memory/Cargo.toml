@@ -2,6 +2,8 @@
 name = "jflow-memory"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+description = "Short-to-long-term memory (Qdrant vector store + prioritized experience replay) for the JANUS trading engine."
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -10,7 +12,7 @@ repository.workspace = true
 name = "memory"
 
 [dependencies]
-common = { path = "../common", package = "jflow-common" }
+common = { path = "../common", package = "jflow-common", version = "0.1.0" }
 qdrant-client = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

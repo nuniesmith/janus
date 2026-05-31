@@ -2,6 +2,8 @@
 name = "jflow-common"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+description = "Canonical data-model types ensuring bitwise compatibility between JANUS services."
 authors.workspace = true
 license.workspace = true
 repository.workspace = true

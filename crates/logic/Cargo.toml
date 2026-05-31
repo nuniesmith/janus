@@ -2,6 +2,7 @@
 name = "jflow-logic"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -18,7 +19,7 @@ metal = ["candle-core/metal", "candle-nn/metal"]
 
 [dependencies]
 # Internal crates
-common = { path = "../common", package = "jflow-common" }
+common = { path = "../common", package = "jflow-common", version = "0.1.0" }
 
 # ML Framework (Candle from HuggingFace) - for differentiable LTN
 candle-core = { workspace = true }

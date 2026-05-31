@@ -2,6 +2,9 @@
 name = "jflow-exchanges"
 version.workspace = true
 edition.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Unified cryptocurrency exchange adapters for market-data ingestion in the JANUS trading engine."
 authors.workspace = true
 license.workspace = true
 
@@ -10,8 +13,8 @@ name = "janus_exchanges"
 
 [dependencies]
 # Janus internal
-janus-core = { path = "../../lib/janus-core", package = "jflow-core" }
-janus-cns = { path = "../cns", optional = true, package = "jflow-cns" }
+janus-core = { path = "../../lib/janus-core", package = "jflow-core", version = "0.1.0" }
+janus-cns = { path = "../cns", optional = true, package = "jflow-cns", version = "0.1.0" }
 
 # Async runtime
 tokio = { workspace = true, features = ["full"] }

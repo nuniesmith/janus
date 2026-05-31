@@ -2,9 +2,11 @@
 name = "jflow-ml"
 version = "2.0.0"
 edition = "2024"
-authors = ["nuniesmith"]
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
 description = "Machine learning models and inference for JANUS trading system"
-license = "MIT"
 
 [lib]
 name = "janus_ml"
@@ -59,8 +61,8 @@ anyhow = "1.0"
 tracing = "0.1"
 
 # JANUS dependencies
-janus-core = { path = "../../lib/janus-core", package = "jflow-core" }
-janus-data-quality = { path = "../data-quality", package = "jflow-data-quality" }
+janus-core = { path = "../../lib/janus-core", package = "jflow-core", version = "0.1.0" }
+janus-data-quality = { path = "../data-quality", package = "jflow-data-quality", version = "0.1.0" }
 
 [dev-dependencies]
 criterion = "0.5"

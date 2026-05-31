@@ -2,6 +2,8 @@
 name = "jflow-data-quality"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+description = "Data-quality validation and anomaly detection for JANUS market-data sources."
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -12,8 +14,8 @@ name = "janus_data_quality"
 [dependencies]
 # Workspace dependencies
 janus-core = { workspace = true }
-janus-gap-detection = { path = "../gap-detection", package = "jflow-gap-detection" }
-janus-cns = { path = "../cns", optional = true, package = "jflow-cns" }
+janus-gap-detection = { path = "../gap-detection", package = "jflow-gap-detection", version = "0.1.0" }
+janus-cns = { path = "../cns", optional = true, package = "jflow-cns", version = "0.1.0" }
 
 # Async runtime
 tokio = { workspace = true, features = ["full"] }

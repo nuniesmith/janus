@@ -186,9 +186,20 @@ release helper only; crates.io publishing is the manual, per-crate process above
 | `jflow-core` — full metadata + README, published to crates.io | ✅ live (v0.1.0) |
 | Tier-0 leaves (15) — `description` + inherited `license`/`repository`/`authors`/`rust-version` | ✅ done — all dry-run clean |
 | `version` pins on root `[workspace.dependencies]` aliases (for publishing) | ✅ done |
-| Per-crate metadata for Tier-1+ libs (`backtest`, `strategies`, `optimizer`, `data`, …) | ❌ TODO |
-| `version` on the ~87 **direct** path-dep sites (per crate, at publish time) | ❌ TODO |
-| Publish the rest, bottom-up | ❌ TODO |
+| Tier-1+ libs (13) — metadata + `version` on their direct path deps | ✅ done |
+| `version` on direct path deps of **publishable** libs | ✅ done (remaining missing-version sites are all `publish=false` services/bins) |
+| Publish the rest, bottom-up | ❌ TODO (your token) |
+
+**All publishable libraries are now prepped.** Tier-1+ manifests are correct
+(`cargo check --workspace` passes); they can only be `cargo publish`-ed *after*
+their dependencies are live, so a `--dry-run` of e.g. `jflow-strategies` fails
+with "no matching package named `jflow-indicators`" until Tier-0 is published —
+that's the bottom-up constraint, not a manifest problem.
+
+> ⚠️ **`jflow-neuromorphic` is blocked**: it depends on `fks-proto`, which is
+> vendored and `publish = false`. To publish it you must first publish
+> `fks-proto` (e.g. rename to `jflow-proto` + add metadata) or drop the
+> dependency. Left unpublished for now.
 
 **Tier-0 leaves are ready to publish now** (15 crates):
 `jflow-api`* , `jflow-indicators`, `jflow-dsp`, `jflow-health`, `jflow-risk`,
@@ -199,14 +210,22 @@ already-published `jflow-core`.) Each `cargo publish --dry-run -p <crate>`
 packages with no metadata warnings.
 
 ```bash
-# publish the leaves (any order; jflow-api after jflow-core, which is already live)
+# Tier 0 — leaves + jflow-common (any order; jflow-api after the live jflow-core)
 for c in jflow-indicators jflow-dsp jflow-health jflow-risk jflow-models \
          jflow-regime jflow-rate-limiter jflow-gap-detection jflow-compliance \
          jflow-ltn jflow-bybit-client jflow-questdb-writer jflow-cns \
-         jflow-registry-lib jflow-api; do
+         jflow-registry-lib jflow-common jflow-api; do
   cargo publish -p "$c" && sleep 20   # let the index update between crates
 done
+
+# Tier 1+ — only after their deps above are live, in this order:
+for c in jflow-memory jflow-logic jflow-vision jflow-lob jflow-exchanges \
+         jflow-data-quality jflow-strategies jflow-training jflow-ml \
+         jflow-backtest jflow-optimizer; do
+  cargo publish -p "$c" && sleep 20
+done
+# jflow-neuromorphic is blocked on fks-proto (see above) — handle separately.
 ```
 
-**Next:** prep Tier-1+ libs (add `description`/`license.workspace` where missing
-and `version` to their direct path deps), then publish up the tiers.
+All publishable libraries are prepped; this is purely a sequencing + token
+exercise now.

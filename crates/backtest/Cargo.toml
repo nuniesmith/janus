@@ -2,6 +2,8 @@
 name = "jflow-backtest"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+description = "Zero-lookahead backtesting engine for JANUS trading strategies."
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -11,12 +13,12 @@ name = "janus_backtest"
 
 [dependencies]
 # Core crates
-janus-models = { path = "../models", package = "jflow-models" }
-janus-indicators = { path = "../indicators", package = "jflow-indicators" }
-janus-strategies = { path = "../strategies", package = "jflow-strategies" }
-janus-risk = { path = "../risk", package = "jflow-risk" }
-janus-compliance = { path = "../compliance", package = "jflow-compliance" }
-janus-regime = { path = "../regime", package = "jflow-regime" }
+janus-models = { path = "../models", package = "jflow-models", version = "0.1.0" }
+janus-indicators = { path = "../indicators", package = "jflow-indicators", version = "0.1.0" }
+janus-strategies = { path = "../strategies", package = "jflow-strategies", version = "0.1.0" }
+janus-risk = { path = "../risk", package = "jflow-risk", version = "0.1.0" }
+janus-compliance = { path = "../compliance", package = "jflow-compliance", version = "0.1.0" }
+janus-regime = { path = "../regime", package = "jflow-regime", version = "0.1.0" }
 
 # Data processing
 polars = { workspace = true }
