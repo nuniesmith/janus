@@ -18,8 +18,9 @@ use axum::{
     routing::{get, post},
 };
 use janus_core::{
-    DEFAULT_ATR_MULTIPLIER, GuidanceThresholds, JanusState, ParamManager, PositionEvent,
-    PositionTracker, ServiceState, Signal, base_asset, compute_guidance,
+    DEFAULT_ATR_MULTIPLIER, GuidanceThresholds, JanusState, ParamManager, PositionClose,
+    PositionEvent, PositionOutcome, PositionTracker, ServiceState, Signal, base_asset,
+    compute_guidance,
 };
 use position_store::PositionEventStore;
 use serde::{Deserialize, Serialize};
@@ -171,6 +172,7 @@ fn create_router(
         .route("/api/log-level", post(log_level_set_handler))
         // Position event ingress (JFLOW-C foundation: receive + log, no guidance yet)
         .route("/api/v1/positions/event", post(position_event_handler))
+        .route("/api/v1/positions/close", post(position_close_handler))
         .layer(Extension(position_store))
         .layer(Extension(param_manager))
         .layer(Extension(position_tracker))
@@ -1051,6 +1053,64 @@ async fn position_event_handler(
     )
 }
 
+/// Receive a position-close event (JFLOW-C outcome capture).
+///
+/// Finalizes this position's accumulated guidance history in the tracker,
+/// joins it with the realized outcome, logs and best-effort persists a
+/// [`PositionOutcome`], and returns it in the 202 response. The outcome is
+/// the closed-trade record the JanusAI service later compacts into
+/// `janus_memories` so guidance quality can be evaluated and tuned.
+#[tracing::instrument(
+    skip(close, store, tracker),
+    fields(symbol = %close.symbol, side = ?close.side, qty = close.qty)
+)]
+async fn position_close_handler(
+    Extension(store): Extension<Arc<PositionEventStore>>,
+    Extension(tracker): Extension<Arc<PositionTracker>>,
+    Json(close): Json<PositionClose>,
+) -> impl IntoResponse {
+    if let Err(reason) = close.validate() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "accepted": false,
+                "error": reason,
+            })),
+        );
+    }
+
+    // Pull (and drop) this position's accumulated guidance history so the
+    // outcome can be joined with it. Untracked positions → None.
+    let state = match &close.position_id {
+        Some(id) => tracker.finalize(id).await,
+        None => None,
+    };
+    let outcome = PositionOutcome::from_close(&close, state.as_ref());
+
+    info!(
+        symbol = %outcome.symbol,
+        side = ?outcome.side,
+        pnl_realized = outcome.pnl_realized,
+        realized_ratio = outcome.realized_ratio,
+        result = outcome.result.as_str(),
+        peak_pnl_ratio = outcome.peak_pnl_ratio.unwrap_or(f64::NAN),
+        samples = outcome.samples,
+        last_guidance = outcome.last_guidance.map(|g| g.as_str()).unwrap_or(""),
+        time_in_position_secs = outcome.time_in_position_secs.unwrap_or(f64::NAN),
+        position_id = outcome.position_id.as_deref().unwrap_or(""),
+        persisted = store.is_outcomes_enabled(),
+        "position close received"
+    );
+    store.record_outcome(&outcome).await;
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "accepted": true,
+            "outcome": outcome,
+        })),
+    )
+}
+
 // =============================================================================
 // Error Handling
 // =============================================================================
@@ -1720,5 +1780,70 @@ mod tests {
             "reason was: {}",
             v2["guidance"]["reason"]
         );
+    }
+
+    // ── Position close endpoint (outcome capture) ────────────────────
+
+    #[tokio::test]
+    async fn position_close_rejects_invalid_payload() {
+        let router = test_router(test_state().await);
+        let body = serde_json::json!({
+            "symbol": "BTC-USD", "side": "Buy", "qty": -1.0,
+            "entry_price": 60000.0, "exit_price": 61000.0, "pnl_realized": 100.0
+        });
+        let (status, value) = post_json(&router, "/api/v1/positions/close", body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(value["accepted"], false);
+        assert!(value["error"].as_str().unwrap().contains("qty"));
+    }
+
+    #[tokio::test]
+    async fn position_close_untracked_returns_outcome() {
+        // A close for a position we never saw open → outcome with no history.
+        let router = test_router(test_state().await);
+        let body = serde_json::json!({
+            "symbol": "ETH-USD", "side": "Sell", "qty": 2.0,
+            "entry_price": 3000.0, "exit_price": 2940.0, "pnl_realized": 120.0
+        });
+        let (status, value) = post_json(&router, "/api/v1/positions/close", body).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(value["accepted"], true);
+        // 120 / 6000 = +2% → win, but nothing was tracked.
+        assert_eq!(value["outcome"]["result"], "win");
+        assert_eq!(value["outcome"]["samples"], 0);
+        assert!(
+            value["outcome"].get("last_guidance").is_none(),
+            "untracked close should omit guidance history"
+        );
+    }
+
+    #[tokio::test]
+    async fn position_close_joins_tracked_guidance_history() {
+        // Two snapshots build history under one position_id, then the close
+        // joins the realized outcome with that history (shared tracker).
+        let router = test_router(test_state().await);
+        for (price, pnl) in [(66000.0, 3000.0), (61200.0, 600.0)] {
+            let snap = serde_json::json!({
+                "symbol": "BTC-USD", "side": "Buy", "qty": 0.5,
+                "entry_price": 60000.0, "current_price": price,
+                "pnl_unrealized": pnl, "position_id": "pos-x"
+            });
+            let (s, _) = post_json(&router, "/api/v1/positions/event", snap).await;
+            assert_eq!(s, StatusCode::ACCEPTED);
+        }
+
+        let close = serde_json::json!({
+            "symbol": "BTC-USD", "side": "Buy", "qty": 0.5,
+            "entry_price": 60000.0, "exit_price": 61000.0,
+            "pnl_realized": 500.0, "position_id": "pos-x"
+        });
+        let (status, value) = post_json(&router, "/api/v1/positions/close", close).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let o = &value["outcome"];
+        assert_eq!(o["samples"], 2, "both snapshots should be counted");
+        assert_eq!(o["last_guidance"], "reduce", "last advice was a trailing reduce");
+        assert_eq!(o["result"], "win"); // +500 realized
+        let peak = o["peak_pnl_ratio"].as_f64().expect("peak recorded");
+        assert!((peak - 0.10).abs() < 1e-6, "peak was {peak}");
     }
 }
