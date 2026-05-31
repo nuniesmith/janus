@@ -2,6 +2,11 @@
 name = "jflow-risk"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Risk management and position-sizing tools for the JANUS trading engine."
 
 [dependencies]
 serde.workspace = true

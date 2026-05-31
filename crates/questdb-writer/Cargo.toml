@@ -2,6 +2,11 @@
 name = "jflow-questdb-writer"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "High-performance QuestDB time-series writer for the JANUS trading engine."
 
 [dependencies]
 tokio.workspace = true

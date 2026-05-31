@@ -2,6 +2,9 @@
 name = "jflow-cns"
 version.workspace = true
 edition.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Central nervous system: health monitoring and metrics collection for the JANUS trading engine."
 authors.workspace = true
 license.workspace = true
 

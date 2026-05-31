@@ -184,13 +184,29 @@ release helper only; crates.io publishing is the manual, per-crate process above
 | Rename all libraries to `jflow-*` (package + `package=` aliases + pinned lib names) | ✅ done — `cargo check --workspace --all-targets` passes |
 | `publish = false` on apps/services/vendored | ✅ done |
 | `jflow-core` — full metadata + README, published to crates.io | ✅ live (v0.1.0) |
-| Per-crate publish metadata (`description`/`license`/`readme`) for the other libs | ❌ TODO |
-| Add `version = "0.1.0"` to internal deps at publish time | ❌ TODO (per crate) |
+| Tier-0 leaves (15) — `description` + inherited `license`/`repository`/`authors`/`rust-version` | ✅ done — all dry-run clean |
+| `version` pins on root `[workspace.dependencies]` aliases (for publishing) | ✅ done |
+| Per-crate metadata for Tier-1+ libs (`backtest`, `strategies`, `optimizer`, `data`, …) | ❌ TODO |
+| `version` on the ~87 **direct** path-dep sites (per crate, at publish time) | ❌ TODO |
 | Publish the rest, bottom-up | ❌ TODO |
 
-**Next:** prep the Tier-0 leaves (`jflow-api`, `jflow-indicators`, `jflow-dsp`,
-`jflow-health`, `jflow-risk`, `jflow-models`, `jflow-regime`,
-`jflow-rate-limiter`, `jflow-gap-detection`, `jflow-compliance`, `jflow-ltn`,
-`jflow-bybit-client`, `jflow-questdb-writer`, `jflow-cns`, `jflow-registry-lib`)
-with `description`/`license.workspace`/`readme`, then publish them, then work up
-the tiers.
+**Tier-0 leaves are ready to publish now** (15 crates):
+`jflow-api`* , `jflow-indicators`, `jflow-dsp`, `jflow-health`, `jflow-risk`,
+`jflow-models`, `jflow-regime`, `jflow-rate-limiter`, `jflow-gap-detection`,
+`jflow-compliance`, `jflow-ltn`, `jflow-bybit-client`, `jflow-questdb-writer`,
+`jflow-cns`, `jflow-registry-lib`. (*`jflow-api` depends on the
+already-published `jflow-core`.) Each `cargo publish --dry-run -p <crate>`
+packages with no metadata warnings.
+
+```bash
+# publish the leaves (any order; jflow-api after jflow-core, which is already live)
+for c in jflow-indicators jflow-dsp jflow-health jflow-risk jflow-models \
+         jflow-regime jflow-rate-limiter jflow-gap-detection jflow-compliance \
+         jflow-ltn jflow-bybit-client jflow-questdb-writer jflow-cns \
+         jflow-registry-lib jflow-api; do
+  cargo publish -p "$c" && sleep 20   # let the index update between crates
+done
+```
+
+**Next:** prep Tier-1+ libs (add `description`/`license.workspace` where missing
+and `version` to their direct path deps), then publish up the tiers.
