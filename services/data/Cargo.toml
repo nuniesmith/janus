@@ -1,4 +1,5 @@
 [package]
+publish = false  # app/vendored: not published to crates.io
 name = "janus-data"
 version.workspace = true
 edition.workspace = true
@@ -15,14 +16,14 @@ path = "src/main.rs"
 
 [dependencies]
 # Internal JANUS crates (shared libraries)
-janus-questdb-writer = { path = "../../crates/questdb-writer" }
-janus-rate-limiter = { path = "../../crates/rate-limiter" }
-janus-gap-detection = { path = "../../crates/gap-detection" }
+janus-questdb-writer = { path = "../../crates/questdb-writer", package = "jflow-questdb-writer" }
+janus-rate-limiter = { path = "../../crates/rate-limiter", package = "jflow-rate-limiter" }
+janus-gap-detection = { path = "../../crates/gap-detection", package = "jflow-gap-detection" }
 
 # New unified JANUS dependencies
 janus-core = { workspace = true }
-janus-exchanges = { path = "../../crates/exchanges", features = ["cns-metrics"] }
-janus-cns = { path = "../../crates/cns" }
+janus-exchanges = { path = "../../crates/exchanges", features = ["cns-metrics"], package = "jflow-exchanges" }
+janus-cns = { path = "../../crates/cns", package = "jflow-cns" }
 
 # Async Runtime
 tokio = { workspace = true }

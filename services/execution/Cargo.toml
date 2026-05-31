@@ -8,6 +8,7 @@
 # ============================================================================
 
 [package]
+publish = false  # app/vendored: not published to crates.io
 name = "janus-execution"
 version.workspace = true
 edition.workspace = true

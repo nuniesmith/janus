@@ -1,5 +1,5 @@
 [package]
-name = "janus-gap-detection"
+name = "jflow-gap-detection"
 version = "0.1.0"
 edition = "2024"
 authors = ["nuniesmith"]

@@ -1,13 +1,16 @@
 [package]
-name = "memory"
+name = "jflow-memory"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[lib]
+name = "memory"
+
 [dependencies]
-common = { path = "../common" }
+common = { path = "../common", package = "jflow-common" }
 qdrant-client = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

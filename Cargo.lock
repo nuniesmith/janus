@@ -2239,24 +2239,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "common"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "ndarray 0.17.2",
- "postcard",
- "proptest",
- "prost 0.14.3",
- "prost-types 0.14.3",
- "rkyv 0.8.15",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "uuid",
-]
-
-[[package]]
 name = "compact_str"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5636,11 +5618,11 @@ dependencies = [
  "chrono",
  "dotenvy",
  "futures",
- "janus-api",
  "janus-backward",
  "janus-cns-service",
  "janus-data",
  "janus-forward",
+ "jflow-api",
  "jflow-core",
  "tokio",
  "tokio-util",
@@ -5650,59 +5632,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "janus-api"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "axum 0.8.8",
- "chrono",
- "futures-util",
- "http 1.4.0",
- "http-body-util",
- "jflow-core",
- "prometheus",
- "redis",
- "serde",
- "serde_json",
- "sqlx",
- "tokio",
- "tower 0.5.3",
- "tower-http",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "janus-backtest"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "approx",
- "chrono",
- "janus-compliance",
- "janus-indicators",
- "janus-models",
- "janus-regime",
- "janus-risk",
- "janus-strategies",
- "polars",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "janus-backtest-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
  "clap",
- "janus-backtest",
+ "jflow-backtest",
  "serde",
  "serde_json",
  "tracing",
@@ -5720,15 +5656,15 @@ dependencies = [
  "arrow-ipc 57.3.0",
  "axum 0.8.8",
  "chrono",
- "common",
  "config",
  "fks-proto",
- "janus-cns",
- "janus-health",
- "janus-ml",
- "janus-models",
+ "jflow-cns",
+ "jflow-common",
  "jflow-core",
- "memory",
+ "jflow-health",
+ "jflow-memory",
+ "jflow-ml",
+ "jflow-models",
  "prometheus",
  "prost 0.14.3",
  "prost-types 0.14.3",
@@ -5751,59 +5687,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "janus-bybit-client"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "futures-util",
- "hex",
- "hmac",
- "reqwest",
- "serde",
- "serde_json",
- "sha2",
- "thiserror 2.0.18",
- "tokio",
- "tokio-tungstenite",
- "tracing",
-]
-
-[[package]]
-name = "janus-cns"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "axum 0.8.8",
- "chrono",
- "futures",
- "prometheus",
- "prost 0.14.3",
- "redis",
- "reqwest",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-test",
- "toml 0.9.12+spec-1.1.0",
- "tonic 0.14.5",
- "tonic-health",
- "tower 0.5.3",
- "tower-http",
- "tracing",
- "uuid",
-]
-
-[[package]]
 name = "janus-cns-service"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum 0.8.8",
  "config",
- "janus-cns",
+ "jflow-cns",
  "jflow-core",
  "prometheus",
  "prost 0.12.6",
@@ -5817,16 +5707,6 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
-]
-
-[[package]]
-name = "janus-compliance"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "serde",
- "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -5844,12 +5724,12 @@ dependencies = [
  "hex",
  "hmac",
  "hyper 1.8.1",
- "janus-cns",
- "janus-exchanges",
- "janus-gap-detection",
- "janus-questdb-writer",
- "janus-rate-limiter",
+ "jflow-cns",
  "jflow-core",
+ "jflow-exchanges",
+ "jflow-gap-detection",
+ "jflow-questdb-writer",
+ "jflow-rate-limiter",
  "jsonwebtoken",
  "mockito",
  "nix 0.30.1",
@@ -5883,57 +5763,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "janus-data-quality"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arrow 57.3.0",
- "async-trait",
- "chrono",
- "criterion 0.5.1",
- "janus-cns",
- "janus-gap-detection",
- "jflow-core",
- "parquet 57.3.0",
- "prometheus",
- "rust_decimal",
- "serde",
- "serde_json",
- "statrs 0.17.1",
- "thiserror 2.0.18",
- "tokio",
- "tokio-test",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "janus-dsp"
-version = "0.1.0"
-
-[[package]]
-name = "janus-exchanges"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "chrono",
- "futures-util",
- "janus-cns",
- "jflow-core",
- "reqwest",
- "rust_decimal",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tokio-test",
- "tokio-tungstenite",
- "tracing",
- "url",
-]
-
-[[package]]
 name = "janus-execution"
 version = "0.1.0"
 dependencies = [
@@ -5953,10 +5782,10 @@ dependencies = [
  "futures-util",
  "hex",
  "hmac",
- "janus-compliance",
- "janus-models",
- "janus-questdb-writer",
- "janus-risk",
+ "jflow-compliance",
+ "jflow-models",
+ "jflow-questdb-writer",
+ "jflow-risk",
  "mockito",
  "parking_lot",
  "prometheus",
@@ -5996,24 +5825,24 @@ dependencies = [
  "async-trait",
  "axum 0.8.8",
  "chrono",
- "common",
  "config",
  "fks-proto",
  "futures",
  "futures-util",
- "janus-bybit-client",
- "janus-cns",
- "janus-compliance",
- "janus-health",
- "janus-indicators",
- "janus-models",
- "janus-optimizer",
- "janus-questdb-writer",
- "janus-regime",
- "janus-risk",
- "janus-strategies",
+ "jflow-bybit-client",
+ "jflow-cns",
+ "jflow-common",
+ "jflow-compliance",
  "jflow-core",
- "logic",
+ "jflow-health",
+ "jflow-indicators",
+ "jflow-logic",
+ "jflow-models",
+ "jflow-optimizer",
+ "jflow-questdb-writer",
+ "jflow-regime",
+ "jflow-risk",
+ "jflow-strategies",
  "prometheus",
  "prost 0.14.3",
  "prost-types 0.14.3",
@@ -6042,7 +5871,302 @@ dependencies = [
 ]
 
 [[package]]
-name = "janus-gap-detection"
+name = "janus-gateway"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "argon2",
+ "axum 0.8.8",
+ "axum-extra",
+ "chrono",
+ "config",
+ "dotenvy",
+ "fks-proto",
+ "governor 0.8.1",
+ "hyper 1.8.1",
+ "hyper-util",
+ "jflow-common",
+ "prometheus",
+ "prost 0.14.3",
+ "prost-build",
+ "prost-types 0.14.3",
+ "redis",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-test",
+ "tonic 0.14.5",
+ "tonic-build",
+ "tonic-web",
+ "tower 0.5.3",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "janus-optimizer-service"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum 0.8.8",
+ "chrono",
+ "clap",
+ "config",
+ "dotenvy",
+ "futures-util",
+ "jflow-cns",
+ "jflow-core",
+ "jflow-exchanges",
+ "jflow-indicators",
+ "jflow-optimizer",
+ "mockito",
+ "parking_lot",
+ "polars",
+ "prometheus",
+ "redis",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-cron-scheduler",
+ "toml 0.9.12+spec-1.1.0",
+ "tower 0.5.3",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "janus-registry-service"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum 0.8.8",
+ "chrono",
+ "config",
+ "dotenvy",
+ "jflow-core",
+ "jflow-registry-lib",
+ "prometheus",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-test",
+ "tower 0.5.3",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "jflow-api"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum 0.8.8",
+ "chrono",
+ "futures-util",
+ "http 1.4.0",
+ "http-body-util",
+ "jflow-core",
+ "prometheus",
+ "redis",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "tower 0.5.3",
+ "tower-http",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "jflow-backtest"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "approx",
+ "chrono",
+ "jflow-compliance",
+ "jflow-indicators",
+ "jflow-models",
+ "jflow-regime",
+ "jflow-risk",
+ "jflow-strategies",
+ "polars",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "jflow-bybit-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "futures-util",
+ "hex",
+ "hmac",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+]
+
+[[package]]
+name = "jflow-cns"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum 0.8.8",
+ "chrono",
+ "futures",
+ "prometheus",
+ "prost 0.14.3",
+ "redis",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-test",
+ "toml 0.9.12+spec-1.1.0",
+ "tonic 0.14.5",
+ "tonic-health",
+ "tower 0.5.3",
+ "tower-http",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "jflow-common"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "ndarray 0.17.2",
+ "postcard",
+ "proptest",
+ "prost 0.14.3",
+ "prost-types 0.14.3",
+ "rkyv 0.8.15",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
+name = "jflow-compliance"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "jflow-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "futures-util",
+ "prometheus",
+ "rand 0.10.0",
+ "redis",
+ "reqwest",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "toml 0.9.12+spec-1.1.0",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "jflow-data-quality"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arrow 57.3.0",
+ "async-trait",
+ "chrono",
+ "criterion 0.5.1",
+ "jflow-cns",
+ "jflow-core",
+ "jflow-gap-detection",
+ "parquet 57.3.0",
+ "prometheus",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "statrs 0.17.1",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-test",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "jflow-dsp"
+version = "0.1.0"
+
+[[package]]
+name = "jflow-exchanges"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "futures-util",
+ "jflow-cns",
+ "jflow-core",
+ "reqwest",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-test",
+ "tokio-tungstenite",
+ "tracing",
+ "url",
+]
+
+[[package]]
+name = "jflow-gap-detection"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -6065,43 +6189,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "janus-gateway"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "argon2",
- "axum 0.8.8",
- "axum-extra",
- "chrono",
- "common",
- "config",
- "dotenvy",
- "fks-proto",
- "governor 0.8.1",
- "hyper 1.8.1",
- "hyper-util",
- "prometheus",
- "prost 0.14.3",
- "prost-build",
- "prost-types 0.14.3",
- "redis",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tokio-test",
- "tonic 0.14.5",
- "tonic-build",
- "tonic-web",
- "tower 0.5.3",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
-name = "janus-health"
+name = "jflow-health"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -6119,7 +6207,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "janus-indicators"
+name = "jflow-indicators"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -6127,7 +6215,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "janus-lob"
+name = "jflow-lob"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -6149,7 +6237,25 @@ dependencies = [
 ]
 
 [[package]]
-name = "janus-ltn"
+name = "jflow-logic"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "candle-core",
+ "candle-nn",
+ "chrono",
+ "jflow-common",
+ "ndarray 0.17.2",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "jflow-ltn"
 version = "0.1.0"
 dependencies = [
  "serde",
@@ -6157,7 +6263,24 @@ dependencies = [
 ]
 
 [[package]]
-name = "janus-ml"
+name = "jflow-memory"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "jflow-common",
+ "qdrant-client",
+ "rand 0.10.0",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "jflow-ml"
 version = "2.0.0"
 dependencies = [
  "anyhow",
@@ -6172,8 +6295,8 @@ dependencies = [
  "burn-wgpu",
  "chrono",
  "criterion 0.5.1",
- "janus-data-quality",
  "jflow-core",
+ "jflow-data-quality",
  "ndarray 0.15.6",
  "ndarray-stats",
  "parquet 54.3.1",
@@ -6193,7 +6316,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "janus-models"
+name = "jflow-models"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -6208,7 +6331,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "janus-neuromorphic"
+name = "jflow-neuromorphic"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -6216,13 +6339,13 @@ dependencies = [
  "candle-core",
  "candle-nn",
  "chrono",
- "common",
  "csv",
  "cudarc 0.18.2",
  "fks-proto",
  "hex",
  "hostname",
- "memory",
+ "jflow-common",
+ "jflow-memory",
  "ndarray 0.17.2",
  "num-complex",
  "num_cpus",
@@ -6253,7 +6376,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "janus-optimizer"
+name = "jflow-optimizer"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -6262,11 +6385,11 @@ dependencies = [
  "chrono",
  "clap",
  "ctrlc",
- "janus-backtest",
- "janus-indicators",
- "janus-models",
- "janus-strategies",
+ "jflow-backtest",
  "jflow-core",
+ "jflow-indicators",
+ "jflow-models",
+ "jflow-strategies",
  "ndarray 0.17.2",
  "polars",
  "prometheus",
@@ -6286,44 +6409,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "janus-optimizer-service"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum 0.8.8",
- "chrono",
- "clap",
- "config",
- "dotenvy",
- "futures-util",
- "janus-cns",
- "janus-exchanges",
- "janus-indicators",
- "janus-optimizer",
- "jflow-core",
- "mockito",
- "parking_lot",
- "polars",
- "prometheus",
- "redis",
- "reqwest",
- "serde",
- "serde_json",
- "sqlx",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-cron-scheduler",
- "toml 0.9.12+spec-1.1.0",
- "tower 0.5.3",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
-name = "janus-questdb-writer"
+name = "jflow-questdb-writer"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -6333,7 +6419,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "janus-rate-limiter"
+name = "jflow-rate-limiter"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -6354,7 +6440,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "janus-regime"
+name = "jflow-regime"
 version = "0.1.0"
 dependencies = [
  "chrono",
@@ -6364,7 +6450,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "janus-registry-lib"
+name = "jflow-registry-lib"
 version = "0.1.0"
 dependencies = [
  "chrono",
@@ -6379,33 +6465,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "janus-registry-service"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "axum 0.8.8",
- "chrono",
- "config",
- "dotenvy",
- "janus-registry-lib",
- "jflow-core",
- "prometheus",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tokio-test",
- "tower 0.5.3",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
-name = "janus-risk"
+name = "jflow-risk"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -6415,42 +6475,76 @@ dependencies = [
 ]
 
 [[package]]
-name = "janus-strategies"
+name = "jflow-strategies"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
- "janus-indicators",
- "janus-models",
- "janus-regime",
+ "jflow-indicators",
+ "jflow-models",
+ "jflow-regime",
  "serde",
  "serde_json",
  "toml 0.9.12+spec-1.1.0",
 ]
 
 [[package]]
-name = "jflow-core"
+name = "jflow-training"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-trait",
+ "candle-core",
+ "candle-nn",
  "chrono",
- "futures-util",
+ "flume 0.12.0",
+ "jflow-common",
+ "jflow-logic",
+ "jflow-vision",
+ "postcard",
+ "rand 0.10.0",
+ "rkyv 0.8.15",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "jflow-vision"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "approx",
+ "bincode",
+ "burn",
+ "burn-autodiff",
+ "burn-core",
+ "burn-cuda",
+ "burn-ndarray",
+ "burn-nn",
+ "burn-train",
+ "burn-wgpu",
+ "candle-core",
+ "candle-nn",
+ "chrono",
+ "criterion 0.5.1",
+ "csv",
+ "image 0.25.10",
+ "jflow-common",
+ "log",
+ "nalgebra 0.33.2",
+ "ndarray 0.15.6",
+ "num-traits",
+ "plotters",
  "prometheus",
  "rand 0.10.0",
- "redis",
- "reqwest",
- "rust_decimal",
+ "rayon",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "toml 0.9.12+spec-1.1.0",
  "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]
@@ -6818,24 +6912,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 
 [[package]]
-name = "logic"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "candle-core",
- "candle-nn",
- "chrono",
- "common",
- "ndarray 0.17.2",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
 name = "loop9"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7056,23 +7132,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
 dependencies = [
  "autocfg",
-]
-
-[[package]]
-name = "memory"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "common",
- "qdrant-client",
- "rand 0.10.0",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "uuid",
 ]
 
 [[package]]
@@ -12639,28 +12698,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "training"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "candle-core",
- "candle-nn",
- "chrono",
- "common",
- "flume 0.12.0",
- "logic",
- "postcard",
- "rand 0.10.0",
- "rkyv 0.8.15",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "vision",
-]
-
-[[package]]
 name = "transpose"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -13042,43 +13079,6 @@ name = "virtue"
 version = "0.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "051eb1abcf10076295e815102942cc58f9d5e3b4560e46e53c21e8ff6f3af7b1"
-
-[[package]]
-name = "vision"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "approx",
- "bincode",
- "burn",
- "burn-autodiff",
- "burn-core",
- "burn-cuda",
- "burn-ndarray",
- "burn-nn",
- "burn-train",
- "burn-wgpu",
- "candle-core",
- "candle-nn",
- "chrono",
- "common",
- "criterion 0.5.1",
- "csv",
- "image 0.25.10",
- "log",
- "nalgebra 0.33.2",
- "ndarray 0.15.6",
- "num-traits",
- "plotters",
- "prometheus",
- "rand 0.10.0",
- "rayon",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tracing",
-]
 
 [[package]]
 name = "void"

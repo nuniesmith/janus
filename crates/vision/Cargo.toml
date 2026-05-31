@@ -1,5 +1,5 @@
 [package]
-name = "vision"
+name = "jflow-vision"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
@@ -7,7 +7,7 @@ description = "Vision pipeline for JANUS - DiffGAF and time series imaging"
 
 [dependencies]
 # Internal crates
-common = { path = "../common" }
+common = { path = "../common", package = "jflow-common" }
 
 # Burn framework
 burn-core = { version = "0.19", default-features = false }

@@ -91,34 +91,34 @@ fks-proto = { path = "crates/fks-proto" }
 # JANUS Local Dependencies
 # ===========================================================================
 janus-core = { path = "lib/janus-core", package = "jflow-core" }
-janus-api = { path = "lib/janus-api" }
-janus-dsp = { path = "crates/dsp" }
-janus-exchanges = { path = "crates/exchanges" }
-janus-ltn = { path = "crates/ltn" }
+janus-api = { path = "lib/janus-api", package = "jflow-api" }
+janus-dsp = { path = "crates/dsp", package = "jflow-dsp" }
+janus-exchanges = { path = "crates/exchanges", package = "jflow-exchanges" }
+janus-ltn = { path = "crates/ltn", package = "jflow-ltn" }
 janus-data = { path = "services/data" }
-janus-data-quality = { path = "crates/data-quality" }
-janus-gap-detection = { path = "crates/gap-detection" }
-janus-indicators = { path = "crates/indicators" }
-janus-strategies = { path = "crates/strategies" }
-janus-risk = { path = "crates/risk" }
-janus-models = { path = "crates/models" }
-janus-bybit-client = { path = "crates/bybit-client" }
-janus-questdb-writer = { path = "crates/questdb-writer" }
-janus-compliance = { path = "crates/compliance" }
-janus-backtest = { path = "crates/backtest" }
-janus-health = { path = "crates/health" }
-janus-logic = { path = "crates/logic" }
-janus-common = { path = "crates/common" }
-janus-rate-limiter = { path = "crates/rate-limiter" }
-janus-memory = { path = "crates/memory" }
+janus-data-quality = { path = "crates/data-quality", package = "jflow-data-quality" }
+janus-gap-detection = { path = "crates/gap-detection", package = "jflow-gap-detection" }
+janus-indicators = { path = "crates/indicators", package = "jflow-indicators" }
+janus-strategies = { path = "crates/strategies", package = "jflow-strategies" }
+janus-risk = { path = "crates/risk", package = "jflow-risk" }
+janus-models = { path = "crates/models", package = "jflow-models" }
+janus-bybit-client = { path = "crates/bybit-client", package = "jflow-bybit-client" }
+janus-questdb-writer = { path = "crates/questdb-writer", package = "jflow-questdb-writer" }
+janus-compliance = { path = "crates/compliance", package = "jflow-compliance" }
+janus-backtest = { path = "crates/backtest", package = "jflow-backtest" }
+janus-health = { path = "crates/health", package = "jflow-health" }
+janus-logic = { path = "crates/logic", package = "jflow-logic" }
+janus-common = { path = "crates/common", package = "jflow-common" }
+janus-rate-limiter = { path = "crates/rate-limiter", package = "jflow-rate-limiter" }
+janus-memory = { path = "crates/memory", package = "jflow-memory" }
 
-janus-cns = { path = "crates/cns" }
-janus-training = { path = "crates/training" }
-janus-ml = { path = "crates/ml" }
-janus-optimizer = { path = "crates/optimizer" }
-janus-regime = { path = "crates/regime" }
-janus-lob = { path = "crates/lob" }
-janus-registry-lib = { path = "crates/registry" }
+janus-cns = { path = "crates/cns", package = "jflow-cns" }
+janus-training = { path = "crates/training", package = "jflow-training" }
+janus-ml = { path = "crates/ml", package = "jflow-ml" }
+janus-optimizer = { path = "crates/optimizer", package = "jflow-optimizer" }
+janus-regime = { path = "crates/regime", package = "jflow-regime" }
+janus-lob = { path = "crates/lob", package = "jflow-lob" }
+janus-registry-lib = { path = "crates/registry", package = "jflow-registry-lib" }
 
 # Async Runtime
 tokio = { version = "1.48.0", features = ["full"] }

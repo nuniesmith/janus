@@ -1,12 +1,12 @@
 [package]
-name = "janus-strategies"
+name = "jflow-strategies"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-janus-indicators = { path = "../indicators" }
-janus-models = { path = "../models" }
-janus-regime = { path = "../regime" }
+janus-indicators = { path = "../indicators", package = "jflow-indicators" }
+janus-models = { path = "../models", package = "jflow-models" }
+janus-regime = { path = "../regime", package = "jflow-regime" }
 serde.workspace = true
 serde_json.workspace = true
 chrono.workspace = true

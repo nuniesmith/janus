@@ -1,11 +1,14 @@
 [package]
-name = "logic"
+name = "jflow-logic"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Neuro-Symbolic Logic for Project JANUS - Differentiable Logic Tensor Networks"
+
+[lib]
+name = "logic"
 
 [features]
 default = ["cpu"]
@@ -15,7 +18,7 @@ metal = ["candle-core/metal", "candle-nn/metal"]
 
 [dependencies]
 # Internal crates
-common = { path = "../common" }
+common = { path = "../common", package = "jflow-common" }
 
 # ML Framework (Candle from HuggingFace) - for differentiable LTN
 candle-core = { workspace = true }

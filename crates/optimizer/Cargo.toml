@@ -1,11 +1,14 @@
 [package]
-name = "janus-optimizer"
+name = "jflow-optimizer"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Hyperparameter optimization for JANUS trading strategies"
+
+[lib]
+name = "janus_optimizer"
 
 [[bin]]
 name = "optimizer-runner"

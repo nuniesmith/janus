@@ -1,4 +1,5 @@
 [package]
+publish = false  # app/vendored: not published to crates.io
 name = "janus-backward"
 version.workspace = true
 edition.workspace = true
@@ -15,13 +16,13 @@ path = "src/main.rs"
 janus-core = { workspace = true }
 
 # Core crates
-common = { path = "../../crates/common" }
-memory = { path = "../../crates/memory" }
+common = { path = "../../crates/common", package = "jflow-common" }
+memory = { path = "../../crates/memory", package = "jflow-memory" }
 fks-proto = { workspace = true }
-cns = { package = "janus-cns", path = "../../crates/cns" }
-janus-models = { path = "../../crates/models" }
-janus-health = { path = "../../crates/health" }
-janus-ml = { path = "../../crates/ml" }
+cns = { package = "jflow-cns", path = "../../crates/cns" }
+janus-models = { path = "../../crates/models", package = "jflow-models" }
+janus-health = { path = "../../crates/health", package = "jflow-health" }
+janus-ml = { path = "../../crates/ml", package = "jflow-ml" }
 
 # Job Queue
 apalis = { workspace = true }

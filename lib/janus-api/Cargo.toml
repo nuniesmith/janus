@@ -1,7 +1,10 @@
 [package]
-name = "janus-api"
+name = "jflow-api"
 version.workspace = true
 edition.workspace = true
+
+[lib]
+name = "janus_api"
 
 [dependencies]
 janus-core.workspace = true

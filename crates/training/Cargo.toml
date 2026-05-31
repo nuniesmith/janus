@@ -1,11 +1,14 @@
 [package]
-name = "training"
+name = "jflow-training"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Training infrastructure for Project JANUS - Optimizers, Schedulers, Replay Buffers"
+
+[lib]
+name = "training"
 
 [features]
 default = ["cpu"]
@@ -16,9 +19,9 @@ vision = ["dep:vision"]
 
 [dependencies]
 # Internal crates
-common = { path = "../common" }
-vision = { path = "../vision", optional = true }
-logic = { path = "../logic" }
+common = { path = "../common", package = "jflow-common" }
+vision = { path = "../vision", optional = true, package = "jflow-vision" }
+logic = { path = "../logic", package = "jflow-logic" }
 
 # ML Framework (Candle from HuggingFace)
 candle-core = { workspace = true }

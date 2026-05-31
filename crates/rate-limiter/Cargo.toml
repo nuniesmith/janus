@@ -1,5 +1,5 @@
 [package]
-name = "janus-rate-limiter"
+name = "jflow-rate-limiter"
 version = "0.1.0"
 edition = "2024"
 authors = ["nuniesmith"]

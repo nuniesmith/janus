@@ -1,4 +1,5 @@
 [package]
+publish = false  # app/vendored: not published to crates.io
 name = "janus-forward"
 version.workspace = true
 edition.workspace = true
@@ -54,18 +55,18 @@ janus-core = { workspace = true }
 fks-proto = { workspace = true }
 
 # Workspace crates
-common = { path = "../../crates/common" }
-janus-indicators = { path = "../../crates/indicators" }
-janus-strategies = { path = "../../crates/strategies" }
-janus-regime = { path = "../../crates/regime" }
-logic = { path = "../../crates/logic" }
-janus-models = { path = "../../crates/models" }
-janus-health = { path = "../../crates/health" }
-janus-risk = { path = "../../crates/risk" }
-janus-cns = { path = "../../crates/cns" }
-janus-compliance = { path = "../../crates/compliance" }
-janus-bybit-client = { path = "../../crates/bybit-client" }
-janus-questdb-writer = { path = "../../crates/questdb-writer" }
+common = { path = "../../crates/common", package = "jflow-common" }
+janus-indicators = { path = "../../crates/indicators", package = "jflow-indicators" }
+janus-strategies = { path = "../../crates/strategies", package = "jflow-strategies" }
+janus-regime = { path = "../../crates/regime", package = "jflow-regime" }
+logic = { path = "../../crates/logic", package = "jflow-logic" }
+janus-models = { path = "../../crates/models", package = "jflow-models" }
+janus-health = { path = "../../crates/health", package = "jflow-health" }
+janus-risk = { path = "../../crates/risk", package = "jflow-risk" }
+janus-cns = { path = "../../crates/cns", package = "jflow-cns" }
+janus-compliance = { path = "../../crates/compliance", package = "jflow-compliance" }
+janus-bybit-client = { path = "../../crates/bybit-client", package = "jflow-bybit-client" }
+janus-questdb-writer = { path = "../../crates/questdb-writer", package = "jflow-questdb-writer" }
 
 # Async Runtime
 tokio = { workspace = true }
@@ -136,8 +137,8 @@ uuid = { workspace = true }
 futures = { workspace = true }
 tokio-stream = { version = "0.1.17", features = ["net"] }
 chrono = { workspace = true }
-janus-cns = { path = "../../crates/cns" }
-janus-optimizer = { path = "../../crates/optimizer" }
+janus-cns = { path = "../../crates/cns", package = "jflow-cns" }
+janus-optimizer = { path = "../../crates/optimizer", package = "jflow-optimizer" }
 
 [features]
 default = ["redis", "persistence"]

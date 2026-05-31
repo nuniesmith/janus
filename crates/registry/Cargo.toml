@@ -1,5 +1,5 @@
 [package]
-name = "janus-registry-lib"
+name = "jflow-registry-lib"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

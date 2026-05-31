@@ -1,5 +1,5 @@
 [package]
-name = "janus-neuromorphic"
+name = "jflow-neuromorphic"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -12,7 +12,7 @@ name = "janus_neuromorphic"
 path = "lib.rs"
 
 [dependencies]
-common = { path = "../crates/common" }
+common = { path = "../crates/common", package = "jflow-common" }
 thiserror = "2.0.17"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -43,7 +43,7 @@ qdrant-client = { workspace = true }
 postcard = { workspace = true }
 
 # Memory crate (Qdrant production client, replay buffer)
-memory = { path = "../crates/memory" }
+memory = { path = "../crates/memory", package = "jflow-memory" }
 
 # ML Framework (optional, for training)
 candle-core = { workspace = true }

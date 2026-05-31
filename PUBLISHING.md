@@ -47,14 +47,33 @@ the internal dependency *names*, using Cargo's dependency renaming:
    janus-core = { path = "../../lib/janus-core", package = "jflow-core" }
    ```
 
-> ⚠️ Internal deps are declared **two ways** here: ~26 via
-> `janus-x = { workspace = true }` (fix once in the root manifest) and **~56 via
-> direct `path = ...`** (each needs `package = "jflow-x"` added individually). A
-> full-workspace `cargo build` will fail loudly on any site you miss, so it is
+> ⚠️ Internal deps are declared **two ways** here: via
+> `janus-x = { workspace = true }` (fixed once in the root manifest) and via
+> **direct `path = ...`** (each needs `package = "jflow-x"` added individually).
+> A full-workspace `cargo check` fails loudly on any site you miss, so it is
 > self-verifying.
 
-The first crate, **`jflow-core`** (`lib/janus-core`), has already been rebranded
-this way and is publish-ready (see Status). Replicate the pattern for the rest.
+**Library-name preservation.** Renaming `[package] name` changes the default
+library (crate) name, which would break a crate's *own* `bin`/`test`/`example`
+targets that reference it by name. To keep **zero source churn**, each renamed
+crate pins its original library name:
+
+```toml
+[package]
+name = "jflow-optimizer"   # published name (crates.io)
+[lib]
+name = "janus_optimizer"   # import name kept stable: `use janus_optimizer::...`
+```
+
+So a crate is **published as `jflow-<x>`** but **imported as its original name**
+(`janus_<x>`, or `common`/`memory`/`vision`/`logic`/`training` for the
+non-prefixed crates). The sole exception is **`jflow-core`**, published first and
+imported as `jflow_core`.
+
+**Status: the rename is done.** All ~29 publishable libraries are already
+renamed to `jflow-*` with `package =` aliases and pinned lib names;
+`cargo check --workspace --all-targets` passes. What remains per crate is
+publish *metadata* (below), not renaming.
 
 ### Rename mapping (published name)
 
@@ -160,10 +179,18 @@ release helper only; crates.io publishing is the manual, per-crate process above
 
 ## Status
 
-| Crate | Prepped | Published |
-|---|---|---|
-| `jflow-core` (`lib/janus-core`) | ✅ renamed + metadata + README + clean `--dry-run` | ❌ not yet (needs token) |
-| everything else | ❌ (rename pending) | ❌ |
+| Step | State |
+|---|---|
+| Rename all libraries to `jflow-*` (package + `package=` aliases + pinned lib names) | ✅ done — `cargo check --workspace --all-targets` passes |
+| `publish = false` on apps/services/vendored | ✅ done |
+| `jflow-core` — full metadata + README, published to crates.io | ✅ live (v0.1.0) |
+| Per-crate publish metadata (`description`/`license`/`readme`) for the other libs | ❌ TODO |
+| Add `version = "0.1.0"` to internal deps at publish time | ❌ TODO (per crate) |
+| Publish the rest, bottom-up | ❌ TODO |
 
-`jflow-core` is ready: authenticate, then from a clean tree run
-`cargo publish -p jflow-core`.
+**Next:** prep the Tier-0 leaves (`jflow-api`, `jflow-indicators`, `jflow-dsp`,
+`jflow-health`, `jflow-risk`, `jflow-models`, `jflow-regime`,
+`jflow-rate-limiter`, `jflow-gap-detection`, `jflow-compliance`, `jflow-ltn`,
+`jflow-bybit-client`, `jflow-questdb-writer`, `jflow-cns`, `jflow-registry-lib`)
+with `description`/`license.workspace`/`readme`, then publish them, then work up
+the tiers.
