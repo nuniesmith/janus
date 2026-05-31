@@ -1,5 +1,5 @@
 [package]
-name = "janus-regime"
+name = "jflow-regime"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

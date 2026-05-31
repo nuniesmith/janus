@@ -1,9 +1,12 @@
 [package]
-name = "janus-cns"
+name = "jflow-cns"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+
+[lib]
+name = "janus_cns"
 
 [dependencies]
 # Workspace dependencies

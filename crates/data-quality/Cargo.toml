@@ -1,16 +1,19 @@
 [package]
-name = "janus-data-quality"
+name = "jflow-data-quality"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[lib]
+name = "janus_data_quality"
+
 [dependencies]
 # Workspace dependencies
 janus-core = { workspace = true }
-janus-gap-detection = { path = "../gap-detection" }
-janus-cns = { path = "../cns", optional = true }
+janus-gap-detection = { path = "../gap-detection", package = "jflow-gap-detection" }
+janus-cns = { path = "../cns", optional = true, package = "jflow-cns" }
 
 # Async runtime
 tokio = { workspace = true, features = ["full"] }

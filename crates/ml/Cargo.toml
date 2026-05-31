@@ -1,10 +1,13 @@
 [package]
-name = "janus-ml"
+name = "jflow-ml"
 version = "2.0.0"
 edition = "2024"
 authors = ["nuniesmith"]
 description = "Machine learning models and inference for JANUS trading system"
 license = "MIT"
+
+[lib]
+name = "janus_ml"
 
 [dependencies]
 # Burn ML framework - using individual crates to avoid SQLite conflict
@@ -57,7 +60,7 @@ tracing = "0.1"
 
 # JANUS dependencies
 janus-core = { path = "../../lib/janus-core", package = "jflow-core" }
-janus-data-quality = { path = "../data-quality" }
+janus-data-quality = { path = "../data-quality", package = "jflow-data-quality" }
 
 [dev-dependencies]
 criterion = "0.5"

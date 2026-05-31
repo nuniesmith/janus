@@ -1,4 +1,5 @@
 [package]
+publish = false  # app/vendored: not published to crates.io
 name = "janus-cns-service"
 version.workspace = true
 edition.workspace = true
@@ -18,7 +19,7 @@ path = "src/main.rs"
 janus-core = { workspace = true }
 
 # Workspace dependencies
-janus-cns = { path = "../../crates/cns" }
+janus-cns = { path = "../../crates/cns", package = "jflow-cns" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

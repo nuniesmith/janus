@@ -1,10 +1,13 @@
 [package]
-name = "janus-health"
+name = "jflow-health"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+
+[lib]
+name = "janus_health"
 
 [dependencies]
 # HTTP server

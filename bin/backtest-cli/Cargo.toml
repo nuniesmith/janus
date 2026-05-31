@@ -1,4 +1,5 @@
 [package]
+publish = false  # app/vendored: not published to crates.io
 name = "janus-backtest-cli"
 version.workspace = true
 edition.workspace = true
@@ -13,7 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 # Internal dependencies
-janus-backtest = { path = "../../crates/backtest" }
+janus-backtest = { path = "../../crates/backtest", package = "jflow-backtest" }
 
 # CLI argument parsing
 clap = { version = "4.5", features = ["derive"] }

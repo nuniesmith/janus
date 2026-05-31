@@ -1,11 +1,14 @@
 [package]
-name = "janus-lob"
+name = "jflow-lob"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Limit Order Book simulator for JANUS backtesting and market microstructure analysis"
+
+[lib]
+name = "janus_lob"
 
 [dependencies]
 # Core crates
