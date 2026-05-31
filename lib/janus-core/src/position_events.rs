@@ -82,6 +82,153 @@ impl PositionEvent {
     }
 }
 
+/// A terminal event: the producer closed a position. Carries the realized
+/// outcome so Janus can record what actually happened against the guidance it
+/// advised while the position was open. Sent to `POST /api/v1/positions/close`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PositionClose {
+    /// Trading pair / instrument (e.g. "BTC-USD").
+    pub symbol: String,
+    /// Direction the (now-closed) position was held in.
+    pub side: Side,
+    /// Position size in base units (always positive).
+    pub qty: f64,
+    /// Average fill price the position was opened at.
+    pub entry_price: f64,
+    /// Average fill price the position was closed at.
+    pub exit_price: f64,
+    /// Realized P&L in quote currency (signed).
+    pub pnl_realized: f64,
+    /// Client position id, used to correlate with the open snapshots so the
+    /// outcome can be joined with this position's guidance history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position_id: Option<String>,
+    /// Optional JanusAI session id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+}
+
+impl PositionClose {
+    /// Reject malformed close events at the boundary.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.symbol.is_empty() {
+            return Err("symbol is empty");
+        }
+        if !self.qty.is_finite() || self.qty <= 0.0 {
+            return Err("qty must be positive and finite");
+        }
+        if !self.entry_price.is_finite() || self.entry_price <= 0.0 {
+            return Err("entry_price must be positive and finite");
+        }
+        if !self.exit_price.is_finite() || self.exit_price <= 0.0 {
+            return Err("exit_price must be positive and finite");
+        }
+        if !self.pnl_realized.is_finite() {
+            return Err("pnl_realized must be finite");
+        }
+        Ok(())
+    }
+
+    /// Realized P&L as a ratio of entry notional. `None` when notional is
+    /// non-positive (impossible after [`validate`](Self::validate)).
+    pub fn realized_ratio(&self) -> Option<f64> {
+        let notional = self.entry_price * self.qty;
+        (notional > 0.0).then(|| self.pnl_realized / notional)
+    }
+}
+
+/// Coarse win/loss classification of a closed trade.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OutcomeResult {
+    Win,
+    Loss,
+    Breakeven,
+}
+
+impl OutcomeResult {
+    /// Classify from a realized P&L ratio (treats `|ratio| < 1e-9` as flat).
+    pub fn from_ratio(ratio: f64) -> Self {
+        if ratio > 1e-9 {
+            Self::Win
+        } else if ratio < -1e-9 {
+            Self::Loss
+        } else {
+            Self::Breakeven
+        }
+    }
+
+    /// Lowercase wire name (matches the serde representation).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Win => "win",
+            Self::Loss => "loss",
+            Self::Breakeven => "breakeven",
+        }
+    }
+}
+
+/// A closed-trade record joining a [`PositionClose`] with the guidance
+/// history accumulated in [`PositionState`] while the position was open.
+///
+/// This is the "outcome" Janus captures so the guidance engine can be
+/// evaluated and tuned. Downstream, the JanusAI service compacts these into
+/// `janus_memories` (fks repo). Fields sourced from the tracker are `None`
+/// when the position was never tracked (no `position_id`, or no snapshots
+/// arrived before the close).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PositionOutcome {
+    pub symbol: String,
+    pub side: Side,
+    pub qty: f64,
+    pub entry_price: f64,
+    pub exit_price: f64,
+    pub pnl_realized: f64,
+    /// Realized P&L as a ratio of entry notional.
+    pub realized_ratio: f64,
+    /// Win / loss / breakeven from the sign of `realized_ratio`.
+    pub result: OutcomeResult,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub position_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// Highest unrealized-P&L ratio seen while the position was open.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peak_pnl_ratio: Option<f64>,
+    /// Number of open snapshots observed (0 if the position was untracked).
+    pub samples: u64,
+    /// The last guidance action Janus advised for this position.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_guidance: Option<GuidanceAction>,
+    /// Seconds the position was reported open.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_in_position_secs: Option<f64>,
+}
+
+impl PositionOutcome {
+    /// Build an outcome from a close event joined with the position's
+    /// accumulated [`PositionState`] (when it was tracked).
+    pub fn from_close(close: &PositionClose, state: Option<&PositionState>) -> Self {
+        let realized_ratio = close.realized_ratio().unwrap_or(0.0);
+        Self {
+            symbol: close.symbol.clone(),
+            side: close.side,
+            qty: close.qty,
+            entry_price: close.entry_price,
+            exit_price: close.exit_price,
+            pnl_realized: close.pnl_realized,
+            realized_ratio,
+            result: OutcomeResult::from_ratio(realized_ratio),
+            position_id: close.position_id.clone(),
+            session_id: close.session_id.clone(),
+            peak_pnl_ratio: state.map(|s| s.peak_pnl_ratio),
+            samples: state.map_or(0, |s| s.samples),
+            last_guidance: state.map(|s| s.last_action),
+            time_in_position_secs: state.map(|s| s.time_in_position().as_secs_f64()),
+        }
+    }
+}
+
 /// Guidance action returned to the execution side for an open position.
 ///
 /// Producers (Ruby / fks) are free to ignore this — it is advisory. The
@@ -97,6 +244,17 @@ pub enum GuidanceAction {
     Hold,
     Reduce,
     Exit,
+}
+
+impl GuidanceAction {
+    /// Lowercase wire name (matches the serde representation).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Hold => "hold",
+            Self::Reduce => "reduce",
+            Self::Exit => "exit",
+        }
+    }
 }
 
 /// Advisory guidance returned alongside the receive acknowledgement.
@@ -403,6 +561,14 @@ impl PositionTracker {
     /// Number of positions currently tracked (after pruning). For metrics/tests.
     pub async fn tracked(&self) -> usize {
         self.states.read().await.len()
+    }
+
+    /// Remove and return a position's accumulated state. Call this when the
+    /// position closes so its guidance history can be joined with the realized
+    /// outcome (see [`PositionOutcome::from_close`]). Returns `None` if the
+    /// position was never tracked.
+    pub async fn finalize(&self, position_id: &str) -> Option<PositionState> {
+        self.states.write().await.remove(position_id)
     }
 
     /// Refine stateless `base` guidance using this position's history, record
@@ -947,5 +1113,95 @@ mod tests {
                 .await;
         }
         assert_eq!(tracker.tracked().await, 2, "oldest entry should be evicted");
+    }
+
+    // ── PositionClose / PositionOutcome (outcome capture) ────────────
+
+    fn close_ev(position_id: Option<&str>, pnl_realized: f64) -> PositionClose {
+        PositionClose {
+            symbol: "BTC-USD".to_string(),
+            side: Side::Buy,
+            qty: 0.5,
+            entry_price: 60_000.0,
+            exit_price: 60_500.0,
+            pnl_realized,
+            position_id: position_id.map(String::from),
+            session_id: None,
+        }
+    }
+
+    #[test]
+    fn position_close_validate_rejects_bad_input() {
+        assert!(close_ev(None, 100.0).validate().is_ok());
+
+        let mut e = close_ev(None, 100.0);
+        e.symbol.clear();
+        assert!(e.validate().is_err());
+
+        let mut e = close_ev(None, 100.0);
+        e.qty = -1.0;
+        assert!(e.validate().is_err());
+
+        let mut e = close_ev(None, 100.0);
+        e.exit_price = 0.0;
+        assert!(e.validate().is_err());
+
+        let e = close_ev(None, f64::NAN);
+        assert!(e.validate().is_err());
+    }
+
+    #[test]
+    fn outcome_from_close_without_state_is_untracked() {
+        // 30_000 notional; +1500 realized = +5% → Win, but no tracker state.
+        let o = PositionOutcome::from_close(&close_ev(None, 1500.0), None);
+        assert_eq!(o.result, OutcomeResult::Win);
+        assert!((o.realized_ratio - 0.05).abs() < 1e-9);
+        assert_eq!(o.samples, 0);
+        assert!(o.peak_pnl_ratio.is_none());
+        assert!(o.last_guidance.is_none());
+        assert!(o.time_in_position_secs.is_none());
+
+        // Sign classification.
+        assert_eq!(
+            PositionOutcome::from_close(&close_ev(None, -600.0), None).result,
+            OutcomeResult::Loss
+        );
+        assert_eq!(
+            PositionOutcome::from_close(&close_ev(None, 0.0), None).result,
+            OutcomeResult::Breakeven
+        );
+    }
+
+    #[test]
+    fn outcome_from_close_joins_tracker_state() {
+        let now = Instant::now();
+        let state = PositionState {
+            first_seen: now,
+            last_seen: now,
+            samples: 3,
+            peak_pnl_ratio: 0.08,
+            last_action: GuidanceAction::Reduce,
+        };
+        let o = PositionOutcome::from_close(&close_ev(Some("p"), 300.0), Some(&state));
+        assert_eq!(o.samples, 3);
+        assert_eq!(o.peak_pnl_ratio, Some(0.08));
+        assert_eq!(o.last_guidance, Some(GuidanceAction::Reduce));
+        assert!(o.time_in_position_secs.is_some());
+        assert_eq!(o.result, OutcomeResult::Win); // +300 / 30_000 = +1%
+    }
+
+    #[tokio::test]
+    async fn tracker_finalize_removes_and_returns_state() {
+        let tracker = PositionTracker::new();
+        tracker
+            .observe(&ev(Some("p"), 3000.0), Guidance::reduce("take profit"))
+            .await;
+        let state = tracker.finalize("p").await.expect("position was tracked");
+        assert_eq!(state.samples, 1);
+        assert!((state.peak_pnl_ratio - 0.10).abs() < 1e-9);
+        assert_eq!(state.last_action, GuidanceAction::Reduce);
+        // Finalize consumes the entry.
+        assert_eq!(tracker.tracked().await, 0);
+        assert!(tracker.finalize("p").await.is_none());
     }
 }
