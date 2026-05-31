@@ -1,0 +1,52 @@
+name: Security audit
+
+# Scans the dependency tree for known RUSTSEC advisories (cargo-audit).
+#
+# Triggers:
+#   - on PRs / pushes that touch the dependency manifests (cheap, targeted)
+#   - weekly, so a freshly-published advisory against an unchanged tree is
+#     still caught
+#   - manually via the Actions tab
+on:
+  push:
+    branches: [main]
+    paths:
+      - "**/Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/security.yml"
+  pull_request:
+    paths:
+      - "**/Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/security.yml"
+  schedule:
+    - cron: "0 7 * * 1" # Mondays 07:00 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+  # Lets the action surface advisories as PR checks / annotations.
+  checks: write
+  issues: write
+
+jobs:
+  cargo-audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Non-blocking for now: the action reports advisories as annotations but
+    # a finding won't red-line main while the existing dependency backlog
+    # (e.g. the tonic 0.10/0.14 split via apalis — see TODO.md) is triaged.
+    # Flip to a hard gate by removing this once the tree is clean.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run cargo-audit
+        uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

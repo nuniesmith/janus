@@ -1,9 +1,37 @@
 # TODO Implementation Plan
 ## Spike Prototypes & Production Readiness
 
-**Last Updated:** 2024  
-**Status:** Active Development  
-**Priority:** High - Pre-Production Blockers Identified
+> ## ⚠️ SUPERSEDED — historical document, do not treat as current status
+>
+> This 2024 plan tracked gaps in the original `spike-prototypes/` and
+> `data-factory` layout. Most of its P0/P1 items have **since been
+> implemented** in the current tree — the "❌ NOT IMPLEMENTED" / "0%
+> complete" statuses below are **stale and inaccurate**. Verified
+> 2026-05-31:
+>
+> | Item (as listed below) | Actual status | Where |
+> |---|---|---|
+> | 1.1 Secrets (`*_FILE` Docker secrets) | ✅ done | `services/data/src/config.rs` (`read_secret`) |
+> | 1.2 Backfill distributed lock | ✅ done | `services/data/src/backfill/lock.rs` |
+> | 1.3 Circuit breaker | ✅ done | `crates/rate-limiter/src/circuit_breaker.rs`, wired in `services/data/src/connectors/circuit_breaker_integration.rs` + `backfill/executor.rs` |
+> | 1.4 Backfill throttle + disk monitor | ✅ done | `services/data/src/backfill/throttle.rs` |
+> | 1.5 Prometheus `/metrics` export | ✅ done | `services/data/src/metrics/prometheus_exporter.rs` |
+> | 2.4 Gap-detection dedup | ✅ done | `services/data/src/backfill/gap_integration.rs` |
+> | Rate limiter (token bucket, sliding window, per-exchange) | ✅ done | `crates/rate-limiter/src/lib.rs` |
+> | QuestDB ILP writer | ✅ done | `crates/questdb-writer/` |
+>
+> **Genuinely still open** (carried into the repo-root `TODO.md`, the
+> single source of truth): cross-exchange price validation, distributed
+> (multi-instance) rate-limiter state, OpenTelemetry/Jaeger tracing, and
+> Grafana dashboards / Alertmanager rules. See `/TODO.md` →
+> "P1 — Data service productionization" and "P2 — Observability".
+>
+> The detailed code templates below are kept for historical reference and
+> may still be useful when implementing the remaining items.
+
+**Last Updated:** 2024 (superseded 2026-05-31)
+**Status:** Historical — see `/TODO.md` for current status
+**Priority:** N/A (superseded)
 
 ---
 
