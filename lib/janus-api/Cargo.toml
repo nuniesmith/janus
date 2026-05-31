@@ -28,3 +28,4 @@ persistence = ["sqlx"]
 [dev-dependencies]
 http-body-util = "0.1"
 http = "1"
+async-trait.workspace = true
