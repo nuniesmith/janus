@@ -77,7 +77,7 @@ version = "0.0.2"
 edition = "2024"
 authors = ["nuniesmith"]
 license = "MIT"
-repository = "https://github.com/nuniesmith/fks"
+repository = "https://github.com/nuniesmith/janus"
 rust-version = "1.92.0"
 
 [workspace.dependencies]

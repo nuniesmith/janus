@@ -2,6 +2,15 @@
 name = "janus-core"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Shared types, configuration, and application state for the JANUS trading engine (signals, config, unified metrics, inter-module channels)."
+documentation = "https://docs.rs/janus-core"
+readme = "README.md"
+keywords = ["trading", "signals", "janus"]
+categories = ["finance"]
 
 [dependencies]
 tokio.workspace = true
