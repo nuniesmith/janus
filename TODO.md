@@ -6,6 +6,11 @@
 > rustcode / claw / RC-CRATES items live under `fks/src/rustcode/` and are
 > **not** tracked here.
 > **Last synced:** 2026-05-31
+>
+> 📋 **Consolidation plan:** [`CONSOLIDATION_PLAN.md`](CONSOLIDATION_PLAN.md) —
+> staged plan to consume `indicators-ta` (TA) + `exchange-apiws` (exchanges)
+> and retire the internal `jflow-indicators` / `jflow-exchanges` /
+> `jflow-bybit-client` duplicates.
 
 ---
 
