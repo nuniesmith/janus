@@ -2,6 +2,7 @@
 name = "jflow-training"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -19,9 +20,9 @@ vision = ["dep:vision"]
 
 [dependencies]
 # Internal crates
-common = { path = "../common", package = "jflow-common" }
-vision = { path = "../vision", optional = true, package = "jflow-vision" }
-logic = { path = "../logic", package = "jflow-logic" }
+common = { path = "../common", package = "jflow-common", version = "0.1.0" }
+vision = { path = "../vision", optional = true, package = "jflow-vision", version = "0.1.0" }
+logic = { path = "../logic", package = "jflow-logic", version = "0.1.0" }
 
 # ML Framework (Candle from HuggingFace)
 candle-core = { workspace = true }

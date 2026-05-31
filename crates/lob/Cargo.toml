@@ -2,6 +2,7 @@
 name = "jflow-lob"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -12,7 +13,7 @@ name = "janus_lob"
 
 [dependencies]
 # Core crates
-janus-core = { path = "../../lib/janus-core", package = "jflow-core" }
+janus-core = { path = "../../lib/janus-core", package = "jflow-core", version = "0.1.0" }
 
 # Data processing
 rust_decimal = { workspace = true }
