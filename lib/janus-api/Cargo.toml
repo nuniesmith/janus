@@ -2,6 +2,11 @@
 name = "jflow-api"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "REST/HTTP and WebSocket API layer for the unified JANUS trading service."
 
 [lib]
 name = "janus_api"

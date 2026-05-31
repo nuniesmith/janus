@@ -2,8 +2,11 @@
 name = "jflow-rate-limiter"
 version = "0.1.0"
 edition = "2024"
-authors = ["nuniesmith"]
-license = "MIT"
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Token-bucket and sliding-window rate limiters for JANUS exchange connectors."
 
 [lib]
 name = "janus_rate_limiter"

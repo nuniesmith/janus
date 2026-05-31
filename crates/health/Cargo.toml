@@ -2,6 +2,8 @@
 name = "jflow-health"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+description = "Production-grade health checks and Prometheus metrics for the JANUS trading engine."
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
