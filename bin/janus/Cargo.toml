@@ -2,6 +2,9 @@
 name = "janus"
 version.workspace = true
 edition.workspace = true
+# Deployed as a Docker image, not a library — and the bare `janus` name is taken
+# on crates.io (uw-labs). Never publish this crate.
+publish = false
 
 [[bin]]
 name = "janus"

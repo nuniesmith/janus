@@ -1,7 +1,10 @@
-# janus-core
+# jflow-core
 
 Shared types, configuration, and application state for the
 [JANUS](https://github.com/nuniesmith/janus) trading engine.
+
+> Published to crates.io as **`jflow-core`** (the `janus-core` name is owned by
+> an unrelated project). The library is imported as `jflow_core`.
 
 This is the foundational crate the rest of the JANUS workspace builds on. It
 deliberately depends on no other workspace crate, so it can be reused
@@ -33,13 +36,13 @@ standalone.
 
 ```toml
 [dependencies]
-janus-core = "0.1"
+jflow-core = "0.1"
 ```
 
 ```rust
-use janus_core::{Config, JanusState};
+use jflow_core::{Config, JanusState};
 
-# async fn run() -> janus_core::Result<()> {
+# async fn run() -> jflow_core::Result<()> {
 let config = Config::load()?;
 let state = JanusState::new(config).await?;
 # Ok(())

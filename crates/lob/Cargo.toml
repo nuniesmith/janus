@@ -9,7 +9,7 @@ description = "Limit Order Book simulator for JANUS backtesting and market micro
 
 [dependencies]
 # Core crates
-janus-core = { path = "../../lib/janus-core" }
+janus-core = { path = "../../lib/janus-core", package = "jflow-core" }
 
 # Data processing
 rust_decimal = { workspace = true }
