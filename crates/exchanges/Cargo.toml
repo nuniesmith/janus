@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Unified cryptocurrency exchange adapters for market-data ingestion in the JANUS trading engine."
+description = "Janus ingestion support: CNS metrics, exchange health monitoring, and price normalization. (Exchange connectivity now lives in the published exchange-apiws crate.)"
 authors.workspace = true
 license.workspace = true
 
@@ -47,12 +47,8 @@ url.workspace = true
 tokio-test = "0.4"
 
 [features]
-default = ["all-exchanges"]
-all-exchanges = ["binance", "bybit", "coinbase", "kraken", "okx", "kucoin"]
+default = []
+# CNS metrics reporting (pulls in jflow-cns). The per-exchange features were
+# removed along with the in-house adapters — exchange selection now happens in
+# the consumer via exchange-apiws's own features.
 cns-metrics = ["janus-cns"]
-binance = []
-bybit = []
-coinbase = []
-kraken = []
-okx = []
-kucoin = []

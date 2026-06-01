@@ -42,9 +42,10 @@
 > environment-sensitive, unrelated to this change).
 >
 > **Consolidation complete** — all four legs (TA, Bybit, ingestion; framework
-> reframed to the `bots/` layer) are done. A clean follow-up remains: the now-
-> dead adapter code (~2.6k LOC) inside `jflow-exchanges/src/adapters/` can be
-> deleted, leaving that crate as a CNS/health/normalizer utility.
+> reframed to the `bots/` layer) are done. The follow-up also shipped: the
+> ~2.6k LOC of now-dead in-house adapters (`jflow-exchanges/src/adapters/`)
+> were deleted, leaving `jflow-exchanges` as a CNS/health/normalizer utility
+> (and a stray dead `janus-exchanges` dep was dropped from `services/optimizer`).
 >
 > ---
 > _Historical (pre-0.5.0 gating notes):_

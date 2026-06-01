@@ -18,7 +18,6 @@ janus-core = { workspace = true }
 janus-optimizer = { workspace = true }
 janus-indicators = { workspace = true }
 janus-cns = { workspace = true }
-janus-exchanges = { workspace = true, features = ["kraken"] }
 
 # Async runtime
 tokio = { workspace = true, features = ["full", "signal"] }
