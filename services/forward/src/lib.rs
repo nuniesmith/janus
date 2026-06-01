@@ -40,6 +40,7 @@ pub mod affinity_recorder;
 pub mod api;
 pub mod brain_runtime;
 pub mod brain_wiring;
+pub mod bybit_compat;
 pub mod execution;
 pub mod features;
 pub mod indicators;
@@ -759,8 +760,8 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
         let sg = Arc::clone(&signal_generator);
         let state_for_metrics = state.clone();
         let client = janus_core::SessionMetricsClient::from_env();
-        let session_id = std::env::var("JANUS_SESSION_ID")
-            .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
+        let session_id =
+            std::env::var("JANUS_SESSION_ID").unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
         let push_secs = std::env::var("JANUS_AI_PUSH_SECS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
@@ -773,9 +774,7 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                 push_secs, session_id
             );
         } else {
-            tracing::debug!(
-                "Session metrics reporter disabled — JANUS_AI_URL not set"
-            );
+            tracing::debug!("Session metrics reporter disabled — JANUS_AI_URL not set");
         }
 
         tokio::spawn(async move {
