@@ -3,7 +3,7 @@
 //! # Status
 //!
 //! Market data ingestion is handled directly by the `EventLoop` via the
-//! Bybit/Kraken WebSocket connection (`janus_bybit_client::BybitWebSocket`).
+//! Bybit/Kraken WebSocket connection (`crate::bybit_compat::BybitWebSocket`).
 //! This actor is retained as a structural placeholder for a future refactor
 //! that decouples market data ingestion into its own actor with:
 //!

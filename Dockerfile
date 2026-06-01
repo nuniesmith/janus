@@ -12,7 +12,8 @@
 # Run (with the companion services from docker-compose.yml):
 #   docker compose up -d
 
-ARG RUST_VERSION=1.92.0
+# 1.94.1 is required by exchange-apiws 0.4.0 (MSRV), pulled in via janus-forward.
+ARG RUST_VERSION=1.94.1
 ARG DEBIAN_RELEASE=bookworm
 
 # ─────────────────────────────────────────────────────────────

@@ -17,7 +17,7 @@
 //! 8. Data Persistence to QuestDB
 
 use anyhow::Result;
-use janus_bybit_client::{
+use crate::bybit_compat::{
     BybitCredentials, BybitRestClient, BybitWebSocket, OrderRequest, OrderSide, OrderType,
     WsMessage,
 };
@@ -815,7 +815,7 @@ impl EventLoop {
     // Tick Processing
     // ========================================================================
 
-    async fn process_tick(&self, tick: janus_bybit_client::BybitTick) -> Result<()> {
+    async fn process_tick(&self, tick: crate::bybit_compat::BybitTick) -> Result<()> {
         let mid_price = (tick.bid_price + tick.ask_price) / 2.0;
         let symbol = tick.symbol.clone();
 

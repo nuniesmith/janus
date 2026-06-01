@@ -28,7 +28,6 @@ members = [
     "crates/strategies",
     "crates/risk",
     "crates/models",
-    "crates/bybit-client",
     "crates/questdb-writer",
     "crates/compliance",
     "crates/backtest",
@@ -108,7 +107,6 @@ janus-indicators = { package = "indicators-ta", version = "0.1.5" }
 janus-strategies = { path = "crates/strategies", package = "jflow-strategies", version = "0.1.0" }
 janus-risk = { path = "crates/risk", package = "jflow-risk", version = "0.1.0" }
 janus-models = { path = "crates/models", package = "jflow-models", version = "0.1.0" }
-janus-bybit-client = { path = "crates/bybit-client", package = "jflow-bybit-client", version = "0.1.0" }
 janus-questdb-writer = { path = "crates/questdb-writer", package = "jflow-questdb-writer", version = "0.1.0" }
 janus-compliance = { path = "crates/compliance", package = "jflow-compliance", version = "0.1.0" }
 janus-backtest = { path = "crates/backtest", package = "jflow-backtest", version = "0.1.0" }
