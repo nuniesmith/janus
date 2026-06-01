@@ -800,7 +800,7 @@ mod tests {
             close.push(c);
         }
 
-        DataFrame::new(vec![
+        DataFrame::new_infer_height(vec![
             Column::new("open".into(), open),
             Column::new("high".into(), high),
             Column::new("low".into(), low),
@@ -884,7 +884,7 @@ mod tests {
     #[test]
     fn test_insufficient_data() {
         let engine = BacktestEngine::default_engine();
-        let data = DataFrame::new(vec![
+        let data = DataFrame::new_infer_height(vec![
             Column::new("open".into(), vec![100.0; 50]),
             Column::new("high".into(), vec![101.0; 50]),
             Column::new("low".into(), vec![99.0; 50]),
@@ -899,7 +899,7 @@ mod tests {
     #[test]
     fn test_missing_columns() {
         let engine = BacktestEngine::default_engine();
-        let data = DataFrame::new(vec![
+        let data = DataFrame::new_infer_height(vec![
             Column::new("open".into(), vec![100.0; 200]),
             Column::new("close".into(), vec![100.5; 200]),
             // Missing high and low
