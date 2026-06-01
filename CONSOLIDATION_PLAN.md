@@ -15,10 +15,21 @@
 
 | Leg | Target crate | Verdict | Effort |
 |-----|--------------|---------|--------|
-| **TA** | [`indicators-ta`](https://crates.io/crates/indicators-ta) `0.1` | ✅ do it — `indicators-ta` is a strict **superset** of `jflow-indicators`; every symbol janus uses exists there under the same name | **Low** — import-path swaps |
-| **Bybit client** | [`exchange-apiws`](https://crates.io/crates/exchange-apiws) `0.1` | ⚠️ blocked — janus's `jflow-bybit-client` has signing + order entry that `exchange-apiws`'s Bybit (public-only) lacks | **Medium** — port signing/orders into `exchange-apiws` first |
-| **Exchange ingestion** | `exchange-apiws` `0.1` | ⚠️ partial — `exchange-apiws` lacks Coinbase + OKX (janus has them); Kraken overlaps | **Medium-high** — rebase janus's normalizer/CNS onto `exchange-apiws`, fill the Coinbase/OKX gap |
-| **Framework** | `rustrade` | ✋ **reframed — not janus's job** | n/a |
+| **TA** | [`indicators-ta`](https://crates.io/crates/indicators-ta) `0.1.5` | ✅ **DONE** — `jflow-indicators` retired; janus consumes published `indicators-ta` (superset). Cost the workspace a polars 0.44→0.53 bump. | shipped |
+| **Bybit client** | [`exchange-apiws`](https://crates.io/crates/exchange-apiws) `0.3.2` | ⚠️ **still blocked** — verified published 0.3.2 Bybit is **public-only** (no signing/order entry); janus's `jflow-bybit-client` is ahead | **Medium** — port signing/orders into `exchange-apiws` first |
+| **Exchange ingestion** | `exchange-apiws` `0.3.2` | ⚠️ **still partial** — verified 0.3.2 has **no Coinbase/OKX** (only binance/bybit/cryptocom/kraken/kucoin); janus needs Coinbase+OKX | **Medium-high** — add Coinbase/OKX to `exchange-apiws`, then rebase janus's normalizer/CNS |
+| **Framework** | `rustrade` | ✋ **reframed — not janus's job** (lives in fks-full `bots/`; `JanusBrain` already ties them together) | n/a |
+
+> **Phase 1 shipped** (branch `claude/phase1-indicators-ta`): the workspace
+> moved to **polars 0.53** to match `indicators-ta`, which required 0.53 API
+> fixes (`with_column(col.into_column())`, `DataFrame::new_infer_height`,
+> `LazyFrame::scan_parquet(PlRefPath)`). `cargo check --workspace` clean;
+> jflow-strategies (58) + jflow-backtest (310) tests pass.
+>
+> **Phases 2 & 3 confirmed still gated** against the now-published
+> `exchange-apiws 0.3.2` — see the table. They need new surface *in
+> exchange-apiws* (Bybit signing/orders; Coinbase + OKX connectors) before
+> janus can retire `jflow-bybit-client` / `jflow-exchanges`.
 
 > **On `rustrade`:** janus is a ~50-crate multi-service ML engine with its own
 > lifecycle (it dropped `rustrade-supervisor` at extraction). Forcing it into

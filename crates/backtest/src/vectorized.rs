@@ -311,7 +311,7 @@ impl VectorizedIndicators {
 
         let ema_series = ema.into_series().with_name(output.into());
         let mut result = self.df.clone();
-        result.with_column(ema_series)?;
+        result.with_column(ema_series.into_column())?;
         Ok(result)
     }
 
@@ -350,7 +350,7 @@ impl VectorizedIndicators {
 
         let sma_series = sma.into_series().with_name(output.into());
         let mut result = self.df.clone();
-        result.with_column(sma_series)?;
+        result.with_column(sma_series.into_column())?;
         Ok(result)
     }
 
@@ -445,7 +445,7 @@ impl VectorizedIndicators {
 
         let atr_series = atr.into_series().with_name(output.into());
         let mut result = self.df.clone();
-        result.with_column(atr_series)?;
+        result.with_column(atr_series.into_column())?;
         Ok(result)
     }
 
@@ -556,7 +556,7 @@ impl VectorizedIndicators {
 
         let rsi_series = Float64Chunked::from_slice_options(output.into(), &rsi).into_series();
         let mut result = self.df.clone();
-        result.with_column(rsi_series)?;
+        result.with_column(rsi_series.into_column())?;
         Ok(result)
     }
 
@@ -597,7 +597,7 @@ impl VectorizedIndicators {
 
         let macd_series =
             Float64Chunked::from_slice_options(output_macd.into(), &macd_values).into_series();
-        temp_df.with_column(macd_series)?;
+        temp_df.with_column(macd_series.into_column())?;
 
         // Calculate signal line (EMA of MACD)
         temp_df = VectorizedIndicators::new(temp_df)
@@ -624,7 +624,7 @@ impl VectorizedIndicators {
         let histogram_series =
             Float64Chunked::from_slice_options(output_histogram.into(), &histogram_values)
                 .into_series();
-        temp_df.with_column(histogram_series)?;
+        temp_df.with_column(histogram_series.into_column())?;
 
         // Drop temporary columns
         let result = temp_df.drop_many(["_temp_fast_ema", "_temp_slow_ema"]);
@@ -710,9 +710,9 @@ impl VectorizedIndicators {
             Float64Chunked::from_slice_options(output_lower.into(), &lower_values).into_series();
 
         let mut result = self.df.clone();
-        result.with_column(sma_series)?;
-        result.with_column(upper_series)?;
-        result.with_column(lower_series)?;
+        result.with_column(sma_series.into_column())?;
+        result.with_column(upper_series.into_column())?;
+        result.with_column(lower_series.into_column())?;
 
         Ok(result)
     }

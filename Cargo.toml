@@ -23,7 +23,8 @@ members = [
     "lib/janus-core",
     "lib/janus-api",
     # Existing crates
-    "crates/indicators",
+    # NOTE: `crates/indicators` (jflow-indicators) retired — consolidated onto
+    # the published `indicators-ta` crate (see [workspace.dependencies]).
     "crates/strategies",
     "crates/risk",
     "crates/models",
@@ -98,7 +99,12 @@ janus-ltn = { path = "crates/ltn", package = "jflow-ltn", version = "0.1.0" }
 janus-data = { path = "services/data" }
 janus-data-quality = { path = "crates/data-quality", package = "jflow-data-quality", version = "0.1.0" }
 janus-gap-detection = { path = "crates/gap-detection", package = "jflow-gap-detection", version = "0.1.0" }
-janus-indicators = { path = "crates/indicators", package = "jflow-indicators", version = "0.1.0" }
+# Consolidated onto the published `indicators-ta` crate (crates.io). The
+# dependency KEY stays `janus-indicators` so every `janus_indicators::…` import
+# and `janus-indicators.workspace = true` keeps working unchanged — Cargo's
+# package rename maps the key to the published crate (whose own lib is
+# `indicators`). The internal `crates/indicators` (jflow-indicators) is retired.
+janus-indicators = { package = "indicators-ta", version = "0.1.5" }
 janus-strategies = { path = "crates/strategies", package = "jflow-strategies", version = "0.1.0" }
 janus-risk = { path = "crates/risk", package = "jflow-risk", version = "0.1.0" }
 janus-models = { path = "crates/models", package = "jflow-models", version = "0.1.0" }
@@ -134,7 +140,7 @@ serde_json = "1.0.149"
 postcard = { version = "1.1", features = ["alloc"] }
 
 # Data Processing
-polars = { version = "0.44.2", features = ["lazy", "temporal", "parquet"] }
+polars = { version = "0.53.0", features = ["lazy", "temporal", "parquet"] }
 ndarray = "0.17.1"
 
 # HTTP & Network
@@ -145,7 +151,7 @@ tower-http = { version = "0.6.8", features = ["cors", "trace"] }
 hyper = "1.8.1"
 
 # Time & Date
-chrono = { version = "0.4.42", features = ["serde"] }
+chrono = { version = "0.4", features = ["serde"] }
 
 # Logging & Tracing
 tracing = "0.1.44"

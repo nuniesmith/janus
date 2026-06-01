@@ -466,10 +466,13 @@ async fn load_ohlc_data(
         if path.exists() {
             info!(path = %path.display(), "Loading OHLC data from file");
 
-            let df = LazyFrame::scan_parquet(&path, Default::default())
-                .context("Failed to scan parquet file")?
-                .collect()
-                .context("Failed to collect dataframe")?;
+            let df = LazyFrame::scan_parquet(
+                polars::prelude::PlRefPath::new(path.to_string_lossy().as_ref()),
+                Default::default(),
+            )
+            .context("Failed to scan parquet file")?
+            .collect()
+            .context("Failed to collect dataframe")?;
 
             // Filter to historical_days if timestamp column exists
             let column_names: Vec<&str> =
@@ -547,13 +550,15 @@ fn generate_synthetic_ohlc(asset: &str, days: u32) -> Result<DataFrame> {
         price = close;
     }
 
-    let df = DataFrame::new(vec![
-        Series::new("timestamp".into(), timestamps).into(),
-        Series::new("open".into(), opens).into(),
-        Series::new("high".into(), highs).into(),
-        Series::new("low".into(), lows).into(),
-        Series::new("close".into(), closes).into(),
-        Series::new("volume".into(), volumes).into(),
+    // polars 0.53: `DataFrame::new` is now `new(height, columns)`; the
+    // height-inferring 1-arg constructor is `new_infer_height`.
+    let df = DataFrame::new_infer_height(vec![
+        Series::new("timestamp".into(), timestamps).into_column(),
+        Series::new("open".into(), opens).into_column(),
+        Series::new("high".into(), highs).into_column(),
+        Series::new("low".into(), lows).into_column(),
+        Series::new("close".into(), closes).into_column(),
+        Series::new("volume".into(), volumes).into_column(),
     ])
     .context("Failed to create synthetic DataFrame")?;
 

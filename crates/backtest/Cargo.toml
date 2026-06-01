@@ -14,7 +14,7 @@ name = "janus_backtest"
 [dependencies]
 # Core crates
 janus-models = { path = "../models", package = "jflow-models", version = "0.1.0" }
-janus-indicators = { path = "../indicators", package = "jflow-indicators", version = "0.1.0" }
+janus-indicators = { workspace = true }
 janus-strategies = { path = "../strategies", package = "jflow-strategies", version = "0.1.0" }
 janus-risk = { path = "../risk", package = "jflow-risk", version = "0.1.0" }
 janus-compliance = { path = "../compliance", package = "jflow-compliance", version = "0.1.0" }

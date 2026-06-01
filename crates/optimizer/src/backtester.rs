@@ -373,10 +373,10 @@ impl BacktestEngine {
 
         // Add new columns to dataframe
         let mut df = data.clone();
-        df.with_column(Series::new("ema_fast".into(), ema_fast))?;
-        df.with_column(Series::new("ema_slow".into(), ema_slow))?;
-        df.with_column(Series::new("atr".into(), atr))?;
-        df.with_column(Series::new("ema_spread_pct".into(), ema_spread))?;
+        df.with_column(Series::new("ema_fast".into(), ema_fast).into_column())?;
+        df.with_column(Series::new("ema_slow".into(), ema_slow).into_column())?;
+        df.with_column(Series::new("atr".into(), atr).into_column())?;
+        df.with_column(Series::new("ema_spread_pct".into(), ema_spread).into_column())?;
 
         Ok(df)
     }
