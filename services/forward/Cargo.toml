@@ -56,7 +56,7 @@ fks-proto = { workspace = true }
 
 # Workspace crates
 common = { path = "../../crates/common", package = "jflow-common" }
-janus-indicators = { path = "../../crates/indicators", package = "jflow-indicators" }
+janus-indicators = { workspace = true }
 janus-strategies = { path = "../../crates/strategies", package = "jflow-strategies" }
 janus-regime = { path = "../../crates/regime", package = "jflow-regime" }
 logic = { path = "../../crates/logic", package = "jflow-logic" }

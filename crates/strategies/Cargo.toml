@@ -9,7 +9,7 @@ rust-version.workspace = true
 description = "Trading strategy implementations for the JANUS trading engine."
 
 [dependencies]
-janus-indicators = { path = "../indicators", package = "jflow-indicators", version = "0.1.0" }
+janus-indicators = { workspace = true }
 janus-models = { path = "../models", package = "jflow-models", version = "0.1.0" }
 janus-regime = { path = "../regime", package = "jflow-regime", version = "0.1.0" }
 serde.workspace = true
