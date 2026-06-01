@@ -22,6 +22,10 @@ janus-gap-detection = { path = "../../crates/gap-detection", package = "jflow-ga
 
 # New unified JANUS dependencies
 janus-core = { workspace = true }
+# Market-data parsing comes from the published exchange-apiws connectors;
+# jflow-exchanges is retained only for its janus-side CNS metrics + health
+# monitoring (its duplicate exchange adapters are no longer used).
+exchange-apiws = { version = "0.5", default-features = false, features = ["coinbase", "okx", "kraken"] }
 janus-exchanges = { path = "../../crates/exchanges", features = ["cns-metrics"], package = "jflow-exchanges" }
 janus-cns = { path = "../../crates/cns", package = "jflow-cns" }
 

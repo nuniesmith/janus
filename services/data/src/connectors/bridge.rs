@@ -1,52 +1,31 @@
-//! Bridge Adapters for JANUS Exchanges
+//! Bridge adapters wiring the published `exchange-apiws` connectors into the
+//! data service's legacy `ExchangeConnector` trait.
 //!
-//! This module provides bridge adapters that wrap the new `janus-exchanges` crate
-//! adapters to implement the legacy `ExchangeConnector` trait used by the data service.
+//! Each bridge (`CoinbaseBridge` / `KrakenBridge` / `OkxBridge`) wraps the
+//! corresponding `exchange_apiws` connector for market-data parsing, layers
+//! janus-side CNS metrics + health monitoring on top, and converts the unified
+//! `exchange_apiws::DataMessage` into the data service's local `DataMessage`.
 //!
-//! This allows a smooth migration path:
-//! 1. Use the new unified exchange adapters from `janus-exchanges`
-//! 2. Convert their `MarketDataEvent` output to legacy `DataMessage` format
-//! 3. Wire CNS metrics and health monitoring
-//! 4. Eventually migrate the entire pipeline to use `MarketDataEvent` end-to-end
-//!
-//! ## Architecture:
+//! Previously these wrapped `jflow-exchanges`'s in-house adapters; that
+//! duplicate parsing has been retired in favour of the published crate
+//! (`jflow-exchanges` is now used only for `CNSReporter` + `HealthChecker`).
 //!
 //! ```text
-//! ┌─────────────────────────────────────────────────────────────┐
-//! │                    WebSocketActor                            │
-//! │                (expects ExchangeConnector)                   │
-//! └───────────────────────┬─────────────────────────────────────┘
-//!                         │
-//!                         │ parse_message()
-//!                         ▼
-//! ┌─────────────────────────────────────────────────────────────┐
-//! │                   BridgeAdapter                              │
-//! │  (implements ExchangeConnector, wraps exchange adapter)      │
-//! ├─────────────────────────────────────────────────────────────┤
-//! │  • parse_message() → Vec<DataMessage>                       │
-//! │  • Record CNS metrics (messages, latency, errors)           │
-//! │  • Update health status                                      │
-//! └───────────────────────┬─────────────────────────────────────┘
-//!                         │
-//!                         ▼
-//! ┌─────────────────────────────────────────────────────────────┐
-//! │            janus-exchanges Adapter                           │
-//! │         (Coinbase, Kraken, OKX, etc.)                        │
-//! ├─────────────────────────────────────────────────────────────┤
-//! │  • parse_message() → Vec<MarketDataEvent>                   │
-//! └───────────────────────┬─────────────────────────────────────┘
-//!                         │
-//!                         ▼
-//! ┌─────────────────────────────────────────────────────────────┐
-//! │                  MarketDataEvent                             │
-//! │         (Trade, OrderBook, Ticker, etc.)                     │
-//! └─────────────────────────────────────────────────────────────┘
+//!   WebSocketActor ──(parse_message)──► <Exchange>Bridge
+//!                                          │  CNS metrics + health
+//!                                          ▼
+//!                          exchange_apiws::<Exchange>Connector
+//!                                          │  Vec<exchange_apiws::DataMessage>
+//!                                          ▼
+//!                          convert_ea_message → Vec<DataMessage>
 //! ```
 
 use anyhow::Result;
-use janus_core::{MarketDataEvent, Side, Symbol};
-use janus_exchanges::adapters::{
-    coinbase::CoinbaseAdapter, kraken::KrakenAdapter, okx::OkxAdapter,
+// Market-data parsing now comes from the published `exchange-apiws` connectors;
+// CNS metrics + health monitoring remain janus-side (jflow-exchanges).
+use exchange_apiws::actors::{DataMessage as EaDataMessage, ExchangeConnector as EaConnector};
+use exchange_apiws::{
+    CoinbaseChannel, CoinbaseConnector, KrakenConnector, OkxChannel, OkxConnector,
 };
 use janus_exchanges::{CNSReporter, HealthChecker};
 use std::sync::Arc;
@@ -57,9 +36,21 @@ use crate::actors::{
     CandleData, DataMessage, ExchangeConnector, TradeData, TradeSide, WebSocketConfig,
 };
 
+/// Format a janus symbol (e.g. `"btcusdt"`) into an exchange product id using
+/// `sep` between base and quote (`"-"` for Coinbase/OKX, `"/"` for Kraken).
+fn format_product(symbol: &str, sep: &str) -> String {
+    let lower = symbol.to_lowercase();
+    if let Some(base) = lower.strip_suffix("usdt") {
+        format!("{}{sep}USDT", base.to_uppercase())
+    } else if let Some(base) = lower.strip_suffix("usd") {
+        format!("{}{sep}USD", base.to_uppercase())
+    } else {
+        symbol.to_uppercase()
+    }
+}
+
 /// Bridge adapter for Coinbase
 pub struct CoinbaseBridge {
-    adapter: CoinbaseAdapter,
     cns_reporter: CNSReporter,
     health_checker: Arc<HealthChecker>,
     ws_url: String,
@@ -68,12 +59,10 @@ pub struct CoinbaseBridge {
 impl CoinbaseBridge {
     /// Create a new Coinbase bridge adapter
     pub fn new(ws_url: String) -> Self {
-        let adapter = CoinbaseAdapter::with_url(ws_url.clone());
         let cns_reporter = CNSReporter::new("coinbase");
         let health_checker = Arc::new(HealthChecker::new());
 
         Self {
-            adapter,
             cns_reporter,
             health_checker,
             ws_url,
@@ -84,6 +73,15 @@ impl CoinbaseBridge {
     pub fn health_checker(&self) -> Arc<HealthChecker> {
         Arc::clone(&self.health_checker)
     }
+
+    /// Build a published exchange-apiws connector for `product` (trades + ticker).
+    fn connector(&self, product: &str) -> CoinbaseConnector {
+        CoinbaseConnector::with_url(
+            self.ws_url.clone(),
+            vec![product.to_string()],
+            vec![CoinbaseChannel::MarketTrades],
+        )
+    }
 }
 
 impl ExchangeConnector for CoinbaseBridge {
@@ -92,28 +90,16 @@ impl ExchangeConnector for CoinbaseBridge {
     }
 
     fn build_ws_config(&self, symbol: &str) -> WebSocketConfig {
-        // Parse symbol (e.g., "btcusdt" -> "BTC-USD")
-        let formatted_symbol = if symbol.to_lowercase().ends_with("usdt") {
-            let base = symbol.strip_suffix("usdt").unwrap_or(symbol);
-            format!("{}-USDT", base.to_uppercase())
-        } else if symbol.to_lowercase().ends_with("usd") {
-            let base = symbol.strip_suffix("usd").unwrap_or(symbol);
-            format!("{}-USD", base.to_uppercase())
-        } else {
-            symbol.to_uppercase()
-        };
-
-        let symbol_obj =
-            Symbol::from_exchange_format(&formatted_symbol, janus_core::Exchange::Coinbase)
-                .unwrap_or_else(|| Symbol::new("BTC", "USD"));
-
-        let subscription_msg = self.adapter.default_subscribe(&symbol_obj);
+        let formatted_symbol = format_product(symbol, "-");
+        let subscription_msg = self
+            .connector(&formatted_symbol)
+            .subscription_message(&formatted_symbol);
 
         WebSocketConfig {
             url: self.ws_url.clone(),
             exchange: "coinbase".to_string(),
             symbol: formatted_symbol,
-            subscription_msg: Some(subscription_msg),
+            subscription_msg,
             ping_interval_secs: 30,
             reconnect_delay_secs: 5,
             max_reconnect_attempts: 10,
@@ -122,51 +108,14 @@ impl ExchangeConnector for CoinbaseBridge {
 
     fn parse_message(&self, raw: &str) -> Result<Vec<DataMessage>> {
         let start = Instant::now();
-
-        // Parse using the adapter
-        let events = match self.adapter.parse_message(raw) {
-            Ok(events) => {
-                if !events.is_empty() {
-                    self.cns_reporter
-                        .record_message("market_data", &format!("{} events", events.len()));
-                }
-                events
-            }
-            Err(e) => {
-                self.cns_reporter
-                    .record_parse_error(&format!("parse_error: {}", e));
-                // Note: health_checker methods are async, so we spawn a task
-                let hc = Arc::clone(&self.health_checker);
-                let err_msg = e.to_string();
-                tokio::spawn(async move {
-                    hc.record_error("coinbase", err_msg).await;
-                });
-                return Err(e);
-            }
-        };
-
-        // Record latency
-        let latency = start.elapsed();
-        self.cns_reporter.record_latency("market_data", latency);
-
-        // Convert MarketDataEvent -> DataMessage
-        let mut messages = Vec::new();
-
-        for event in events {
-            match convert_market_data_event(event, "coinbase") {
-                Some(msg) => messages.push(msg),
-                None => {
-                    debug!("Coinbase: Skipped unsupported event type");
-                }
-            }
-        }
-
-        // Update health (async, spawn a task)
-        let hc = Arc::clone(&self.health_checker);
-        tokio::spawn(async move {
-            hc.record_message("coinbase", None).await;
-        });
-
+        let messages = parse_via_connector(
+            &self.connector(""),
+            raw,
+            "coinbase",
+            &self.cns_reporter,
+            &self.health_checker,
+            start,
+        )?;
         Ok(messages)
     }
 
@@ -182,7 +131,6 @@ impl ExchangeConnector for CoinbaseBridge {
 
 /// Bridge adapter for Kraken
 pub struct KrakenBridge {
-    adapter: KrakenAdapter,
     cns_reporter: CNSReporter,
     health_checker: Arc<HealthChecker>,
     ws_url: String,
@@ -191,12 +139,10 @@ pub struct KrakenBridge {
 impl KrakenBridge {
     /// Create a new Kraken bridge adapter
     pub fn new(ws_url: String) -> Self {
-        let adapter = KrakenAdapter::with_url(ws_url.clone());
         let cns_reporter = CNSReporter::new("kraken");
         let health_checker = Arc::new(HealthChecker::new());
 
         Self {
-            adapter,
             cns_reporter,
             health_checker,
             ws_url,
@@ -207,6 +153,10 @@ impl KrakenBridge {
     pub fn health_checker(&self) -> Arc<HealthChecker> {
         Arc::clone(&self.health_checker)
     }
+
+    fn connector(&self) -> KrakenConnector {
+        KrakenConnector::with_url(self.ws_url.clone())
+    }
 }
 
 impl ExchangeConnector for KrakenBridge {
@@ -215,22 +165,9 @@ impl ExchangeConnector for KrakenBridge {
     }
 
     fn build_ws_config(&self, symbol: &str) -> WebSocketConfig {
-        // Parse symbol (e.g., "btcusdt" -> "BTC/USDT")
-        let formatted_symbol = if symbol.to_lowercase().ends_with("usdt") {
-            let base = symbol.strip_suffix("usdt").unwrap_or(symbol);
-            format!("{}/USDT", base.to_uppercase())
-        } else if symbol.to_lowercase().ends_with("usd") {
-            let base = symbol.strip_suffix("usd").unwrap_or(symbol);
-            format!("{}/USD", base.to_uppercase())
-        } else {
-            symbol.to_uppercase()
-        };
-
-        let symbol_obj =
-            Symbol::from_exchange_format(&formatted_symbol, janus_core::Exchange::Kraken)
-                .unwrap_or_else(|| Symbol::new("BTC", "USD"));
-
-        let subscription_msg = self.adapter.default_subscribe(&symbol_obj);
+        let formatted_symbol = format_product(symbol, "/");
+        // Kraken v2 subscribes by pair list via a static frame builder.
+        let subscription_msg = KrakenConnector::trade_subscription(&[&formatted_symbol]);
 
         WebSocketConfig {
             url: self.ws_url.clone(),
@@ -245,50 +182,14 @@ impl ExchangeConnector for KrakenBridge {
 
     fn parse_message(&self, raw: &str) -> Result<Vec<DataMessage>> {
         let start = Instant::now();
-
-        // Parse using the adapter
-        let events = match self.adapter.parse_message(raw) {
-            Ok(events) => {
-                if !events.is_empty() {
-                    self.cns_reporter
-                        .record_message("market_data", &format!("{} events", events.len()));
-                }
-                events
-            }
-            Err(e) => {
-                self.cns_reporter
-                    .record_parse_error(&format!("parse_error: {}", e));
-                let hc = Arc::clone(&self.health_checker);
-                let err_msg = e.to_string();
-                tokio::spawn(async move {
-                    hc.record_error("kraken", err_msg).await;
-                });
-                return Err(e);
-            }
-        };
-
-        // Record latency
-        let latency = start.elapsed();
-        self.cns_reporter.record_latency("market_data", latency);
-
-        // Convert MarketDataEvent -> DataMessage
-        let mut messages = Vec::new();
-
-        for event in events {
-            match convert_market_data_event(event, "kraken") {
-                Some(msg) => messages.push(msg),
-                None => {
-                    debug!("Kraken: Skipped unsupported event type");
-                }
-            }
-        }
-
-        // Update health (async, spawn a task)
-        let hc = Arc::clone(&self.health_checker);
-        tokio::spawn(async move {
-            hc.record_message("kraken", None).await;
-        });
-
+        let messages = parse_via_connector(
+            &self.connector(),
+            raw,
+            "kraken",
+            &self.cns_reporter,
+            &self.health_checker,
+            start,
+        )?;
         Ok(messages)
     }
 
@@ -304,7 +205,6 @@ impl ExchangeConnector for KrakenBridge {
 
 /// Bridge adapter for OKX
 pub struct OkxBridge {
-    adapter: OkxAdapter,
     cns_reporter: CNSReporter,
     health_checker: Arc<HealthChecker>,
     ws_url: String,
@@ -313,12 +213,10 @@ pub struct OkxBridge {
 impl OkxBridge {
     /// Create a new OKX bridge adapter
     pub fn new(ws_url: String) -> Self {
-        let adapter = OkxAdapter::with_url(ws_url.clone());
         let cns_reporter = CNSReporter::new("okx");
         let health_checker = Arc::new(HealthChecker::new());
 
         Self {
-            adapter,
             cns_reporter,
             health_checker,
             ws_url,
@@ -329,6 +227,10 @@ impl OkxBridge {
     pub fn health_checker(&self) -> Arc<HealthChecker> {
         Arc::clone(&self.health_checker)
     }
+
+    fn connector(&self, inst_id: &str) -> OkxConnector {
+        OkxConnector::with_url(self.ws_url.clone(), vec![OkxChannel::trades(inst_id)])
+    }
 }
 
 impl ExchangeConnector for OkxBridge {
@@ -337,27 +239,16 @@ impl ExchangeConnector for OkxBridge {
     }
 
     fn build_ws_config(&self, symbol: &str) -> WebSocketConfig {
-        // Parse symbol (e.g., "btcusdt" -> "BTC-USDT")
-        let formatted_symbol = if symbol.to_lowercase().ends_with("usdt") {
-            let base = symbol.strip_suffix("usdt").unwrap_or(symbol);
-            format!("{}-USDT", base.to_uppercase())
-        } else if symbol.to_lowercase().ends_with("usd") {
-            let base = symbol.strip_suffix("usd").unwrap_or(symbol);
-            format!("{}-USD", base.to_uppercase())
-        } else {
-            symbol.to_uppercase()
-        };
-
-        let symbol_obj = Symbol::from_exchange_format(&formatted_symbol, janus_core::Exchange::Okx)
-            .unwrap_or_else(|| Symbol::new("BTC", "USD"));
-
-        let subscription_msg = self.adapter.default_subscribe(&symbol_obj);
+        let formatted_symbol = format_product(symbol, "-");
+        let subscription_msg = self
+            .connector(&formatted_symbol)
+            .subscription_message(&formatted_symbol);
 
         WebSocketConfig {
             url: self.ws_url.clone(),
             exchange: "okx".to_string(),
             symbol: formatted_symbol,
-            subscription_msg: Some(subscription_msg),
+            subscription_msg,
             ping_interval_secs: 30,
             reconnect_delay_secs: 5,
             max_reconnect_attempts: 10,
@@ -366,50 +257,14 @@ impl ExchangeConnector for OkxBridge {
 
     fn parse_message(&self, raw: &str) -> Result<Vec<DataMessage>> {
         let start = Instant::now();
-
-        // Parse using the adapter
-        let events = match self.adapter.parse_message(raw) {
-            Ok(events) => {
-                if !events.is_empty() {
-                    self.cns_reporter
-                        .record_message("market_data", &format!("{} events", events.len()));
-                }
-                events
-            }
-            Err(e) => {
-                self.cns_reporter
-                    .record_parse_error(&format!("parse_error: {}", e));
-                let hc = Arc::clone(&self.health_checker);
-                let err_msg = e.to_string();
-                tokio::spawn(async move {
-                    hc.record_error("okx", err_msg).await;
-                });
-                return Err(e);
-            }
-        };
-
-        // Record latency
-        let latency = start.elapsed();
-        self.cns_reporter.record_latency("market_data", latency);
-
-        // Convert MarketDataEvent -> DataMessage
-        let mut messages = Vec::new();
-
-        for event in events {
-            match convert_market_data_event(event, "okx") {
-                Some(msg) => messages.push(msg),
-                None => {
-                    debug!("OKX: Skipped unsupported event type");
-                }
-            }
-        }
-
-        // Update health (async, spawn a task)
-        let hc = Arc::clone(&self.health_checker);
-        tokio::spawn(async move {
-            hc.record_message("okx", None).await;
-        });
-
+        let messages = parse_via_connector(
+            &self.connector(""),
+            raw,
+            "okx",
+            &self.cns_reporter,
+            &self.health_checker,
+            start,
+        )?;
         Ok(messages)
     }
 
@@ -423,67 +278,100 @@ impl ExchangeConnector for OkxBridge {
     }
 }
 
-/// Convert MarketDataEvent to legacy DataMessage
-fn convert_market_data_event(event: MarketDataEvent, exchange: &str) -> Option<DataMessage> {
-    match event {
-        MarketDataEvent::Trade(trade) => {
-            let side = match trade.side {
-                Side::Buy => TradeSide::Buy,
-                Side::Sell => TradeSide::Sell,
-            };
+/// Shared parse path: run an exchange-apiws connector's `parse_message`, record
+/// CNS metrics + health, and convert the unified `DataMessage` into janus's
+/// local `DataMessage`. Used by all three bridges.
+fn parse_via_connector(
+    connector: &dyn EaConnector,
+    raw: &str,
+    exchange: &str,
+    cns_reporter: &CNSReporter,
+    health_checker: &Arc<HealthChecker>,
+    start: Instant,
+) -> Result<Vec<DataMessage>> {
+    let events = match connector.parse_message(raw) {
+        Ok(events) => {
+            if !events.is_empty() {
+                cns_reporter.record_message("market_data", &format!("{} events", events.len()));
+            }
+            events
+        }
+        Err(e) => {
+            cns_reporter.record_parse_error(&format!("parse_error: {e}"));
+            let hc = Arc::clone(health_checker);
+            let ex = exchange.to_string();
+            let err_msg = e.to_string();
+            tokio::spawn(async move {
+                hc.record_error(&ex, err_msg).await;
+            });
+            return Err(anyhow::anyhow!("{e}"));
+        }
+    };
 
+    cns_reporter.record_latency("market_data", start.elapsed());
+
+    let mut messages = Vec::new();
+    for event in events {
+        match convert_ea_message(event, exchange) {
+            Some(msg) => messages.push(msg),
+            None => debug!("{exchange}: skipped unsupported event type"),
+        }
+    }
+
+    let hc = Arc::clone(health_checker);
+    let ex = exchange.to_string();
+    tokio::spawn(async move {
+        hc.record_message(&ex, None).await;
+    });
+
+    Ok(messages)
+}
+
+/// Convert an exchange-apiws `DataMessage` into janus's legacy `DataMessage`.
+/// Trades + candles map across; ticker / order-book frames are dropped (the
+/// legacy format the data pipeline consumes doesn't carry them — same as the
+/// previous adapter behaviour).
+fn convert_ea_message(event: EaDataMessage, exchange: &str) -> Option<DataMessage> {
+    match event {
+        EaDataMessage::Trade(trade) => {
+            let side = match trade.side {
+                exchange_apiws::actors::TradeSide::Buy => TradeSide::Buy,
+                exchange_apiws::actors::TradeSide::Sell => TradeSide::Sell,
+            };
             Some(DataMessage::Trade(TradeData {
-                symbol: trade.symbol.to_string(),
+                symbol: trade.symbol,
                 exchange: exchange.to_string(),
                 side,
-                price: trade.price.to_string().parse().unwrap_or(0.0),
-                amount: trade.quantity.to_string().parse().unwrap_or(0.0),
-                exchange_ts: trade.timestamp / 1000, // Convert µs to ms
-                receipt_ts: chrono::Utc::now().timestamp_millis(),
+                price: trade.price,
+                amount: trade.amount,
+                exchange_ts: trade.exchange_ts,
+                receipt_ts: trade.receipt_ts,
                 trade_id: trade.trade_id,
             }))
         }
-
-        MarketDataEvent::Kline(kline) => {
-            // Only emit closed candles
-            if !kline.is_closed {
+        EaDataMessage::Candle(c) => {
+            // Match the legacy behaviour: only emit fully-closed bars.
+            if !c.is_closed {
                 return None;
             }
-
             Some(DataMessage::Candle(CandleData {
-                symbol: kline.symbol.to_string(),
+                symbol: c.symbol,
                 exchange: exchange.to_string(),
-                open_time: kline.open_time / 1000, // Convert µs to ms
-                close_time: kline.close_time / 1000,
-                open: kline.open.to_string().parse().unwrap_or(0.0),
-                high: kline.high.to_string().parse().unwrap_or(0.0),
-                low: kline.low.to_string().parse().unwrap_or(0.0),
-                close: kline.close.to_string().parse().unwrap_or(0.0),
-                volume: kline.volume.to_string().parse().unwrap_or(0.0),
-                interval: kline.interval.clone(),
+                // exchange-apiws candles carry only the open timestamp; the
+                // legacy close_time is approximated by the receipt time.
+                open_time: c.open_ts,
+                close_time: c.receipt_ts,
+                open: c.open,
+                high: c.high,
+                low: c.low,
+                close: c.close,
+                volume: c.volume,
+                interval: c.interval,
             }))
         }
-
-        MarketDataEvent::OrderBook(_) => {
-            // Order book events are not supported in the legacy DataMessage format
-            // These would be handled separately in a production system
-            None
-        }
-
-        MarketDataEvent::Ticker(_) => {
-            // Ticker events are not supported in the legacy DataMessage format
-            None
-        }
-
-        MarketDataEvent::Liquidation(_) => {
-            // Liquidation events are not supported in the legacy DataMessage format
-            None
-        }
-
-        MarketDataEvent::FundingRate(_) => {
-            // Funding rate events are not supported in the legacy DataMessage format
-            None
-        }
+        // Ticker / OrderBook / FundingRate / private events are not part of the
+        // legacy DataMessage surface the data pipeline consumes.
+        _ => None,
     }
 }
 

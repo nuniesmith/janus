@@ -1,9 +1,9 @@
 //! Integration tests for bridge adapters
 //!
 //! These tests verify that the bridge adapters correctly:
-//! - Wrap exchange adapters from janus-exchanges
+//! - Wrap the published exchange-apiws connectors
 //! - Implement the ExchangeConnector trait
-//! - Convert MarketDataEvent to DataMessage
+//! - Convert exchange_apiws::DataMessage to the local DataMessage
 //! - Record CNS metrics (messages, errors, latency)
 //! - Track health status
 //! - Build WebSocket configurations correctly
@@ -37,14 +37,15 @@ fn test_coinbase_bridge_builds_ws_config() {
 async fn test_coinbase_bridge_parses_trade_message() {
     let bridge = CoinbaseBridge::new("wss://test.coinbase.com".to_string());
 
-    // Sample Coinbase trade message
+    // Sample Coinbase Advanced Trade `market_trades` message (the channel the
+    // published exchange-apiws connector subscribes to).
     let raw_message = r#"{
-        "channel": "matches",
+        "channel": "market_trades",
         "client_id": "",
         "timestamp": "2024-01-01T00:00:00.000000Z",
         "sequence_num": 0,
         "events": [{
-            "type": "match",
+            "type": "update",
             "trades": [{
                 "trade_id": "12345",
                 "product_id": "BTC-USD",
@@ -64,11 +65,12 @@ async fn test_coinbase_bridge_parses_trade_message() {
 
     match &messages[0] {
         DataMessage::Trade(trade) => {
-            // Symbol is normalized to standard format (BTC/USD) from exchange format (BTC-USD)
-            assert_eq!(trade.symbol, "BTC/USD");
+            // The published connector surfaces the exchange product id as-is
+            // (BTC-USD); normalization is no longer done in the ingestion path.
+            assert_eq!(trade.symbol, "BTC-USD");
             assert_eq!(trade.exchange, "coinbase");
-            assert_eq!(trade.price, 50000.0);
-            assert_eq!(trade.amount, 0.001);
+            assert!((trade.price - 50000.0).abs() < 1e-9);
+            assert!((trade.amount - 0.001).abs() < 1e-9);
         }
         _ => panic!("Expected Trade message"),
     }
