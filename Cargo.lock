@@ -5903,7 +5903,6 @@ dependencies = [
  "indicators-ta",
  "jflow-cns",
  "jflow-core",
- "jflow-exchanges",
  "jflow-optimizer",
  "mockito",
  "parking_lot",
