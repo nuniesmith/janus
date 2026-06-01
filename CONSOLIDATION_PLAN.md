@@ -17,7 +17,7 @@
 |-----|--------------|---------|--------|
 | **TA** | [`indicators-ta`](https://crates.io/crates/indicators-ta) `0.1.5` | ✅ **DONE** — `jflow-indicators` retired; janus consumes published `indicators-ta` (superset). Cost the workspace a polars 0.44→0.53 bump. | shipped |
 | **Bybit client** | [`exchange-apiws`](https://crates.io/crates/exchange-apiws) `0.4.0` | ✅ **DONE** — `jflow-bybit-client` retired; forward consumes 0.4.0's signed Bybit via a thin `bybit_compat` adapter (REST order entry + WS feed) | shipped |
-| **Exchange ingestion** | `exchange-apiws` `0.3.2` | ⚠️ **still partial** — verified 0.3.2 has **no Coinbase/OKX** (only binance/bybit/cryptocom/kraken/kucoin); janus needs Coinbase+OKX | **Medium-high** — add Coinbase/OKX to `exchange-apiws`, then rebase janus's normalizer/CNS |
+| **Exchange ingestion** | `exchange-apiws` `0.5.0` | ✅ **DONE** — `services/data` bridges now wrap the published Coinbase/Kraken/OKX connectors; the duplicate `jflow-exchanges` adapters are out of the data path. CNS metrics + health stay janus-side. | shipped |
 | **Framework** | `rustrade` | ✋ **reframed — not janus's job** (lives in fks-full `bots/`; `JanusBrain` already ties them together) | n/a |
 
 > **Phase 1 shipped** (branch `claude/phase1-indicators-ta`): the workspace
@@ -33,7 +33,21 @@
 > `BybitPrivateClient` + `BybitConnector`/`run_feed`, so the event loop is
 > untouched. `cargo test -p janus-forward` → 540 passing.
 >
-> **Phase 3 (ingestion) still gated** against the now-published
+> **Phase 3 shipped** (branch `claude/phase3-exchanges`): exchange-apiws 0.5.0
+> added the Coinbase + OKX connectors, so `services/data`'s bridges now wrap the
+> published Coinbase/Kraken/OKX connectors instead of `jflow-exchanges`'s
+> adapters. CNS metrics + health monitoring remain janus-side (the only
+> `jflow-exchanges` surface still imported). `cargo build -p janus-data` clean;
+> 170 lib tests pass (2 pre-existing backfill-throttle failures are
+> environment-sensitive, unrelated to this change).
+>
+> **Consolidation complete** — all four legs (TA, Bybit, ingestion; framework
+> reframed to the `bots/` layer) are done. A clean follow-up remains: the now-
+> dead adapter code (~2.6k LOC) inside `jflow-exchanges/src/adapters/` can be
+> deleted, leaving that crate as a CNS/health/normalizer utility.
+>
+> ---
+> _Historical (pre-0.5.0 gating notes):_
 > `exchange-apiws 0.3.2` — see the table. They need new surface *in
 > exchange-apiws* (Bybit signing/orders; Coinbase + OKX connectors) before
 > janus can retire `jflow-bybit-client` / `jflow-exchanges`.
