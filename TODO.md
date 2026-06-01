@@ -34,6 +34,67 @@
 
 ---
 
+## P0 — Brain: wire what's built into the live path  ◀ THE HEADLINE GOAL
+
+> **Goal:** janus decides *what to trade and how much* across asset classes
+> under explicit risk rules. A 2026-06 cross-repo survey found that **much of
+> this already exists on disk but is not in the running binary**. See
+> `fks-full/docs/MULTI_ASSET_BRAIN_ROADMAP.md` (Track 3 + 5). These are the
+> highest-value items and are **not** otherwise tracked below.
+
+### The orphaned sophisticated pipeline
+- [ ] **`services/forward/src/event_loop.rs` (4,114 LOC) is compiled out** — there
+      is no `mod event_loop` (nor `mod actors`) in `services/forward/src/lib.rs`.
+      It holds the rich single-symbol pipeline: the 5-strategy suite
+      (EMAFlip/MeanReversion/Squeeze/VWAP/ORB from `crates/strategies`), **inline
+      `PropFirmValidator` on every entry**, and regime gating. The **live** path
+      is the simpler multi-symbol `tokio::spawn` block in `lib.rs` (~L920–1264).
+      **Decide:** re-wire `event_loop.rs` (add `mod` + entry point), or **port its
+      capabilities into the live `lib.rs` loop**. Document the decision; the
+      integration tests currently *mirror* its logic rather than call it.
+
+### Risk enforcement is REST-on-demand, not inline
+- [ ] **Apply risk on each live signal.** `RiskManager::apply_risk_management`
+      (`services/forward/src/risk/`) and `PropFirmValidator`
+      (`crates/models/src/prop_firm.rs`) are real and exposed via REST
+      (`/api/v1/risk/*`) for Ruby to consult, but the **live kline loop does not
+      call them inline** — only the dead `event_loop.rs` does. Wire one pre-trade
+      validation pass into the live submit path.
+- [ ] **Unify the three duplicate prop-firm / risk engines** into one:
+      `crates/models::prop_firm` (`PropFirmValidator`/`HyroTraderRules`),
+      `crates/compliance` (`ComplianceSheriff`), `crates/logic` (`ComprehensiveRiskEngine`/
+      `PropFirmType`). Pick the canonical one, delete the others. (Also: the rules
+      are HyroTrader-specific + hardcoded — generalize across prop firms.)
+
+### The regime detector is built but under-fed
+- [ ] **Feed the regime detector live.** `RegimeManager` (`services/forward/src/
+      regime.rs`, wrapping `crates/regime`'s indicator+HMM+ensemble) is **never
+      `update()`d** in the live loop. Call it per candle.
+- [ ] **Emit `regime` + `fear` into `signal.metadata`** (JFLOW-C producer gap).
+      Today guidance reads them opportunistically; nothing emits them, so
+      `current_regime`/`current_threat` stay `None` and position guidance is
+      effectively **P&L-only**. Wire the real regime detector + amygdala fear
+      network output into emitted signals. *(Already listed under JFLOW-C below;
+      restated here as it's the gate for regime-adaptive trading.)*
+
+### The brain itself is rule-based; ML/neuromorphic are unwired
+- [ ] **Decide the ML story.** ONNX inference (`services/forward/src/inference.rs`,
+      tract-onnx) is real but `enable_ml_inference` defaults **false** and isn't on
+      the live path; `crates/ml` (DQN/LSTM, candle) trains in `services/backward`
+      but its models aren't loaded into live forward; the 251K-LOC
+      `neuromorphic/` stack is **entirely disconnected** (no service depends on it;
+      the two apparent importers are comment-only / a local health shim). Either
+      wire a path (ONNX fusion is the cheapest) or formally mark these
+      research-only until the 30-day validation gate (P3) passes.
+
+### Multi-asset breadth
+- [ ] **Futures + equities asset classes.** `crates/optimizer/src/asset.rs`
+      `AssetCategory` + `AssetRegistry::with_kraken_defaults()` cover **crypto +
+      forex only**. Add futures/equities variants with class params (min spread,
+      hold time, ATR mult, TP range), liquidity tiers, and venues.
+
+---
+
 ## P0 — Codebase health & correctness
 
 - [ ] **`#[allow(dead_code)]` audit (~312 annotations: 143 services / 107 neuromorphic / 60 crates / 2 bin).**
