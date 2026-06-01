@@ -16,7 +16,7 @@
 | Leg | Target crate | Verdict | Effort |
 |-----|--------------|---------|--------|
 | **TA** | [`indicators-ta`](https://crates.io/crates/indicators-ta) `0.1.5` | ✅ **DONE** — `jflow-indicators` retired; janus consumes published `indicators-ta` (superset). Cost the workspace a polars 0.44→0.53 bump. | shipped |
-| **Bybit client** | [`exchange-apiws`](https://crates.io/crates/exchange-apiws) `0.3.2` | ⚠️ **still blocked** — verified published 0.3.2 Bybit is **public-only** (no signing/order entry); janus's `jflow-bybit-client` is ahead | **Medium** — port signing/orders into `exchange-apiws` first |
+| **Bybit client** | [`exchange-apiws`](https://crates.io/crates/exchange-apiws) `0.4.0` | ✅ **DONE** — `jflow-bybit-client` retired; forward consumes 0.4.0's signed Bybit via a thin `bybit_compat` adapter (REST order entry + WS feed) | shipped |
 | **Exchange ingestion** | `exchange-apiws` `0.3.2` | ⚠️ **still partial** — verified 0.3.2 has **no Coinbase/OKX** (only binance/bybit/cryptocom/kraken/kucoin); janus needs Coinbase+OKX | **Medium-high** — add Coinbase/OKX to `exchange-apiws`, then rebase janus's normalizer/CNS |
 | **Framework** | `rustrade` | ✋ **reframed — not janus's job** (lives in fks-full `bots/`; `JanusBrain` already ties them together) | n/a |
 
@@ -26,7 +26,14 @@
 > `LazyFrame::scan_parquet(PlRefPath)`). `cargo check --workspace` clean;
 > jflow-strategies (58) + jflow-backtest (310) tests pass.
 >
-> **Phases 2 & 3 confirmed still gated** against the now-published
+> **Phase 2 shipped** (branch `claude/phase2-bybit`): exchange-apiws 0.4.0 added
+> the signed Bybit surface, so `jflow-bybit-client` is retired. A
+> `services/forward/src/bybit_compat.rs` adapter re-exposes the old API
+> (`BybitTick`/`WsMessage`/`BybitRestClient`/`OrderRequest`/…) on top of
+> `BybitPrivateClient` + `BybitConnector`/`run_feed`, so the event loop is
+> untouched. `cargo test -p janus-forward` → 540 passing.
+>
+> **Phase 3 (ingestion) still gated** against the now-published
 > `exchange-apiws 0.3.2` — see the table. They need new surface *in
 > exchange-apiws* (Bybit signing/orders; Coinbase + OKX connectors) before
 > janus can retire `jflow-bybit-client` / `jflow-exchanges`.
