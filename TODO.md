@@ -59,19 +59,23 @@
       and one source of truth. Port in safe, independently-shippable stages, each
       additive and gated behind config so a half-finished port never degrades the
       running service:
-        1. **Feed `RegimeManager` live** — call `on_tick_price` per candle in the
-           loop, stash the latest `RoutedSignal` per symbol (lowest-risk; unblocks 3).
-        2. **`PropFirmValidator` inline** — one pre-trade validation pass on the
-           submit path (already proven in `event_loop.rs`).
-        3. **Emit `regime` + `fear` into `signal.metadata`** at signal creation
-           (`signal/mod.rs` ~L372, beside `"strategy"`) — closes the JFLOW-C
-           producer gap so guidance stops being P&L-only.
-        4. **`RiskManager::apply_risk_management` inline** — needs live
-           `PortfolioState` upkeep (now fed by the new `/positions/close` endpoint).
-        5. **Retire `event_loop.rs`** and **unify the three prop-firm/risk engines**
-           (`models::prop_firm` canonical; delete `compliance` + `logic` dupes).
+        1. ✅ **Feed `RegimeManager` live** (PR #41).
+        2. ✅ **`PropFirmValidator` inline** — advisory pre-trade pass (PR #43).
+        3. ✅ **Emit `regime` + `fear` into `signal.metadata`** (PRs #41/#42).
+        4. ✅ **`RiskManager::apply_risk_management` inline** — advisory, against the
+           live `PortfolioState` (PR #44).
+        5. ⏳ **Port the strategy suite, then retire `event_loop.rs`; unify the risk
+           engines.** Per the owner's call (2026-06-02): **port the 5-strategy suite
+           first** so no capability is lost before deleting `event_loop.rs`; and make
+           **`logic::ComprehensiveRiskEngine` the canonical** risk engine (re-wire the
+           live path to it; delete `compliance::ComplianceSheriff` +
+           `models::prop_firm::PropFirmValidator`). Strategy port **begun**:
+           `EMAFlipStrategy` is wired into the live loop (per-symbol state, replacing the
+           inline `ema_cross` approximation). Remaining strategies: MeanReversion,
+           SqueezeBreakout, VwapScalper, Orb (+ EmaRibbon / TrendPullback / MomentumSurge /
+           MultiTfTrend if desired). Each is a focused follow-up PR.
       Integration tests currently *mirror* `event_loop.rs`'s logic rather than call
-      it; as each stage ports, point the matching test at the live path.
+      it; as each strategy ports, point the matching test at the live path.
 
 ### Risk enforcement is REST-on-demand, not inline
 - [x] **Apply risk on each live signal.** **`PropFirmValidator` (Stage 2)** + **`RiskManager`
