@@ -923,6 +923,13 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
             // Per-symbol indicator analyzers, keyed by "SYMBOL/QUOTE:interval"
             let mut analyzers: HashMap<String, IndicatorAnalyzer> = HashMap::new();
 
+            // Live market-regime detector (Track 3). Task-owned, so it needs no
+            // lock; it's fed each closed candle below and its per-symbol regime is
+            // emitted into every signal's metadata, closing the producer gap that
+            // left downstream guidance regime-blind (P&L-only).
+            let mut regime_manager =
+                crate::regime::RegimeManager::new(crate::regime::RegimeManagerConfig::default());
+
             let mut klines_processed: u64 = 0;
             let mut signals_generated: u64 = 0;
             let mut trades_skipped: u64 = 0;
@@ -1007,6 +1014,10 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                                     warn!("[{}] Failed to update indicators: {}", analyzer_key, e);
                                     continue;
                                 }
+
+                                // Feed the same candle to the live regime detector so its
+                                // per-symbol regime stays current for the metadata below.
+                                let _ = regime_manager.on_candle(&symbol_str, high, low, close);
 
                                 klines_processed += 1;
 
@@ -1179,6 +1190,10 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                                 } else { signal };
                                 let signal = if let Some(ema_s) = analysis.ema_slow {
                                     signal.with_metadata("ema_slow", format!("{:.4}", ema_s))
+                                } else { signal };
+                                // Emit the live market regime (Track 3 producer gap).
+                                let signal = if let Some(regime) = regime_manager.current_regime(&symbol_str) {
+                                    signal.with_metadata("regime", regime.to_string())
                                 } else { signal };
 
                                 // Publish to signal bus
