@@ -87,15 +87,17 @@
       are HyroTrader-specific + hardcoded — generalize across prop firms.)
 
 ### The regime detector is built but under-fed
-- [ ] **Feed the regime detector live.** `RegimeManager` (`services/forward/src/
-      regime.rs`, wrapping `crates/regime`'s indicator+HMM+ensemble) is **never
-      `update()`d** in the live loop. Call it per candle.
-- [ ] **Emit `regime` + `fear` into `signal.metadata`** (JFLOW-C producer gap).
-      Today guidance reads them opportunistically; nothing emits them, so
-      `current_regime`/`current_threat` stay `None` and position guidance is
-      effectively **P&L-only**. Wire the real regime detector + amygdala fear
-      network output into emitted signals. *(Already listed under JFLOW-C below;
-      restated here as it's the gate for regime-adaptive trading.)*
+- [x] **Feed the regime detector live.** `RegimeManager` (`services/forward/src/
+      regime.rs`) is now instantiated (task-owned) in the live signal loop and fed
+      every closed candle via `on_candle(symbol, high, low, close)` — Stage 1 of the
+      event_loop port above.
+- [~] **Emit `regime` + `fear` into `signal.metadata`** (JFLOW-C producer gap).
+      **`regime` done:** the live loop reads `current_regime(symbol)` and stamps it
+      into each emitted signal's metadata, and `submit_signal_to_execution`
+      propagates it onto the execution-path `TradingSignal`, so guidance is no longer
+      regime-blind. **`fear` still TODO:** wire the amygdala threat output
+      (`brain_wiring.rs`) into the metadata too (a separate component from
+      `RegimeManager`).
 
 ### The brain itself is rule-based; ML/neuromorphic are unwired
 - [ ] **Decide the ML story.** ONNX inference (`services/forward/src/inference.rs`,
