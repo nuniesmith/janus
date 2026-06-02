@@ -178,6 +178,15 @@ impl PortfolioState {
         self.positions.insert(symbol, position);
     }
 
+    /// Record a closed trade: drop the open position and fold its realised PnL
+    /// into the running daily PnL (the figure the risk engine checks against the
+    /// daily-loss limit). Returns `true` if a position was open for `symbol`.
+    pub fn record_close(&mut self, symbol: &str, realized_pnl: f64) -> bool {
+        let had_position = self.positions.remove(symbol).is_some();
+        self.daily_pnl += realized_pnl;
+        had_position
+    }
+
     pub fn total_exposure(&self) -> f64 {
         self.positions.values().map(|p| p.position_value()).sum()
     }
@@ -544,6 +553,31 @@ mod tests {
         assert_eq!(portfolio.position_count(), 1);
         assert_eq!(portfolio.total_exposure(), 5000.0);
         assert_eq!(portfolio.exposure_for_symbol("BTC/USD"), 5000.0);
+    }
+
+    #[test]
+    fn test_record_close_drops_position_and_folds_pnl() {
+        let mut portfolio = PortfolioState::new(10000.0);
+        portfolio.add_position(
+            "BTC/USD".to_string(),
+            Position {
+                symbol: "BTC/USD".to_string(),
+                entry_price: 50000.0,
+                quantity: 0.1,
+                side: PositionSide::Long,
+                stop_loss: None,
+                take_profit: None,
+            },
+        );
+
+        // Closing a tracked position returns true and folds PnL into daily_pnl.
+        assert!(portfolio.record_close("BTC/USD", 250.0));
+        assert_eq!(portfolio.position_count(), 0);
+        assert!((portfolio.daily_pnl - 250.0).abs() < 1e-9);
+
+        // Closing an unknown symbol still records the PnL but returns false.
+        assert!(!portfolio.record_close("ETH/USD", -75.0));
+        assert!((portfolio.daily_pnl - 175.0).abs() < 1e-9);
     }
 
     #[test]
