@@ -8,6 +8,7 @@
 //! - `PUT /api/v1/risk/config` - Update risk configuration
 //! - `GET /api/v1/risk/portfolio` - Get portfolio state
 //! - `POST /api/v1/risk/portfolio/positions` - Add position to portfolio
+//! - `POST /api/v1/risk/portfolio/positions/close` - Record a closed trade (realised PnL)
 //! - `DELETE /api/v1/risk/portfolio/positions/{symbol}` - Remove position
 //! - `GET /api/v1/risk/metrics` - Get risk metrics snapshot
 //! - `GET /api/v1/risk/performance` - Get performance metrics
@@ -61,6 +62,10 @@ impl RiskApiState {
             .route(
                 "/api/v1/risk/portfolio/positions",
                 post(add_position_handler),
+            )
+            .route(
+                "/api/v1/risk/portfolio/positions/close",
+                post(close_position_handler),
             )
             .route(
                 "/api/v1/risk/portfolio/positions/{symbol}",
@@ -383,6 +388,27 @@ pub struct AddPositionRequest {
     pub position: PositionDto,
 }
 
+/// Close (outcome) report for a position — sent by a bot when a trade closes so
+/// the portfolio sees realised PnL, not just open exposure. Only `symbol` and
+/// `realized_pnl` are required; the rest are context for logging / future
+/// affinity learning.
+#[derive(Debug, Deserialize)]
+pub struct ClosePositionRequest {
+    pub symbol: String,
+    pub realized_pnl: f64,
+    #[serde(default)]
+    pub entry_price: Option<f64>,
+    #[serde(default)]
+    pub exit_price: Option<f64>,
+    #[serde(default)]
+    pub quantity: Option<f64>,
+    #[serde(default)]
+    pub side: Option<String>,
+    /// Why it closed — e.g. `"stop_loss"`, `"take_profit"`, `"signal_exit"`.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
 /// Generic success response
 #[derive(Debug, Serialize)]
 pub struct SuccessResponse {
@@ -502,6 +528,42 @@ pub async fn add_position_handler(
     Ok(Json(SuccessResponse {
         success: true,
         message: format!("Position added for {}", symbol),
+    }))
+}
+
+/// POST /api/v1/risk/portfolio/positions/close
+///
+/// Records a closed trade's outcome: drops the open position and folds its
+/// realised PnL into the portfolio's daily PnL (which the risk engine checks
+/// against the daily-loss limit). This is how a bot's exits feed back into
+/// janus's risk view, instead of janus only ever seeing positions opened.
+pub async fn close_position_handler(
+    State(state): State<AppState>,
+    Json(req): Json<ClosePositionRequest>,
+) -> Result<Json<SuccessResponse>, ApiError> {
+    info!(
+        symbol = %req.symbol,
+        realized_pnl = req.realized_pnl,
+        reason = ?req.reason,
+        "POST /api/v1/risk/portfolio/positions/close"
+    );
+
+    let mut portfolio = state.portfolio.write().await;
+    let had_position = portfolio.record_close(&req.symbol, req.realized_pnl);
+    let daily_pnl = portfolio.daily_pnl;
+    drop(portfolio);
+
+    let note = if had_position {
+        "closed"
+    } else {
+        "no open position tracked; PnL still recorded"
+    };
+    Ok(Json(SuccessResponse {
+        success: true,
+        message: format!(
+            "Position {} for {} (realised PnL {:.2}); portfolio daily PnL now {:.2}",
+            note, req.symbol, req.realized_pnl, daily_pnl
+        ),
     }))
 }
 

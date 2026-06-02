@@ -49,9 +49,29 @@
       (EMAFlip/MeanReversion/Squeeze/VWAP/ORB from `crates/strategies`), **inline
       `PropFirmValidator` on every entry**, and regime gating. The **live** path
       is the simpler multi-symbol `tokio::spawn` block in `lib.rs` (~L920–1264).
-      **Decide:** re-wire `event_loop.rs` (add `mod` + entry point), or **port its
-      capabilities into the live `lib.rs` loop**. Document the decision; the
-      integration tests currently *mirror* its logic rather than call it.
+
+      **DECISION (2026-06-02): PORT incrementally into the live `lib.rs` loop;
+      retire `event_loop.rs` once its capabilities land. Do _not_ re-wire it as a
+      parallel entry point.** Rationale: the live loop is already the multi-symbol
+      production path; re-wiring `event_loop.rs` (a single-symbol reference) would
+      create two divergent loops with double the test/maintenance burden and a
+      standing risk of behavioural drift. A single live path keeps one test suite
+      and one source of truth. Port in safe, independently-shippable stages, each
+      additive and gated behind config so a half-finished port never degrades the
+      running service:
+        1. **Feed `RegimeManager` live** — call `on_tick_price` per candle in the
+           loop, stash the latest `RoutedSignal` per symbol (lowest-risk; unblocks 3).
+        2. **`PropFirmValidator` inline** — one pre-trade validation pass on the
+           submit path (already proven in `event_loop.rs`).
+        3. **Emit `regime` + `fear` into `signal.metadata`** at signal creation
+           (`signal/mod.rs` ~L372, beside `"strategy"`) — closes the JFLOW-C
+           producer gap so guidance stops being P&L-only.
+        4. **`RiskManager::apply_risk_management` inline** — needs live
+           `PortfolioState` upkeep (now fed by the new `/positions/close` endpoint).
+        5. **Retire `event_loop.rs`** and **unify the three prop-firm/risk engines**
+           (`models::prop_firm` canonical; delete `compliance` + `logic` dupes).
+      Integration tests currently *mirror* `event_loop.rs`'s logic rather than call
+      it; as each stage ports, point the matching test at the live path.
 
 ### Risk enforcement is REST-on-demand, not inline
 - [ ] **Apply risk on each live signal.** `RiskManager::apply_risk_management`
