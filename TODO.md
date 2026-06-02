@@ -91,13 +91,13 @@
       regime.rs`) is now instantiated (task-owned) in the live signal loop and fed
       every closed candle via `on_candle(symbol, high, low, close)` — Stage 1 of the
       event_loop port above.
-- [~] **Emit `regime` + `fear` into `signal.metadata`** (JFLOW-C producer gap).
-      **`regime` done:** the live loop reads `current_regime(symbol)` and stamps it
-      into each emitted signal's metadata, and `submit_signal_to_execution`
-      propagates it onto the execution-path `TradingSignal`, so guidance is no longer
-      regime-blind. **`fear` still TODO:** wire the amygdala threat output
-      (`brain_wiring.rs`) into the metadata too (a separate component from
-      `RegimeManager`).
+- [x] **Emit `regime` + `fear` into `signal.metadata`** (JFLOW-C producer gap — closed).
+      The live loop stamps **`regime`** (`current_regime(symbol)`) and **`fear`** (the
+      amygdala threat label from `regime_bridge::bridge_regime_signal` on the routed
+      regime) into each emitted signal's metadata, and `submit_signal_to_execution`
+      propagates both onto the execution-path `TradingSignal`. Guidance is no longer
+      regime/threat-blind. *(Refinement: feed real ADX/BB-width/ATR/rel-volume into the
+      bridge instead of `None` for a sharper amygdala read.)*
 
 ### The brain itself is rule-based; ML/neuromorphic are unwired
 - [ ] **Decide the ML story.** ONNX inference (`services/forward/src/inference.rs`,

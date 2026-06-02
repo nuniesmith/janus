@@ -371,13 +371,13 @@ impl SignalGenerator {
         trading_signal
             .metadata
             .insert("strategy".to_string(), strategy_name);
-        // Propagate the live regime from the source signal (Track 3) so the
-        // execution-path TradingSignal carries it too, not just signal-bus
-        // consumers.
-        if let Some(regime) = signal.metadata.get("regime") {
-            trading_signal
-                .metadata
-                .insert("regime".to_string(), regime.clone());
+        // Propagate the live regime + amygdala fear from the source signal
+        // (Track 3) so the execution-path TradingSignal carries them too, not
+        // just signal-bus consumers.
+        for key in ["regime", "fear"] {
+            if let Some(val) = signal.metadata.get(key) {
+                trading_signal.metadata.insert(key.to_string(), val.clone());
+            }
         }
 
         // ── Brain-gated path ───────────────────────────────────────

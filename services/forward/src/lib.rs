@@ -929,6 +929,9 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
             // left downstream guidance regime-blind (P&L-only).
             let mut regime_manager =
                 crate::regime::RegimeManager::new(crate::regime::RegimeManagerConfig::default());
+            // Last-known amygdala "fear" label per symbol, derived from the routed
+            // regime, emitted alongside `regime` to finish the producer gap.
+            let mut last_fear: HashMap<String, String> = HashMap::new();
 
             let mut klines_processed: u64 = 0;
             let mut signals_generated: u64 = 0;
@@ -1017,7 +1020,24 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
 
                                 // Feed the same candle to the live regime detector so its
                                 // per-symbol regime stays current for the metadata below.
-                                let _ = regime_manager.on_candle(&symbol_str, high, low, close);
+                                if let Some(routed) =
+                                    regime_manager.on_candle(&symbol_str, high, low, close)
+                                {
+                                    // Bridge the routed regime to the amygdala threat
+                                    // ("fear") model and remember its label for this symbol.
+                                    let bridged = crate::regime_bridge::bridge_regime_signal(
+                                        &symbol_str,
+                                        &routed,
+                                        None,
+                                        None,
+                                        None,
+                                        None,
+                                    );
+                                    last_fear.insert(
+                                        symbol_str.clone(),
+                                        bridged.amygdala_regime.to_string(),
+                                    );
+                                }
 
                                 klines_processed += 1;
 
@@ -1191,9 +1211,13 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                                 let signal = if let Some(ema_s) = analysis.ema_slow {
                                     signal.with_metadata("ema_slow", format!("{:.4}", ema_s))
                                 } else { signal };
-                                // Emit the live market regime (Track 3 producer gap).
+                                // Emit the live market regime + amygdala fear (Track 3
+                                // producer gap — guidance reads both from metadata).
                                 let signal = if let Some(regime) = regime_manager.current_regime(&symbol_str) {
                                     signal.with_metadata("regime", regime.to_string())
+                                } else { signal };
+                                let signal = if let Some(fear) = last_fear.get(&symbol_str) {
+                                    signal.with_metadata("fear", fear.clone())
                                 } else { signal };
 
                                 // Publish to signal bus
