@@ -52,6 +52,7 @@ pub mod persistence;
 // Re-export for convenience — the global janus-core Prometheus singleton.
 use janus_core::metrics::metrics as janus_metrics;
 use janus_models::prop_firm::{ChallengeType, PropFirmValidator};
+use janus_strategies::EMAFlipStrategy;
 pub mod regime;
 pub mod regime_bridge;
 pub mod regime_bridge_auth;
@@ -958,6 +959,9 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
 
             // Per-symbol indicator analyzers, keyed by "SYMBOL/QUOTE:interval"
             let mut analyzers: HashMap<String, IndicatorAnalyzer> = HashMap::new();
+            // Per-symbol strategy instances ported from the event_loop suite
+            // (Track 3 Stage 5). EMA-flip is the first; more follow.
+            let mut ema_flip: HashMap<String, EMAFlipStrategy> = HashMap::new();
 
             // Live market-regime detector (Track 3). Task-owned, so it needs no
             // lock; it's fed each closed candle below and its per-symbol regime is
@@ -1116,21 +1120,32 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
 
                                 let mut strategy_votes: Vec<(janus_core::SignalType, f64, String)> = Vec::new();
 
-                                // 1. EMA Crossover strategy
-                                if analysis.ema_cross > 0.5 {
-                                    // Bullish EMA crossover
-                                    strategy_votes.push((
-                                        janus_core::SignalType::Buy,
-                                        analysis.ema_cross.min(1.0),
-                                        "ema_crossover".to_string(),
-                                    ));
-                                } else if analysis.ema_cross < -0.5 {
-                                    // Bearish EMA crossover
-                                    strategy_votes.push((
-                                        janus_core::SignalType::Sell,
-                                        analysis.ema_cross.abs().min(1.0),
-                                        "ema_crossover".to_string(),
-                                    ));
+                                // 1. EMA Flip strategy (ported from the event_loop suite —
+                                //    proper crossover detection with per-symbol state,
+                                //    replacing the inline ema_cross approximation; Stage 5).
+                                if let (Some(ema_f), Some(ema_s)) =
+                                    (analysis.ema_fast, analysis.ema_slow)
+                                {
+                                    let flip = ema_flip.entry(analyzer_key.clone()).or_insert_with(|| {
+                                        EMAFlipStrategy::new(
+                                            ind_config.ema_fast_period,
+                                            ind_config.ema_slow_period,
+                                        )
+                                    });
+                                    match flip.check_signal(ema_f, ema_s) {
+                                        janus_strategies::Signal::Buy => strategy_votes.push((
+                                            janus_core::SignalType::Buy,
+                                            0.8,
+                                            "ema_flip".to_string(),
+                                        )),
+                                        janus_strategies::Signal::Sell => strategy_votes.push((
+                                            janus_core::SignalType::Sell,
+                                            0.8,
+                                            "ema_flip".to_string(),
+                                        )),
+                                        janus_strategies::Signal::Close
+                                        | janus_strategies::Signal::None => {}
+                                    }
                                 }
 
                                 // 2. RSI Reversal strategy
