@@ -74,12 +74,14 @@
       it; as each stage ports, point the matching test at the live path.
 
 ### Risk enforcement is REST-on-demand, not inline
-- [ ] **Apply risk on each live signal.** `RiskManager::apply_risk_management`
-      (`services/forward/src/risk/`) and `PropFirmValidator`
-      (`crates/models/src/prop_firm.rs`) are real and exposed via REST
-      (`/api/v1/risk/*`) for Ruby to consult, but the **live kline loop does not
-      call them inline** — only the dead `event_loop.rs` does. Wire one pre-trade
-      validation pass into the live submit path.
+- [~] **Apply risk on each live signal.** **`PropFirmValidator` done (Stage 2):** the
+      live kline loop now runs an inline pre-trade prop-firm validation pass on each
+      prospective entry (ATR-based stop + account-risk size, mirroring `event_loop.rs`),
+      logs violations, and emits a `prop_firm` metadata tag. Blocking is opt-in via
+      `JANUS_PROP_FIRM_ENFORCE` (default **advisory** — never blocks live trades on its
+      own, per "no autonomous execution"). **Still TODO:** `RiskManager::apply_risk_management`
+      inline (Stage 4), and feeding closed-trade outcomes back into the validator so its
+      stateful daily-loss / drawdown rules (not just per-trade risk) engage.
 - [ ] **Unify the three duplicate prop-firm / risk engines** into one:
       `crates/models::prop_firm` (`PropFirmValidator`/`HyroTraderRules`),
       `crates/compliance` (`ComplianceSheriff`), `crates/logic` (`ComprehensiveRiskEngine`/
