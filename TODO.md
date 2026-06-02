@@ -74,14 +74,16 @@
       it; as each stage ports, point the matching test at the live path.
 
 ### Risk enforcement is REST-on-demand, not inline
-- [~] **Apply risk on each live signal.** **`PropFirmValidator` done (Stage 2):** the
-      live kline loop now runs an inline pre-trade prop-firm validation pass on each
-      prospective entry (ATR-based stop + account-risk size, mirroring `event_loop.rs`),
-      logs violations, and emits a `prop_firm` metadata tag. Blocking is opt-in via
-      `JANUS_PROP_FIRM_ENFORCE` (default **advisory** — never blocks live trades on its
-      own, per "no autonomous execution"). **Still TODO:** `RiskManager::apply_risk_management`
-      inline (Stage 4), and feeding closed-trade outcomes back into the validator so its
-      stateful daily-loss / drawdown rules (not just per-trade risk) engage.
+- [x] **Apply risk on each live signal.** **`PropFirmValidator` (Stage 2)** + **`RiskManager`
+      (Stage 4)** are both wired inline now. Each prospective entry gets (a) a prop-firm
+      validation pass (ATR stop + account-risk size, `prop_firm` metadata; blocking opt-in
+      via `JANUS_PROP_FIRM_ENFORCE`) and (b) a portfolio-aware `RiskManager::apply_risk_management`
+      check against the live `PortfolioState` (concurrent positions / exposure / daily loss),
+      surfaced as `risk_check` metadata. Both **advisory by default** (never block live trades
+      on their own, per "no autonomous execution"); the live portfolio is kept current by the
+      REST add/close endpoints. **Follow-ups:** wire the RiskManager verdict into the enforce
+      gate too, and feed closed-trade outcomes back so the validators' stateful daily-loss /
+      drawdown rules engage (not just per-trade / point-in-time checks).
 - [ ] **Unify the three duplicate prop-firm / risk engines** into one:
       `crates/models::prop_firm` (`PropFirmValidator`/`HyroTraderRules`),
       `crates/compliance` (`ComplianceSheriff`), `crates/logic` (`ComprehensiveRiskEngine`/

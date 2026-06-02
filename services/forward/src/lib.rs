@@ -779,6 +779,10 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
     // Subscribe to signals from signal bus
     let mut signal_rx = state.signal_bus.subscribe();
     let signal_generator = service.signal_generator();
+    // Shared risk state for the inline portfolio-aware risk check (Track 3 Stage 4).
+    // The portfolio is kept current by the REST add/close endpoints.
+    let risk_manager_handle = service.risk_manager();
+    let portfolio_handle = service.portfolio();
 
     // ── JFLOW-A: Session metrics push loop ────────────────────────────────
     // Periodically snapshot SignalGenerator metrics and push to JanusAI.
@@ -944,6 +948,10 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
         // Strategy config from JanusState
         let rsi_overbought = state_clone.config.forward.indicators.rsi_overbought;
         let rsi_oversold = state_clone.config.forward.indicators.rsi_oversold;
+
+        // Shared RiskManager + live portfolio for the inline risk check (Track 3 Stage 4).
+        let risk_manager = risk_manager_handle.clone();
+        let portfolio = portfolio_handle.clone();
 
         tokio::spawn(async move {
             use std::collections::HashMap;
@@ -1273,6 +1281,43 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                                     None => "skipped".to_string(),
                                 };
 
+                                // Portfolio-aware risk check (Track 3 Stage 4, advisory):
+                                // RiskManager validates the prospective entry against the
+                                // live portfolio (concurrent positions, exposure, daily
+                                // loss). Result is surfaced as `risk_check` metadata; it
+                                // does not block (enforcement is a noted follow-up).
+                                let risk_check = {
+                                    let fwd_type = match final_type {
+                                        janus_core::SignalType::Buy => crate::signal::SignalType::Buy,
+                                        janus_core::SignalType::Sell => crate::signal::SignalType::Sell,
+                                        _ => crate::signal::SignalType::Hold,
+                                    };
+                                    let ts = crate::signal::TradingSignal::new(
+                                        symbol_str.clone(),
+                                        fwd_type,
+                                        crate::signal::Timeframe::M15,
+                                        avg_confidence,
+                                        crate::signal::SignalSource::TechnicalIndicator {
+                                            name: strategies_used.join("+"),
+                                        },
+                                    );
+                                    let mut md = crate::risk::MarketData::new(close);
+                                    md.atr = analysis.atr;
+                                    let rm = risk_manager.read().await;
+                                    let pf = portfolio.read().await;
+                                    match rm.apply_risk_management(ts, &md, &pf) {
+                                        Ok(_) => "ok".to_string(),
+                                        Err(e) => {
+                                            warn!(
+                                                symbol = %symbol_str,
+                                                error = %e,
+                                                "risk: RiskManager rejected entry (advisory)"
+                                            );
+                                            format!("rejected:{e}")
+                                        }
+                                    }
+                                };
+
                                 // Create the signal with full metadata
                                 let signal = janus_core::Signal::new(&symbol_str, final_type, avg_confidence)
                                     .with_source("forward")
@@ -1304,6 +1349,8 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                                 } else { signal };
                                 // Prop-firm compliance of the prospective entry (advisory).
                                 let signal = signal.with_metadata("prop_firm", &prop_firm_label);
+                                // Portfolio-aware RiskManager verdict (advisory).
+                                let signal = signal.with_metadata("risk_check", &risk_check);
 
                                 // Publish to signal bus
                                 match state_clone.signal_bus.publish(signal.clone()) {

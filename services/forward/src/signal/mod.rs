@@ -374,7 +374,7 @@ impl SignalGenerator {
         // Propagate the live regime + amygdala fear from the source signal
         // (Track 3) so the execution-path TradingSignal carries them too, not
         // just signal-bus consumers.
-        for key in ["regime", "fear", "prop_firm"] {
+        for key in ["regime", "fear", "prop_firm", "risk_check"] {
             if let Some(val) = signal.metadata.get(key) {
                 trading_signal.metadata.insert(key.to_string(), val.clone());
             }
