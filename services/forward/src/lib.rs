@@ -51,6 +51,7 @@ pub mod persistence;
 
 // Re-export for convenience — the global janus-core Prometheus singleton.
 use janus_core::metrics::metrics as janus_metrics;
+use janus_models::prop_firm::{ChallengeType, PropFirmValidator};
 pub mod regime;
 pub mod regime_bridge;
 pub mod regime_bridge_auth;
@@ -106,6 +107,33 @@ use anyhow::Result;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
+
+/// Synthesize the `(stop_loss, position_size)` for a prospective entry so the
+/// inline prop-firm validator (Track 3 Stage 2) can check it: an ATR-based stop
+/// (2×ATR on the loss side) and a size that risks `risk_per_trade` (a **fraction**,
+/// e.g. `0.01` = 1%) of the account over that stop distance. Returns `None` when
+/// ATR is unusable (no stop → skip validation rather than block on missing
+/// data). Mirrors the sizing in the reference `event_loop.rs`.
+fn prop_firm_entry_inputs(
+    side: janus_core::SignalType,
+    price: f64,
+    atr: Option<f64>,
+    account_balance: f64,
+    risk_per_trade: f64,
+) -> Option<(f64, f64)> {
+    let atr = atr.filter(|a| *a > 0.0)?;
+    let stop_distance = 2.0 * atr;
+    let stop_loss = match side {
+        janus_core::SignalType::Sell => price + stop_distance, // short: stop above
+        _ => price - stop_distance,                            // long: stop below
+    };
+    if stop_loss <= 0.0 {
+        return None;
+    }
+    let risk_amount = account_balance * risk_per_trade;
+    let size = risk_amount / stop_distance;
+    Some((stop_loss, size))
+}
 
 /// Forward service version
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -933,6 +961,30 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
             // regime, emitted alongside `regime` to finish the producer gap.
             let mut last_fear: HashMap<String, String> = HashMap::new();
 
+            // Inline prop-firm validation (Track 3 Stage 2). Each prospective entry
+            // is checked against the prop-firm rules; the result is logged + emitted
+            // as `prop_firm` metadata. Blocking is OPT-IN via JANUS_PROP_FIRM_ENFORCE
+            // (default: advisory — never blocks live trades on its own, per the
+            // "no autonomous execution" principle). validate_trade is &self.
+            let prop_validator = PropFirmValidator::new(
+                state_clone.config.risk.account_balance,
+                ChallengeType::OneStep,
+            );
+            let prop_account_balance = state_clone.config.risk.account_balance;
+            let prop_risk_pct = state_clone.config.risk.position_sizing.risk_per_trade_pct;
+            let prop_firm_enforce = std::env::var("JANUS_PROP_FIRM_ENFORCE")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            if prop_firm_enforce {
+                info!(
+                    "prop-firm validation: ENFORCING (non-compliant live entries will be blocked)"
+                );
+            } else {
+                info!(
+                    "prop-firm validation: advisory (logs + metadata only; set JANUS_PROP_FIRM_ENFORCE=1 to block)"
+                );
+            }
+
             let mut klines_processed: u64 = 0;
             let mut signals_generated: u64 = 0;
             let mut trades_skipped: u64 = 0;
@@ -1190,6 +1242,37 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                                     continue;
                                 }
 
+                                // Inline prop-firm validation (Track 3 Stage 2). Advisory
+                                // unless JANUS_PROP_FIRM_ENFORCE is set (see the submit gate).
+                                let prop_firm_label = match prop_firm_entry_inputs(
+                                    final_type,
+                                    close,
+                                    analysis.atr,
+                                    prop_account_balance,
+                                    prop_risk_pct,
+                                ) {
+                                    Some((stop_loss, size)) => {
+                                        let result = prop_validator
+                                            .validate_trade(&symbol_str, close, stop_loss, size, 1);
+                                        if result.compliant {
+                                            "ok".to_string()
+                                        } else {
+                                            let rules: Vec<&str> = result
+                                                .violations
+                                                .iter()
+                                                .map(|v| v.rule.as_str())
+                                                .collect();
+                                            warn!(
+                                                symbol = %symbol_str,
+                                                violations = ?rules,
+                                                "prop-firm: prospective entry would violate rules"
+                                            );
+                                            format!("violation:{}", rules.join(","))
+                                        }
+                                    }
+                                    None => "skipped".to_string(),
+                                };
+
                                 // Create the signal with full metadata
                                 let signal = janus_core::Signal::new(&symbol_str, final_type, avg_confidence)
                                     .with_source("forward")
@@ -1219,6 +1302,8 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                                 let signal = if let Some(fear) = last_fear.get(&symbol_str) {
                                     signal.with_metadata("fear", fear.clone())
                                 } else { signal };
+                                // Prop-firm compliance of the prospective entry (advisory).
+                                let signal = signal.with_metadata("prop_firm", &prop_firm_label);
 
                                 // Publish to signal bus
                                 match state_clone.signal_bus.publish(signal.clone()) {
@@ -1253,10 +1338,21 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                                     }
                                 }
 
-                                // Submit to execution service if actionable
-                                if final_type != janus_core::SignalType::Hold && avg_confidence >= 0.7
-                                    && let Err(e) = signal_gen.submit_signal_to_execution(&signal).await {
-                                    warn!("Failed to submit live signal to execution: {}", e);
+                                // Submit to execution service if actionable. When
+                                // prop-firm enforcement is enabled, a non-compliant entry
+                                // is blocked here (advisory by default — see the flag).
+                                if final_type != janus_core::SignalType::Hold && avg_confidence >= 0.7 {
+                                    if prop_firm_enforce && prop_firm_label.starts_with("violation") {
+                                        warn!(
+                                            symbol = %symbol_str,
+                                            prop_firm = %prop_firm_label,
+                                            "prop-firm ENFORCE: blocking non-compliant live entry"
+                                        );
+                                    } else if let Err(e) =
+                                        signal_gen.submit_signal_to_execution(&signal).await
+                                    {
+                                        warn!("Failed to submit live signal to execution: {}", e);
+                                    }
                                 }
 
                                 // Update health with live stats
@@ -1649,6 +1745,46 @@ impl ParamReloadHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prop_firm_inputs_atr_stop_and_risk_size() {
+        // Long: stop 2*ATR below; size risks 1% (0.01) of 10k over the 20-wide stop.
+        let (sl, size) = prop_firm_entry_inputs(
+            janus_core::SignalType::Buy,
+            100.0,
+            Some(10.0),
+            10_000.0,
+            0.01,
+        )
+        .expect("usable atr");
+        assert!((sl - 80.0).abs() < 1e-9); // 100 - 2*10
+        assert!((size - 5.0).abs() < 1e-9); // (10000*0.01) / 20
+        // Short: stop above.
+        let (sl_s, _) = prop_firm_entry_inputs(
+            janus_core::SignalType::Sell,
+            100.0,
+            Some(10.0),
+            10_000.0,
+            0.01,
+        )
+        .expect("usable atr");
+        assert!((sl_s - 120.0).abs() < 1e-9); // 100 + 2*10
+        // No / zero ATR → None (skip validation rather than block on missing data).
+        assert!(
+            prop_firm_entry_inputs(janus_core::SignalType::Buy, 100.0, None, 10_000.0, 0.01)
+                .is_none()
+        );
+        assert!(
+            prop_firm_entry_inputs(
+                janus_core::SignalType::Buy,
+                100.0,
+                Some(0.0),
+                10_000.0,
+                0.01
+            )
+            .is_none()
+        );
+    }
 
     #[tokio::test]
     async fn test_service_creation() {
