@@ -53,8 +53,9 @@ pub mod persistence;
 use janus_core::metrics::metrics as janus_metrics;
 use janus_models::prop_firm::{ChallengeType, PropFirmValidator};
 use janus_strategies::{
-    EMAFlipStrategy, MeanReversionConfig, MeanReversionSignal, MeanReversionStrategy,
-    SqueezeBreakoutConfig, SqueezeBreakoutSignal, SqueezeBreakoutStrategy,
+    EMAFlipStrategy, MeanReversionConfig, MeanReversionSignal, MeanReversionStrategy, OrbConfig,
+    OrbSignal, OrbStrategy, SqueezeBreakoutConfig, SqueezeBreakoutSignal, SqueezeBreakoutStrategy,
+    VwapScalperConfig, VwapScalperStrategy, VwapSignal,
 };
 pub mod regime;
 pub mod regime_bridge;
@@ -963,10 +964,17 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
             // Per-symbol indicator analyzers, keyed by "SYMBOL/QUOTE:interval"
             let mut analyzers: HashMap<String, IndicatorAnalyzer> = HashMap::new();
             // Per-symbol strategy instances ported from the event_loop suite
-            // (Track 3 Stage 5). EMA-flip + mean-reversion ported; more follow.
+            // (Track 3 Stage 5). EMA-flip, mean-reversion, squeeze-breakout, and the
+            // session-anchored VWAP-scalper + ORB pair are all wired below.
             let mut ema_flip: HashMap<String, EMAFlipStrategy> = HashMap::new();
             let mut mean_rev: HashMap<String, MeanReversionStrategy> = HashMap::new();
             let mut squeeze: HashMap<String, SqueezeBreakoutStrategy> = HashMap::new();
+            let mut vwap: HashMap<String, VwapScalperStrategy> = HashMap::new();
+            let mut orb: HashMap<String, OrbStrategy> = HashMap::new();
+            // Tracks the UTC calendar day each symbol's session is anchored to, so we
+            // know when to roll VWAP/ORB at the 00:00 UTC boundary (24/7 crypto has no
+            // natural "open"; see the strategies' own session docs).
+            let mut session_day: HashMap<String, chrono::NaiveDate> = HashMap::new();
 
             // Live market-regime detector (Track 3). Task-owned, so it needs no
             // lock; it's fed each closed candle below and its per-symbol regime is
@@ -1197,6 +1205,56 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                                         // Mid-squeeze consolidation / no setup → no vote.
                                         SqueezeBreakoutSignal::Squeeze
                                         | SqueezeBreakoutSignal::Hold => {}
+                                    }
+                                }
+
+                                // 1d. Session-anchored pair: VWAP scalper + ORB (ported from
+                                //     the event_loop suite; Track 3 Stage 5). 24/7 crypto has no
+                                //     natural "open", so we anchor each symbol's session to the
+                                //     UTC calendar day: on first sight and at every 00:00 UTC
+                                //     rollover we roll the session — VWAP via reset_session(),
+                                //     ORB via start_session() (which also opens the very first
+                                //     range; a fresh OrbStrategy stays Forming until started).
+                                {
+                                    let today = chrono::Utc::now().date_naive();
+                                    let vw = vwap.entry(analyzer_key.clone()).or_insert_with(
+                                        || VwapScalperStrategy::new(VwapScalperConfig::crypto_aggressive()),
+                                    );
+                                    let ob = orb.entry(analyzer_key.clone()).or_insert_with(
+                                        || OrbStrategy::new(OrbConfig::crypto_aggressive()),
+                                    );
+                                    if session_day.get(&analyzer_key) != Some(&today) {
+                                        vw.reset_session();
+                                        ob.start_session();
+                                        session_day.insert(analyzer_key.clone(), today);
+                                    }
+
+                                    match vw.update_hlc(high, low, close).signal {
+                                        VwapSignal::Buy => strategy_votes.push((
+                                            janus_core::SignalType::Buy,
+                                            0.7,
+                                            "vwap_scalper".to_string(),
+                                        )),
+                                        VwapSignal::Sell => strategy_votes.push((
+                                            janus_core::SignalType::Sell,
+                                            0.7,
+                                            "vwap_scalper".to_string(),
+                                        )),
+                                        VwapSignal::Hold => {}
+                                    }
+                                    match ob.update_hlc(high, low, close).signal {
+                                        OrbSignal::BuyBreakout => strategy_votes.push((
+                                            janus_core::SignalType::Buy,
+                                            0.7,
+                                            "orb".to_string(),
+                                        )),
+                                        OrbSignal::SellBreakout => strategy_votes.push((
+                                            janus_core::SignalType::Sell,
+                                            0.7,
+                                            "orb".to_string(),
+                                        )),
+                                        // Range still forming / complete-but-no-breakout → no vote.
+                                        OrbSignal::Forming | OrbSignal::Hold => {}
                                     }
                                 }
 
