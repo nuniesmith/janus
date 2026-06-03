@@ -18,6 +18,7 @@ use crate::execution::{
 use crate::features::{FeatureConfig, FeatureEngineering};
 use crate::indicators::IndicatorAnalysis;
 use crate::inference::{ModelCache, ModelInference};
+use crate::persistence::RedisKillSwitch;
 use anyhow::{Result, anyhow};
 use janus_regime::{ActiveStrategy, DetectionMethod, MarketRegime, RoutedSignal};
 use std::sync::Arc;
@@ -85,6 +86,10 @@ pub struct SignalGenerator {
     /// before reaching the execution service. The raw `execution_client` is
     /// bypassed in favor of this gated wrapper.
     brain_gated_client: Option<Arc<Mutex<BrainGatedExecutionClient>>>,
+    /// Optional shared kill-switch. When set, `submit_signal_to_execution`
+    /// consults the cached state before dispatching to any execution client
+    /// (brain-gated or direct) and suppresses the submit while it is active.
+    kill_switch: Option<Arc<RedisKillSwitch>>,
     /// Optional param query handle for dynamic config updates
     param_query_handle: Option<crate::ParamQueryHandle>,
 }
@@ -102,6 +107,7 @@ impl SignalGenerator {
             model_inference: None,
             execution_client: None,
             brain_gated_client: None,
+            kill_switch: None,
             param_query_handle: None,
         }
     }
@@ -138,6 +144,7 @@ impl SignalGenerator {
             model_inference: None,
             execution_client,
             brain_gated_client: None,
+            kill_switch: None,
             param_query_handle: None,
         })
     }
@@ -157,6 +164,7 @@ impl SignalGenerator {
             model_inference: Some(Arc::new(model_inference)),
             execution_client: None,
             brain_gated_client: None,
+            kill_switch: None,
             param_query_handle: None,
         }
     }
@@ -168,6 +176,16 @@ impl SignalGenerator {
     pub fn set_param_query_handle(&mut self, handle: crate::ParamQueryHandle) {
         info!("Signal generator: param query handle attached");
         self.param_query_handle = Some(handle);
+    }
+
+    /// Wire a shared Redis kill-switch into the execution choke point.
+    ///
+    /// When set, [`submit_signal_to_execution`](Self::submit_signal_to_execution)
+    /// consults the cached kill-switch state before dispatching to any execution
+    /// client and suppresses the submit while the switch is active.
+    pub fn set_kill_switch(&mut self, kill_switch: Arc<RedisKillSwitch>) {
+        info!("Signal generator: kill-switch attached to execution choke point");
+        self.kill_switch = Some(kill_switch);
     }
 
     /// Attach a brain-gated execution client.
@@ -346,6 +364,21 @@ impl SignalGenerator {
     /// When a brain-gated execution client is attached, the signal is converted
     /// to a `TradingSignal` and routed through the brain pipeline.
     pub async fn submit_signal_to_execution(&self, signal: &janus_core::Signal) -> Result<()> {
+        // Defense-in-depth: a tripped kill-switch halts every execution path
+        // (brain-gated and direct) and the bus-consumer path that also calls
+        // this method. Uses the cached state (no Redis round-trip in the hot
+        // path); the signal is still published to the bus by callers for
+        // observability — only the order submit is suppressed.
+        if let Some(ks) = &self.kill_switch
+            && ks.is_killed_cached().await
+        {
+            warn!(
+                "🛑 kill-switch ACTIVE — suppressing execution submit for signal {} ({} {:?})",
+                signal.id, signal.symbol, signal.signal_type,
+            );
+            return Ok(());
+        }
+
         // Convert janus_core::Signal to TradingSignal for submission
         let signal_type = match signal.signal_type {
             janus_core::SignalType::Buy => SignalType::Buy,
@@ -1011,7 +1044,9 @@ impl SignalMetrics {
         let n = samples.len();
         // Nearest-rank percentile (1-indexed): idx = ceil(p * n) - 1.
         let pick = |p: f64| -> u64 {
-            let rank = ((p * n as f64).ceil() as usize).saturating_sub(1).min(n - 1);
+            let rank = ((p * n as f64).ceil() as usize)
+                .saturating_sub(1)
+                .min(n - 1);
             samples[rank]
         };
         (pick(0.50), pick(0.99))

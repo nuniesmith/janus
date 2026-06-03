@@ -277,6 +277,19 @@ impl ForwardService {
         }
     }
 
+    /// Wire a shared Redis kill-switch into the SignalGenerator's execution
+    /// choke point. Like [`set_brain_gated_client`](Self::set_brain_gated_client),
+    /// this must run before the `signal_generator` `Arc` is shared (i.e. before
+    /// the live loop clones it). Returns `true` if wiring succeeded.
+    pub fn set_kill_switch(&mut self, kill_switch: Arc<persistence::RedisKillSwitch>) -> bool {
+        if let Some(sg) = Arc::get_mut(&mut self.signal_generator) {
+            sg.set_kill_switch(kill_switch);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Get risk manager
     pub fn risk_manager(&self) -> Arc<RwLock<RiskManager>> {
         Arc::clone(&self.risk_manager)
@@ -780,6 +793,31 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
     state
         .register_module_health("forward", true, Some("running".to_string()))
         .await;
+
+    // ── Wire the shared Redis kill-switch into the execution choke point ──
+    // Independent of the brain runtime so the direct-execution path is guarded
+    // too. A background task keeps the cached state fresh for the hot-path
+    // check in `submit_signal_to_execution`. Graceful: if Redis is unavailable
+    // the service runs without it (logged). Must precede the
+    // `signal_generator()` clone below so `Arc::get_mut` can still mutate it.
+    match persistence::RedisKillSwitch::from_env().await {
+        Ok(ks) => {
+            let ks = Arc::new(ks);
+            // Detached daemon poller for the process lifetime; keeps the cached
+            // kill-switch state fresh for the hot-path check.
+            let _refresh_task = ks.spawn_cache_refresh_task();
+            if service.set_kill_switch(Arc::clone(&ks)) {
+                info!("🛑✅ Redis kill-switch wired into execution choke point");
+            } else {
+                warn!("⚠️  Could not wire kill-switch into SignalGenerator (Arc already shared)");
+            }
+        }
+        Err(e) => {
+            warn!(
+                "⚠️  Redis kill-switch unavailable ({e}); execution proceeds without kill-switch protection"
+            );
+        }
+    }
 
     // Subscribe to signals from signal bus
     let mut signal_rx = state.signal_bus.subscribe();
