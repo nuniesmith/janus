@@ -54,6 +54,7 @@ use janus_core::metrics::metrics as janus_metrics;
 use janus_models::prop_firm::{ChallengeType, PropFirmValidator};
 use janus_strategies::{
     EMAFlipStrategy, MeanReversionConfig, MeanReversionSignal, MeanReversionStrategy,
+    SqueezeBreakoutConfig, SqueezeBreakoutSignal, SqueezeBreakoutStrategy,
 };
 pub mod regime;
 pub mod regime_bridge;
@@ -965,6 +966,7 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
             // (Track 3 Stage 5). EMA-flip + mean-reversion ported; more follow.
             let mut ema_flip: HashMap<String, EMAFlipStrategy> = HashMap::new();
             let mut mean_rev: HashMap<String, MeanReversionStrategy> = HashMap::new();
+            let mut squeeze: HashMap<String, SqueezeBreakoutStrategy> = HashMap::new();
 
             // Live market-regime detector (Track 3). Task-owned, so it needs no
             // lock; it's fed each closed candle below and its per-symbol regime is
@@ -1170,6 +1172,31 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                                             "mean_reversion".to_string(),
                                         )),
                                         MeanReversionSignal::Hold => {}
+                                    }
+                                }
+
+                                // 1c. Squeeze-breakout strategy (ported from the event_loop
+                                //     suite; Bollinger/Keltner squeeze + breakout over HLC,
+                                //     per-symbol state — Track 3 Stage 5). `update_hlc` returns
+                                //     a richer result; we vote on its `.signal`.
+                                {
+                                    let sq = squeeze.entry(analyzer_key.clone()).or_insert_with(
+                                        || SqueezeBreakoutStrategy::new(SqueezeBreakoutConfig::crypto_aggressive()),
+                                    );
+                                    match sq.update_hlc(high, low, close).signal {
+                                        SqueezeBreakoutSignal::BuyBreakout => strategy_votes.push((
+                                            janus_core::SignalType::Buy,
+                                            0.7,
+                                            "squeeze_breakout".to_string(),
+                                        )),
+                                        SqueezeBreakoutSignal::SellBreakout => strategy_votes.push((
+                                            janus_core::SignalType::Sell,
+                                            0.7,
+                                            "squeeze_breakout".to_string(),
+                                        )),
+                                        // Mid-squeeze consolidation / no setup → no vote.
+                                        SqueezeBreakoutSignal::Squeeze
+                                        | SqueezeBreakoutSignal::Hold => {}
                                     }
                                 }
 
