@@ -7,7 +7,7 @@
 //! ## Architecture
 //!
 //! ```text
-//!   EventLoop (main_production)
+//!   Forward live loop (start_module)
 //!       │
 //!       ▼
 //!   broadcast::Sender<BridgedRegimeState>
@@ -116,9 +116,9 @@ use janus_forward::regime_bridge_server::RegimeBridgeServer;
 
 /// A `BridgedRegimeState` as received from the Redis stream.
 ///
-/// The producer (`regime_bridge_consumer` task in `main_production.rs`)
-/// serializes the state as a JSON string in the `data` field of the stream
-/// entry. This struct deserializes that JSON.
+/// The producer (the forward service's regime bridge) serializes the state
+/// as a JSON string in the `data` field of the stream entry. This struct
+/// deserializes that JSON.
 #[derive(Debug, Clone, Deserialize)]
 pub struct StreamedBridgeState {
     pub symbol: String,

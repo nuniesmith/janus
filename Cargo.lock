@@ -5819,7 +5819,6 @@ dependencies = [
  "jflow-compliance",
  "jflow-core",
  "jflow-health",
- "jflow-logic",
  "jflow-models",
  "jflow-optimizer",
  "jflow-questdb-writer",

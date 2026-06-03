@@ -59,7 +59,6 @@ common = { path = "../../crates/common", package = "jflow-common" }
 janus-indicators = { workspace = true }
 janus-strategies = { path = "../../crates/strategies", package = "jflow-strategies" }
 janus-regime = { path = "../../crates/regime", package = "jflow-regime" }
-logic = { path = "../../crates/logic", package = "jflow-logic" }
 janus-models = { path = "../../crates/models", package = "jflow-models" }
 janus-health = { path = "../../crates/health", package = "jflow-health" }
 janus-risk = { path = "../../crates/risk", package = "jflow-risk" }

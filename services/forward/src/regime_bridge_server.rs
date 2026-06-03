@@ -8,8 +8,8 @@
 //!
 //! ## 1. Forward Service (streaming provider)
 //!
-//! When embedded in the JANUS forward service (`main_production`), the server
-//! receives the event loop's `broadcast::Sender<BridgedRegimeState>` and:
+//! When embedded in the JANUS forward service, the server receives the live
+//! loop's `broadcast::Sender<BridgedRegimeState>` and:
 //!
 //! - **`StreamRegimeUpdates`** — subscribes to the broadcast channel and
 //!   streams `RegimeState` messages to gRPC clients. Supports symbol filters,

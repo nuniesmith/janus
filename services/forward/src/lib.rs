@@ -118,7 +118,7 @@ use tracing::{info, warn};
 /// (2×ATR on the loss side) and a size that risks `risk_per_trade` (a **fraction**,
 /// e.g. `0.01` = 1%) of the account over that stop distance. Returns `None` when
 /// ATR is unusable (no stop → skip validation rather than block on missing
-/// data). Mirrors the sizing in the reference `event_loop.rs`.
+/// data). Uses ATR-stop, risk-based position sizing.
 fn prop_firm_entry_inputs(
     side: janus_core::SignalType,
     price: f64,
