@@ -52,7 +52,9 @@ pub mod persistence;
 // Re-export for convenience — the global janus-core Prometheus singleton.
 use janus_core::metrics::metrics as janus_metrics;
 use janus_models::prop_firm::{ChallengeType, PropFirmValidator};
-use janus_strategies::EMAFlipStrategy;
+use janus_strategies::{
+    EMAFlipStrategy, MeanReversionConfig, MeanReversionSignal, MeanReversionStrategy,
+};
 pub mod regime;
 pub mod regime_bridge;
 pub mod regime_bridge_auth;
@@ -960,8 +962,9 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
             // Per-symbol indicator analyzers, keyed by "SYMBOL/QUOTE:interval"
             let mut analyzers: HashMap<String, IndicatorAnalyzer> = HashMap::new();
             // Per-symbol strategy instances ported from the event_loop suite
-            // (Track 3 Stage 5). EMA-flip is the first; more follow.
+            // (Track 3 Stage 5). EMA-flip + mean-reversion ported; more follow.
             let mut ema_flip: HashMap<String, EMAFlipStrategy> = HashMap::new();
+            let mut mean_rev: HashMap<String, MeanReversionStrategy> = HashMap::new();
 
             // Live market-regime detector (Track 3). Task-owned, so it needs no
             // lock; it's fed each closed candle below and its per-symbol regime is
@@ -1145,6 +1148,28 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                                         )),
                                         janus_strategies::Signal::Close
                                         | janus_strategies::Signal::None => {}
+                                    }
+                                }
+
+                                // 1b. Mean-reversion strategy (ported from the event_loop
+                                //     suite; Bollinger-band mean reversion over HLC, per-symbol
+                                //     state — Track 3 Stage 5).
+                                {
+                                    let mr = mean_rev.entry(analyzer_key.clone()).or_insert_with(
+                                        || MeanReversionStrategy::new(MeanReversionConfig::crypto_aggressive()),
+                                    );
+                                    match mr.update_hlc(high, low, close) {
+                                        MeanReversionSignal::Buy => strategy_votes.push((
+                                            janus_core::SignalType::Buy,
+                                            0.7,
+                                            "mean_reversion".to_string(),
+                                        )),
+                                        MeanReversionSignal::Sell => strategy_votes.push((
+                                            janus_core::SignalType::Sell,
+                                            0.7,
+                                            "mean_reversion".to_string(),
+                                        )),
+                                        MeanReversionSignal::Hold => {}
                                     }
                                 }
 
