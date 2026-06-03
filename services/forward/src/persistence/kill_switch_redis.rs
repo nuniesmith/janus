@@ -617,6 +617,70 @@ impl RedisKillSwitch {
         })
     }
 
+    /// Spawn a background task that polls Redis at the configured interval to
+    /// keep the local cache fresh for [`is_killed_cached`](Self::is_killed_cached)
+    /// fast-path checks.
+    ///
+    /// Unlike [`spawn_sync_task`](Self::spawn_sync_task), this does not require a
+    /// `TradingPipeline` — it only refreshes the cache, so it can guard execution
+    /// choke points that consult `is_killed_cached()` directly (e.g. the signal
+    /// generator's `submit_signal_to_execution`). On sustained Redis failure it
+    /// fails **closed**: after 10 consecutive errors the cached state is forced
+    /// to "killed" so trading halts until Redis is reachable again.
+    ///
+    /// Returns a `JoinHandle` that can be aborted on shutdown.
+    pub fn spawn_cache_refresh_task(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let ks = Arc::clone(self);
+        let interval_ms = ks.config.poll_interval_ms;
+
+        info!(
+            "Starting kill switch cache-refresh task (key={}, poll={}ms)",
+            ks.config.key, interval_ms,
+        );
+
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_millis(interval_ms));
+            // Skip the first immediate tick — `new()` already seeded the cache.
+            ticker.tick().await;
+
+            let mut consecutive_errors: u32 = 0;
+
+            loop {
+                ticker.tick().await;
+
+                // `is_killed()` refreshes `local_cache` as a side effect.
+                match ks.is_killed().await {
+                    Ok(_) => consecutive_errors = 0,
+                    Err(e) => {
+                        consecutive_errors += 1;
+                        if consecutive_errors <= 3 {
+                            warn!(
+                                "Kill switch cache-refresh error ({}/3): {}",
+                                consecutive_errors, e,
+                            );
+                        } else if consecutive_errors == 4 {
+                            error!(
+                                "Kill switch cache-refresh: {} consecutive errors. \
+                                 Suppressing further warnings. Last error: {}",
+                                consecutive_errors, e,
+                            );
+                        }
+                        // Fail closed: after sustained Redis failure, force the
+                        // cached state to "killed" so the execution choke point
+                        // halts trading until Redis is reachable again.
+                        if consecutive_errors == 10 {
+                            error!(
+                                "🛑 Kill switch cache-refresh: 10 consecutive Redis failures. \
+                                 Forcing local cache to KILLED as a safety measure."
+                            );
+                            *ks.local_cache.write().await = true;
+                        }
+                    }
+                }
+            }
+        })
+    }
+
     /// Spawn a sync task that also periodically refreshes the TTL
     /// (for dead-man's switch mode).
     pub fn spawn_sync_task_with_ttl_refresh(
