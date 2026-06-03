@@ -1009,6 +1009,23 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                     "prop-firm validation: advisory (logs + metadata only; set JANUS_PROP_FIRM_ENFORCE=1 to block)"
                 );
             }
+            // Portfolio-aware RiskManager enforcement (Track 3 Stage 5). Symmetric
+            // with prop-firm enforcement above and default-off: when set, a
+            // RiskManager rejection blocks the execution submit (the signal is
+            // still published to the bus for observability). Preserves today's
+            // advisory behaviour unless explicitly enabled.
+            let risk_enforce = std::env::var("JANUS_RISK_ENFORCE")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            if risk_enforce {
+                info!(
+                    "portfolio risk check: ENFORCING (RiskManager-rejected live entries will be blocked)"
+                );
+            } else {
+                info!(
+                    "portfolio risk check: advisory (logs + metadata only; set JANUS_RISK_ENFORCE=1 to block)"
+                );
+            }
 
             let mut klines_processed: u64 = 0;
             let mut signals_generated: u64 = 0;
@@ -1510,15 +1527,28 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                                     }
                                 }
 
-                                // Submit to execution service if actionable. When
-                                // prop-firm enforcement is enabled, a non-compliant entry
-                                // is blocked here (advisory by default — see the flag).
+                                // Submit to execution service if actionable. Enforcement
+                                // gates (both default-off) suppress only the execution
+                                // submit — the signal is already on the bus above for
+                                // observability — preserving "no autonomous execution" for
+                                // risk-rejected entries. A prop-firm violation blocks under
+                                // JANUS_PROP_FIRM_ENFORCE; a RiskManager rejection blocks
+                                // under JANUS_RISK_ENFORCE.
                                 if final_type != janus_core::SignalType::Hold && avg_confidence >= 0.7 {
-                                    if prop_firm_enforce && prop_firm_label.starts_with("violation") {
+                                    let block_reason = if prop_firm_enforce
+                                        && prop_firm_label.starts_with("violation")
+                                    {
+                                        Some(format!("prop-firm: {prop_firm_label}"))
+                                    } else if risk_enforce && risk_check.starts_with("rejected") {
+                                        Some(format!("risk: {risk_check}"))
+                                    } else {
+                                        None
+                                    };
+                                    if let Some(reason) = block_reason {
                                         warn!(
                                             symbol = %symbol_str,
-                                            prop_firm = %prop_firm_label,
-                                            "prop-firm ENFORCE: blocking non-compliant live entry"
+                                            reason = %reason,
+                                            "risk ENFORCE: blocking live entry from execution submit"
                                         );
                                     } else if let Err(e) =
                                         signal_gen.submit_signal_to_execution(&signal).await
