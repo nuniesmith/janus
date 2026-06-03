@@ -43,12 +43,14 @@
 > highest-value items and are **not** otherwise tracked below.
 
 ### The orphaned sophisticated pipeline
-- [ ] **`services/forward/src/event_loop.rs` (4,114 LOC) is compiled out** — there
-      is no `mod event_loop` (nor `mod actors`) in `services/forward/src/lib.rs`.
-      It holds the rich single-symbol pipeline: the 5-strategy suite
-      (EMAFlip/MeanReversion/Squeeze/VWAP/ORB from `crates/strategies`), **inline
-      `PropFirmValidator` on every entry**, and regime gating. The **live** path
-      is the simpler multi-symbol `tokio::spawn` block in `lib.rs` (~L920–1264).
+- [x] **`services/forward/src/event_loop.rs` deleted (#51).** It was dead code —
+      compiled out (no `mod event_loop` / `mod actors` in `lib.rs`) — holding a
+      single-symbol *reference* pipeline: the 5-strategy suite
+      (EMAFlip/MeanReversion/Squeeze/VWAP/ORB), inline `PropFirmValidator`, and
+      regime gating. All of that now lives in the **live** multi-symbol loop in
+      `lib.rs`, so the orphan was removed (~4.5k LOC incl. `actors/`) rather than
+      re-wired. The live loop is the single source of truth — see
+      `docs/architecture/RISK_TOPOLOGY.md`.
 
       **DECISION (2026-06-02): PORT incrementally into the live `lib.rs` loop;
       retire `event_loop.rs` once its capabilities land. Do _not_ re-wire it as a
@@ -64,22 +66,25 @@
         3. ✅ **Emit `regime` + `fear` into `signal.metadata`** (PRs #41/#42).
         4. ✅ **`RiskManager::apply_risk_management` inline** — advisory, against the
            live `PortfolioState` (PR #44).
-        5. ⏳ **Port the strategy suite, then retire `event_loop.rs`; unify the risk
-           engines.** Per the owner's call (2026-06-02): **port the 5-strategy suite
-           first** so no capability is lost before deleting `event_loop.rs`; and make
-           **`logic::ComprehensiveRiskEngine` the canonical** risk engine (re-wire the
-           live path to it; delete `compliance::ComplianceSheriff` +
-           `models::prop_firm::PropFirmValidator`). Strategy port **core suite done**:
-           `EMAFlipStrategy` (replacing the inline `ema_cross`), `MeanReversionStrategy`
-           (Bollinger-band MR), `SqueezeBreakoutStrategy` (BB/Keltner squeeze → breakout),
-           and the session-anchored `VwapScalperStrategy` + `OrbStrategy` pair are all wired
-           into the live loop with per-symbol state. VWAP/ORB anchor each symbol's session
-           to the UTC calendar day (00:00 UTC reset — `reset_session()` / `start_session()`),
-           since 24/7 crypto has no natural open. Optional extras remain (EmaRibbon /
-           TrendPullback / MomentumSurge / MultiTfTrend). With the suite ported, the next
-           track is retiring `event_loop.rs` and unifying onto `logic::ComprehensiveRiskEngine`.
-      Integration tests currently *mirror* `event_loop.rs`'s logic rather than call
-      it; as each strategy ports, point the matching test at the live path.
+        5. ✅ **Strategy suite ported + `event_loop.rs` retired (#51).** The core suite is
+           wired into the live loop with per-symbol state: `EMAFlipStrategy` (replacing the
+           inline `ema_cross`), `MeanReversionStrategy` (Bollinger-band MR),
+           `SqueezeBreakoutStrategy` (BB/Keltner squeeze → breakout), and the session-anchored
+           `VwapScalperStrategy` + `OrbStrategy` pair. VWAP/ORB anchor each symbol's session to
+           the UTC calendar day (00:00 UTC reset — `reset_session()` / `start_session()`), since
+           24/7 crypto has no natural open. Optional extras remain (EmaRibbon / TrendPullback /
+           MomentumSurge / MultiTfTrend). **Risk-engine note:** the original 2026-06-02 plan to
+           make `logic::ComprehensiveRiskEngine` canonical (and delete `ComplianceSheriff` +
+           `PropFirmValidator`) was **investigated and dropped** — `ComprehensiveRiskEngine` is an
+           unwired, stateless library validator with no production consumer, and the live loop
+           already enforces via `PropFirmValidator` + `RiskManager` (now blocking under
+           `JANUS_RISK_ENFORCE`, #49) plus a cross-process Redis kill-switch (#50). The standing
+           engine-consolidation item is below; see `docs/architecture/RISK_TOPOLOGY.md` for the
+           actual live topology.
+      The integration tests that once *mirrored* `event_loop.rs` (e.g.
+      `regime_mr_integration.rs`, `kraken_strategies_integration.rs`) now stand as the
+      live-path reference; the source is gone. (Minor follow-up: a few stale `event_loop`
+      mentions linger in comments — harmless, clean up opportunistically.)
 
 ### Risk enforcement is REST-on-demand, not inline
 - [x] **Apply risk on each live signal.** **`PropFirmValidator` (Stage 2)** + **`RiskManager`
@@ -89,14 +94,21 @@
       check against the live `PortfolioState` (concurrent positions / exposure / daily loss),
       surfaced as `risk_check` metadata. Both **advisory by default** (never block live trades
       on their own, per "no autonomous execution"); the live portfolio is kept current by the
-      REST add/close endpoints. **Follow-ups:** wire the RiskManager verdict into the enforce
-      gate too, and feed closed-trade outcomes back so the validators' stateful daily-loss /
-      drawdown rules engage (not just per-trade / point-in-time checks).
+      REST add/close endpoints. **Follow-ups:** ✅ the RiskManager verdict is now wired into the
+      enforce gate (`JANUS_RISK_ENFORCE`, #49), and a cross-process Redis kill-switch suppresses
+      execution at the `submit_signal_to_execution` choke point (#50). ⏳ Still open: feed
+      closed-trade outcomes back so the validators' stateful daily-loss / drawdown rules engage
+      (not just per-trade / point-in-time checks).
 - [ ] **Unify the three duplicate prop-firm / risk engines** into one:
       `crates/models::prop_firm` (`PropFirmValidator`/`HyroTraderRules`),
       `crates/compliance` (`ComplianceSheriff`), `crates/logic` (`ComprehensiveRiskEngine`/
       `PropFirmType`). Pick the canonical one, delete the others. (Also: the rules
       are HyroTrader-specific + hardcoded — generalize across prop firms.)
+      **Current reality (don't assume otherwise):** only `models::prop_firm::PropFirmValidator`
+      + the portfolio `RiskManager` are actually on the live path; `ComprehensiveRiskEngine` and
+      `ComplianceSheriff` are unwired. So consolidation means deciding whether to *adopt* one of
+      the unwired engines onto the live path or *fold* their logic into the live validators — not
+      deleting what's already running. See `docs/architecture/RISK_TOPOLOGY.md`.
 
 ### The regime detector is built but under-fed
 - [x] **Feed the regime detector live.** `RegimeManager` (`services/forward/src/
