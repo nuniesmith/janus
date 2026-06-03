@@ -70,11 +70,12 @@
            **`logic::ComprehensiveRiskEngine` the canonical** risk engine (re-wire the
            live path to it; delete `compliance::ComplianceSheriff` +
            `models::prop_firm::PropFirmValidator`). Strategy port **in progress**:
-           `EMAFlipStrategy` (replacing the inline `ema_cross`) and `MeanReversionStrategy`
-           (Bollinger-band MR over HLC) are wired into the live loop with per-symbol state.
-           Remaining strategies: SqueezeBreakout, VwapScalper, Orb (+ EmaRibbon /
-           TrendPullback / MomentumSurge / MultiTfTrend if desired). Each is a focused
-           follow-up PR.
+           `EMAFlipStrategy` (replacing the inline `ema_cross`), `MeanReversionStrategy`
+           (Bollinger-band MR over HLC), and `SqueezeBreakoutStrategy` (BB/Keltner squeeze
+           → breakout) are wired into the live loop with per-symbol state. Remaining
+           strategies: VwapScalper, Orb — the session-stateful pair, which need an
+           intraday-session reset hook (+ EmaRibbon / TrendPullback / MomentumSurge /
+           MultiTfTrend if desired). Each is a focused follow-up PR.
       Integration tests currently *mirror* `event_loop.rs`'s logic rather than call
       it; as each strategy ports, point the matching test at the live path.
 
