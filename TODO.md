@@ -99,16 +99,12 @@
       execution at the `submit_signal_to_execution` choke point (#50). ⏳ Still open: feed
       closed-trade outcomes back so the validators' stateful daily-loss / drawdown rules engage
       (not just per-trade / point-in-time checks).
-- [ ] **Unify the three duplicate prop-firm / risk engines** into one:
-      `crates/models::prop_firm` (`PropFirmValidator`/`HyroTraderRules`),
-      `crates/compliance` (`ComplianceSheriff`), `crates/logic` (`ComprehensiveRiskEngine`/
-      `PropFirmType`). Pick the canonical one, delete the others. (Also: the rules
-      are HyroTrader-specific + hardcoded — generalize across prop firms.)
-      **Current reality (don't assume otherwise):** only `models::prop_firm::PropFirmValidator`
-      + the portfolio `RiskManager` are actually on the live path; `ComprehensiveRiskEngine` and
-      `ComplianceSheriff` are unwired. So consolidation means deciding whether to *adopt* one of
-      the unwired engines onto the live path or *fold* their logic into the live validators — not
-      deleting what's already running. See `docs/architecture/RISK_TOPOLOGY.md`.
+- [x] **Unify the duplicate prop-firm / risk engines — done (#54).** Consolidated onto the live
+      `models::prop_firm::PropFirmValidator` + portfolio `RiskManager`: deleted the orphaned
+      `logic::ComprehensiveRiskEngine` (+ `risk`/`constraints`) and `common::RiskEngine`, migrated
+      `crates/backtest` off `compliance::ComplianceSheriff` and removed it, and **generalized
+      `PropFirmValidator` across firms** (`PropFirm` enum + presets, config-driven prohibited
+      symbols; `new()` keeps the HyroTrader preset). See `docs/architecture/RISK_TOPOLOGY.md`.
 
 ### The regime detector is built but under-fed
 - [x] **Feed the regime detector live.** `RegimeManager` (`services/forward/src/
@@ -124,14 +120,15 @@
       bridge instead of `None` for a sharper amygdala read.)*
 
 ### The brain itself is rule-based; ML/neuromorphic are unwired
-- [ ] **Decide the ML story.** ONNX inference (`services/forward/src/inference.rs`,
-      tract-onnx) is real but `enable_ml_inference` defaults **false** and isn't on
-      the live path; `crates/ml` (DQN/LSTM, candle) trains in `services/backward`
-      but its models aren't loaded into live forward; the 251K-LOC
-      `neuromorphic/` stack is **entirely disconnected** (no service depends on it;
-      the two apparent importers are comment-only / a local health shim). Either
-      wire a path (ONNX fusion is the cheapest) or formally mark these
-      research-only until the 30-day validation gate (P3) passes.
+- [ ] **ML story: decided + Phase 1 foundation built — now run the probe.** Documented in
+      `docs/architecture/ML_STORY.md` (#55): the live path is rule-based; ~300K LOC of ML is
+      unwired; the tract-ONNX `inference.rs` is a dead end (the trained models are Burn, not ONNX)
+      and `neuromorphic/` is now CI-quarantined (#56). Direction chosen = the vision/GAF route
+      (`ML_VISION_SCOPE.md`, #58). **Phase 1 machinery is built + merged (#59–#62):** GAF feature
+      extractor → real experience builder → sliding-window batches → opt-in `backward` seeding.
+      **Remaining (needs real data + GPU):** run the go/no-go probe (does GAF beat chance?) per
+      `docs/architecture/ML_PHASE1_HANDOFF.md` (#63); enrich the flat features + reward scheme;
+      serve into forward only if it shows edge.
 
 ### Multi-asset breadth
 - [ ] **Futures + equities asset classes.** `crates/optimizer/src/asset.rs`
@@ -216,7 +213,7 @@ gaps are below.
 
 ## P2 — Observability & quality gates
 
-- [ ] **`cargo fmt --check` in CI.** Intentionally disabled (`ci.yml:38-40`) because the tree has unformatted regions. Land a one-shot reformat PR, then re-enable the step.
+- [x] **`cargo fmt --check` in CI — done (#57).** One-shot `cargo fmt --all` reformat landed and the `cargo fmt --all --check` gate is re-enabled in `ci.yml` (runs before the heavier check). Tree is fmt-clean.
 - [x] **Dependency vuln scanning in CI (2026-05-31).** `.github/workflows/security.yml` runs `cargo-audit` (RUSTSEC) on dependency-manifest changes, weekly, and on demand. **Informational** for now: it reports advisories in the job summary + a `::warning::` annotation but **exits 0** (green check), so it surfaces findings without red-lining `main` or training people to ignore a by-design-red check. Flip to a hard gate (drop the `exit 0`, mark required) once the advisory backlog above is cleared. Trivy filesystem scan still TODO.
 - [ ] **Service-backed integration tests in CI.** `ci.yml` runs `--lib` only; integration/e2e suites that need Postgres/Redis (e.g. `services/forward/tests/param_reload_integration.rs`, the execution scenarios) don't run. Add a job with service containers.
 - [ ] **Distributed tracing (OpenTelemetry/Jaeger).** `Config` has a `tracing`/`jaeger_endpoint` field that nothing reads. Either wire OTel export through it or drop the field. Plain `tracing` is used everywhere today.
