@@ -822,6 +822,20 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
     // Subscribe to signals from signal bus
     let mut signal_rx = state.signal_bus.subscribe();
     let signal_generator = service.signal_generator();
+
+    // ── Burn model hot-reload ─────────────────────────────────────────────
+    // Reload the SignalGenerator's Burn inference model when the backward
+    // trainer publishes a new checkpoint. Inert unless hot-reload is configured
+    // and the generator has ML inference enabled; a missing Redis never blocks
+    // startup (the listener handles connection errors in its own task).
+    let model_reload_task =
+        crate::param_reload::spawn_signal_model_reloader(Arc::clone(&signal_generator))
+            .await
+            .unwrap_or_else(|e| {
+                warn!("Model hot-reload listener failed to start: {e}");
+                tokio::spawn(async {})
+            });
+
     // Shared risk state for the inline portfolio-aware risk check (Track 3 Stage 4).
     // The portfolio is kept current by the REST add/close endpoints.
     let risk_manager_handle = service.risk_manager();
@@ -1842,6 +1856,7 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
     signal_gen_task.abort();
     signal_rx_task.abort();
     session_metrics_task.abort();
+    model_reload_task.abort();
 
     // Shutdown service
     service

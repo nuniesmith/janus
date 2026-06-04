@@ -40,5 +40,5 @@ pub use appliers::{
 pub use manager::{ParamApplier, ParamReloadConfig, ParamReloadManager, ReloadStats};
 pub use model_reload::{
     CallbackReloadHandler, LoggingReloadHandler, ModelReloadConfig, ModelReloadHandler,
-    ModelReloadListener, ModelReloadStats,
+    ModelReloadListener, ModelReloadStats, spawn_signal_model_reloader,
 };
