@@ -59,16 +59,6 @@ pub struct Signal {
     pub predicted_duration_seconds: Option<u64>,
 }
 
-/// Risk engine - validates orders against risk constraints
-pub trait RiskEngine: Send + Sync {
-    /// Verify an order against risk limits
-    fn verify_order(&self, order: &Order) -> Result<f64, JanusError>;
-    // Returns compliance score: 0.0 (reject) to 1.0 (fully compliant)
-
-    /// Check if an order violates any hard constraints
-    fn is_valid(&self, order: &Order) -> bool;
-}
-
 /// Execution engine - routes orders to exchanges
 pub trait ExecutionEngine: Send + Sync {
     /// Submit an order for execution
