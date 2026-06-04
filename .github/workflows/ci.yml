@@ -42,8 +42,13 @@ jobs:
       # `--all-targets` exercises lib + bin + tests + examples + benches
       # so rot in any of them shows up at PR time instead of when someone
       # actually runs `cargo bench` or builds an example.
+      #
+      # `jflow-neuromorphic` (~251K LOC) is excluded: it is an experimental
+      # subsystem that no service depends on, so compiling it on every PR is
+      # pure cost. It remains a workspace member, buildable on demand with
+      # `cargo check -p jflow-neuromorphic`. See docs/architecture/ML_STORY.md.
       - name: cargo check --workspace
-        run: cargo check --workspace --all-targets
+        run: cargo check --workspace --all-targets --exclude jflow-neuromorphic
 
   rust-test:
     name: rust test
@@ -68,8 +73,9 @@ jobs:
 
       # `--lib` skips integration / e2e suites that need a live Postgres
       # or Redis. Those run separately if/when we wire up service-backed CI.
+      # `jflow-neuromorphic` is excluded for the same reason as in rust-check.
       - name: cargo test --workspace --lib
-        run: cargo test --workspace --lib --no-fail-fast
+        run: cargo test --workspace --lib --no-fail-fast --exclude jflow-neuromorphic
 
   docker-build:
     name: docker build (no push)
