@@ -1627,7 +1627,10 @@ impl Config {
         let overlay: serde_json::Value = match serde_json::from_str(&json) {
             Ok(v) => v,
             Err(e) => {
-                warn!("Redis config overlay: malformed JSON at {key} — {e}", key = "fks:janus:config");
+                warn!(
+                    "Redis config overlay: malformed JSON at {key} — {e}",
+                    key = "fks:janus:config"
+                );
                 return;
             }
         };
@@ -1875,6 +1878,9 @@ mod tests {
             http = 8080
         "#;
         let result: Result<Config, _> = toml::from_str(toml_str);
-        assert!(result.is_err(), "legacy top-level http_port should be rejected");
+        assert!(
+            result.is_err(),
+            "legacy top-level http_port should be rejected"
+        );
     }
 }

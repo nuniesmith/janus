@@ -77,7 +77,12 @@ pub async fn start_module(state: Arc<JanusState>) -> janus_core::Result<()> {
     let position_tracker = Arc::new(PositionTracker::new());
 
     // Build the main HTTP router
-    let app = create_router(state.clone(), position_store, param_manager, position_tracker);
+    let app = create_router(
+        state.clone(),
+        position_store,
+        param_manager,
+        position_tracker,
+    );
 
     // Build the metrics router
     let metrics_app = create_metrics_router();
@@ -1677,7 +1682,10 @@ mod tests {
         assert_eq!(status, StatusCode::ACCEPTED);
         assert_eq!(value["guidance"]["action"], "exit");
         assert!(
-            value["guidance"]["reason"].as_str().unwrap().contains("fear"),
+            value["guidance"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("fear"),
             "reason should mention fear, got: {}",
             value["guidance"]["reason"]
         );
@@ -1863,7 +1871,10 @@ mod tests {
         assert_eq!(status, StatusCode::ACCEPTED);
         let o = &value["outcome"];
         assert_eq!(o["samples"], 2, "both snapshots should be counted");
-        assert_eq!(o["last_guidance"], "reduce", "last advice was a trailing reduce");
+        assert_eq!(
+            o["last_guidance"], "reduce",
+            "last advice was a trailing reduce"
+        );
         assert_eq!(o["result"], "win"); // +500 realized
         let peak = o["peak_pnl_ratio"].as_f64().expect("peak recorded");
         assert!((peak - 0.10).abs() < 1e-6, "peak was {peak}");
@@ -1922,7 +1933,13 @@ mod tests {
         // base_asset("BTC-USD") == "BTC"; +500 realized = win; rr passed through.
         assert_eq!(
             calls[0],
-            ("ema_cross".to_string(), "BTC".to_string(), 500.0, true, Some(2.5))
+            (
+                "ema_cross".to_string(),
+                "BTC".to_string(),
+                500.0,
+                true,
+                Some(2.5)
+            )
         );
     }
 
@@ -1944,6 +1961,9 @@ mod tests {
         });
         let (status, _) = post_json(&router, "/api/v1/positions/close", close).await;
         assert_eq!(status, StatusCode::ACCEPTED);
-        assert!(calls.lock().unwrap().is_empty(), "no strategy ⇒ no affinity call");
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "no strategy ⇒ no affinity call"
+        );
     }
 }

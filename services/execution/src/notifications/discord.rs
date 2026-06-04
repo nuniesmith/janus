@@ -83,7 +83,8 @@ impl DiscordNotifier {
 
     /// Create from environment variables
     pub fn from_env() -> Self {
-        let webhook_url = std::env::var("DISCORD_WEBHOOK_GENERAL").unwrap_or_else(|_| String::new());
+        let webhook_url =
+            std::env::var("DISCORD_WEBHOOK_GENERAL").unwrap_or_else(|_| String::new());
         let enabled = std::env::var("DISCORD_ENABLE_NOTIFICATIONS")
             .unwrap_or_else(|_| "false".to_string())
             .parse()
