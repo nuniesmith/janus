@@ -29,6 +29,7 @@ use janus_ml::backend::{BackendDevice, CpuBackend};
 use janus_ml::dqn::{DqnOnlineModel, DqnStepResult, compute_double_dqn_targets};
 use janus_ml::models::trainable::TrainableLstmConfig;
 use janus_ml::models::{LstmConfig, LstmPredictor};
+use janus_vision::gaf_features_from_closes;
 
 // ─── Configuration ────────────────────────────────────────────────────────────
 
@@ -121,6 +122,38 @@ fn create_placeholder_experience() -> Experience {
     let next_state = State::from_flat_gaf(vec![0.0_f32; 9], vec![], metadata);
     let action = Action::new(ActionType::Hold, "PLACEHOLDER".to_string(), 0.0);
     Experience::new(state, action, 0.0, next_state, false)
+}
+
+/// Build a *real* training experience from a price window, computing GAF
+/// features via DiffGAF instead of the zero placeholder used by
+/// [`create_placeholder_experience`].
+///
+/// `closes` is the current window and `next_closes` the window advanced one bar
+/// (the resulting next state). Once a real OHLCV source feeds the training loop
+/// (next increment), the replay buffer seeds from these real-feature
+/// experiences instead of zeros — closing the train-on-zeros gap documented in
+/// `docs/architecture/ML_VISION_SCOPE.md`.
+pub fn experience_from_closes(
+    closes: &[f32],
+    next_closes: &[f32],
+    action_type: ActionType,
+    reward: f32,
+    done: bool,
+    symbol: &str,
+    image_size: usize,
+) -> Result<Experience> {
+    let device = candle_core::Device::Cpu;
+    let gaf = gaf_features_from_closes(closes, image_size, &device)
+        .context("computing GAF features for state")?;
+    let next_gaf = gaf_features_from_closes(next_closes, image_size, &device)
+        .context("computing GAF features for next state")?;
+
+    let meta = StateMetadata::new(symbol.to_string());
+    let state = State::from_flat_gaf(gaf.flat, closes.to_vec(), meta.clone());
+    let next_state = State::from_flat_gaf(next_gaf.flat, next_closes.to_vec(), meta);
+    let action = Action::new(action_type, symbol.to_string(), 0.0);
+
+    Ok(Experience::new(state, action, reward, next_state, done))
 }
 
 /// Build an [`LstmConfig`] (inference) from a [`TrainingConfig`].
@@ -619,6 +652,20 @@ fn compute_training_step(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_experience_from_closes_has_real_features() {
+        // Real GAF features, in contrast to create_placeholder_experience's zeros.
+        let closes: Vec<f32> = (0..32).map(|t| 100.0 + (t as f32 * 0.2).sin()).collect();
+        let next: Vec<f32> = (1..33).map(|t| 100.0 + (t as f32 * 0.2).sin()).collect();
+
+        let exp = experience_from_closes(&closes, &next, ActionType::Buy, 1.0, false, "BTCUSD", 16)
+            .unwrap();
+
+        assert!(!exp.state.gaf_features_flat.is_empty());
+        assert!(exp.state.gaf_features_flat.iter().any(|&v| v != 0.0));
+        assert!(exp.state.gaf_features_flat.iter().all(|v| v.is_finite()));
+    }
 
     #[test]
     fn test_training_config_defaults() {

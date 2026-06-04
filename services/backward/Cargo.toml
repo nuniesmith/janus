@@ -23,6 +23,9 @@ cns = { package = "jflow-cns", path = "../../crates/cns" }
 janus-models = { path = "../../crates/models", package = "jflow-models" }
 janus-health = { path = "../../crates/health", package = "jflow-health" }
 janus-ml = { path = "../../crates/ml", package = "jflow-ml" }
+# Vision (DiffGAF) for real GAF training features (ML Phase 1)
+janus-vision = { path = "../../crates/vision", package = "jflow-vision" }
+candle-core = { workspace = true }
 
 # Job Queue
 apalis = { workspace = true }
