@@ -2,7 +2,7 @@
 
 **Rust ML inference engine and neuromorphic trading brain — source code only.**
 
-This repo contains the Janus engine: a 50+ crate Rust workspace implementing ML inference, neuromorphic GPU compute, signal generation, gRPC services, QuestDB data pipelines, and risk management. Infrastructure (Docker, compose, CI/CD) lives in [fks](https://github.com/nuniesmith/fks).
+This repo contains the Janus engine: a 39-crate Rust workspace implementing ML inference, neuromorphic GPU compute, signal generation, gRPC services, QuestDB data pipelines, and risk management. Infrastructure (Docker, compose, CI/CD) lives in [fks](https://github.com/nuniesmith/fks).
 
 ---
 
@@ -29,7 +29,7 @@ Brain-region-mapped Rust modules — experimental (30-day live validation requir
 
 ### Core crates (`crates/`)
 
-`ml` · `lob` (limit order book simulator) · `logic` (LTN fuzzy logic) · `dsp` (FRAMA signal processing) · `strategies` · `backtest` · `vision` (DiffGAF/ViViT) · `regime` · `cns` · `ltn` · `optimizer` · `memory` · `training` · `exchanges` · `indicators` · `data-quality` · `gap-detection` · `compliance` · `rate-limiter` · `risk` · `health` · `common` · `apalis-redis` · `registry` · `questdb-writer` · `bybit-client`
+`ml` · `lob` (limit order book simulator) · `logic` (LTN fuzzy logic) · `dsp` (FRAMA signal processing) · `strategies` · `backtest` · `vision` (DiffGAF/ViViT) · `regime` · `cns` · `ltn` · `optimizer` · `memory` · `training` · `exchanges` · `models` (trades/signals/account/performance + prop-firm validator) · `data-quality` · `gap-detection` · `compliance` · `rate-limiter` · `risk` · `health` · `common` · `apalis-redis` · `registry` · `questdb-writer` · `fks-proto` (Janus-side protobuf surface)
 
 ### Proto definitions (`services/forward/proto/`)
 
