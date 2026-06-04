@@ -522,6 +522,10 @@ mod tests {
         let config = ThrottleConfig {
             max_concurrent: 2,
             questdb_data_dir: "/tmp".to_string(), // Use /tmp for tests
+            // Decouple from the runner's real disk usage: this test exercises
+            // the concurrency semaphore, not the disk gate (which has its own
+            // tests). Without this, a >90%-full /tmp fails the gate first.
+            max_disk_usage: 1.0,
             ..Default::default()
         };
         let throttle = Arc::new(BackfillThrottle::new(config));
@@ -576,6 +580,10 @@ mod tests {
         let config = ThrottleConfig {
             max_ooo_rows: 1000,
             questdb_data_dir: "/tmp".to_string(), // Use /tmp for tests
+            // Decouple from the runner's real disk usage: this test exercises
+            // the gap-size limit, not the disk gate (which has its own tests).
+            // Without this, a >90%-full /tmp fails the gate first.
+            max_disk_usage: 1.0,
             ..Default::default()
         };
         let throttle = BackfillThrottle::new(config);
