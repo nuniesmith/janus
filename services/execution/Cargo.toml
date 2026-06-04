@@ -63,7 +63,6 @@ fks-proto = { workspace = true }
 # ---------------------------------------------------------------------------
 janus-questdb-writer = { workspace = true }
 janus-risk = { workspace = true }
-janus-compliance = { workspace = true }
 janus-models = { workspace = true }
 
 # ---------------------------------------------------------------------------

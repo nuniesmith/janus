@@ -13,11 +13,8 @@
 //!
 //! Uses ndarray for inference-time constraint checking:
 //! - `tnorm`: Traditional fuzzy logic operations (Łukasiewicz T-Norms)
-//! - `constraints`: Rule-based constraint checking
 //! - `signal`: Signal validation and filtering
 //! - `position`: Position-related logic
-//! - `risk`: Risk assessment logic
-//! - `risk_engine`: Full risk evaluation engine
 //!
 //! ## 2. Differentiable Logic Tensor Networks (LTN)
 //!
@@ -88,10 +85,7 @@
 // Non-Differentiable Modules (ndarray-based)
 // =============================================================================
 
-pub mod constraints;
 pub mod position;
-pub mod risk;
-pub mod risk_engine;
 pub mod signal;
 pub mod tnorm;
 
@@ -107,10 +101,7 @@ pub mod predicates;
 // Re-exports: Traditional Logic
 // =============================================================================
 
-pub use constraints::*;
 pub use position::*;
-pub use risk::*;
-pub use risk_engine::*;
 pub use signal::*;
 pub use tnorm::{FuzzyLogic, LogicTensorNetwork, LogicalRule as TraditionalLogicalRule};
 

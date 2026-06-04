@@ -70,14 +70,30 @@ pub enum AccountStatus {
 /// HyroTrader compliance checker
 pub struct PropFirmValidator {
     pub account: PropFirmAccount,
-    pub rules: HyroTraderRules,
+    pub rules: PropFirmRules,
     pub soft_breach_count: i32,
     pub stop_loss_violations: HashMap<String, DateTime<Utc>>,
 }
 
-/// HyroTrader rules configuration
+/// Which prop firm's rule set applies.
+///
+/// The validator is parameterized over this so one implementation covers every
+/// firm; [`PropFirmRules::for_firm`] returns the matching preset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PropFirm {
+    HyroTrader,
+    TakeProfitTrader,
+    /// Permissive baseline for an unconfigured / generic challenge.
+    Generic,
+}
+
+/// Prop firm rules configuration.
+///
+/// Firm-agnostic: construct via [`PropFirmRules::for_firm`] or a named preset
+/// (e.g. [`PropFirmRules::hyrotrader`]). `Default` is the HyroTrader preset, so
+/// `PropFirmValidator::new` stays backward-compatible.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HyroTraderRules {
+pub struct PropFirmRules {
     // Risk limits
     pub daily_drawdown_percent: f64,
     pub max_drawdown_percent: f64,
@@ -100,10 +116,25 @@ pub struct HyroTraderRules {
     // Profit targets
     pub profit_target_percent: f64,
     pub phase_2_profit_target_percent: Option<f64>,
+
+    /// Symbols this firm prohibits, matched as a substring of the traded
+    /// symbol. Empty = no symbol restrictions.
+    #[serde(default)]
+    pub prohibited_symbols: Vec<String>,
 }
 
-impl Default for HyroTraderRules {
-    fn default() -> Self {
+impl PropFirmRules {
+    /// Rules for a given prop firm.
+    pub fn for_firm(firm: PropFirm) -> Self {
+        match firm {
+            PropFirm::HyroTrader => Self::hyrotrader(),
+            PropFirm::TakeProfitTrader => Self::take_profit_trader(),
+            PropFirm::Generic => Self::generic(),
+        }
+    }
+
+    /// HyroTrader rule set (the historical default).
+    pub fn hyrotrader() -> Self {
         Self {
             daily_drawdown_percent: 5.0,
             max_drawdown_percent: 10.0,
@@ -120,13 +151,59 @@ impl Default for HyroTraderRules {
             minimum_trading_days: 10,
             profit_target_percent: 10.0,
             phase_2_profit_target_percent: Some(5.0),
+            prohibited_symbols: vec!["EUR/USD".to_string(), "USDC".to_string()],
+        }
+    }
+
+    /// TakeProfitTrader rule set. These values are reasonable starting points;
+    /// reconcile against the firm's current rulebook before relying on them for
+    /// enforcement.
+    pub fn take_profit_trader() -> Self {
+        Self {
+            daily_drawdown_percent: 4.0,
+            max_drawdown_percent: 6.0,
+            max_risk_per_trade_percent: 2.0,
+            profit_target_percent: 8.0,
+            phase_2_profit_target_percent: None,
+            prohibited_symbols: Vec::new(),
+            ..Self::hyrotrader()
+        }
+    }
+
+    /// Permissive baseline for a generic / unconfigured challenge: no symbol
+    /// restrictions and stop-loss not mandatory.
+    pub fn generic() -> Self {
+        Self {
+            stop_loss_required: false,
+            prohibited_symbols: Vec::new(),
+            ..Self::hyrotrader()
         }
     }
 }
 
+impl Default for PropFirmRules {
+    fn default() -> Self {
+        Self::hyrotrader()
+    }
+}
+
 impl PropFirmValidator {
-    /// Create a new validator
+    /// Create a validator using the HyroTrader rule set (back-compat default).
     pub fn new(account_size: f64, challenge_type: ChallengeType) -> Self {
+        Self::with_rules(account_size, challenge_type, PropFirmRules::default())
+    }
+
+    /// Create a validator for a specific prop firm's rule set.
+    pub fn for_firm(account_size: f64, challenge_type: ChallengeType, firm: PropFirm) -> Self {
+        Self::with_rules(account_size, challenge_type, PropFirmRules::for_firm(firm))
+    }
+
+    /// Create a validator with an explicit rule set.
+    pub fn with_rules(
+        account_size: f64,
+        challenge_type: ChallengeType,
+        rules: PropFirmRules,
+    ) -> Self {
         let account = PropFirmAccount {
             account_size,
             challenge_type,
@@ -140,7 +217,7 @@ impl PropFirmValidator {
 
         Self {
             account,
-            rules: HyroTraderRules::default(),
+            rules,
             soft_breach_count: 0,
             stop_loss_violations: HashMap::new(),
         }
@@ -199,8 +276,13 @@ impl PropFirmValidator {
             ));
         }
 
-        // Check prohibited symbols
-        if symbol.contains("EUR/USD") || symbol.contains("USDC") {
+        // Check prohibited symbols (per the active firm's rule set)
+        if self
+            .rules
+            .prohibited_symbols
+            .iter()
+            .any(|p| symbol.contains(p.as_str()))
+        {
             violations.push(RuleViolation {
                 rule: "prohibited_symbol".to_string(),
                 severity: ViolationSeverity::AccountFailure,
@@ -480,5 +562,45 @@ mod tests {
 
         validator.update_balance(5500.0);
         assert!(validator.check_profit_target()); // 10% = 10%
+    }
+
+    #[test]
+    fn test_new_defaults_to_hyrotrader_preset() {
+        // `new` must stay behaviourally identical to the pre-generalization
+        // hardcoded HyroTrader rules (the live path relies on this).
+        let v = PropFirmValidator::new(10000.0, ChallengeType::OneStep);
+        assert_eq!(v.rules.daily_drawdown_percent, 5.0);
+        assert_eq!(v.rules.max_drawdown_percent, 10.0);
+        assert_eq!(v.rules.max_risk_per_trade_percent, 3.0);
+        assert!(v.rules.stop_loss_required);
+        assert!(v.rules.prohibited_symbols.iter().any(|s| s == "EUR/USD"));
+        assert!(v.rules.prohibited_symbols.iter().any(|s| s == "USDC"));
+    }
+
+    #[test]
+    fn test_prohibited_symbols_are_firm_specific() {
+        // A low-risk, stop-loss-set trade on a USDC pair: only the prohibited
+        // -symbol rule can fail it, isolating the behaviour under test.
+        let hyro = PropFirmValidator::new(5000.0, ChallengeType::OneStep);
+        let r = hyro.validate_trade("BTC/USDC", 50000.0, 48500.0, 500.0, 1);
+        assert!(!r.compliant);
+        assert!(r.violations.iter().any(|v| v.rule == "prohibited_symbol"));
+
+        // The generic firm imposes no symbol restrictions.
+        let generic =
+            PropFirmValidator::for_firm(5000.0, ChallengeType::OneStep, PropFirm::Generic);
+        let r = generic.validate_trade("BTC/USDC", 50000.0, 48500.0, 500.0, 1);
+        assert!(r.compliant);
+    }
+
+    #[test]
+    fn test_with_rules_uses_supplied_rules() {
+        let mut rules = PropFirmRules::generic();
+        rules.max_risk_per_trade_percent = 1.0;
+        let v = PropFirmValidator::with_rules(5000.0, ChallengeType::Funded, rules);
+        // ~4% risk trade (4% stop distance on a full-balance position)
+        // exceeds the custom 1% per-trade cap.
+        let r = v.validate_trade("BTC/USDT", 50000.0, 48000.0, 5000.0, 1);
+        assert!(!r.compliant);
     }
 }

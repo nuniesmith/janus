@@ -20,7 +20,7 @@
 use crate::data_loader::Tick;
 use crate::fortress::TemporalFortress;
 use chrono::{DateTime, Utc};
-use janus_compliance::{ComplianceSheriff, HyroTraderRules};
+use janus_models::prop_firm::{ChallengeType, PropFirmRules, PropFirmValidator};
 use janus_strategies::Signal;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -59,7 +59,7 @@ pub struct ReplayConfig {
     pub symbol: String,
 
     /// Prop firm rules to enforce
-    pub prop_firm_rules: Option<HyroTraderRules>,
+    pub prop_firm_rules: Option<PropFirmRules>,
 
     /// Slippage model (basis points)
     pub slippage_bps: f64,
@@ -153,7 +153,7 @@ pub struct ReplayEngine {
     config: ReplayConfig,
     fortress: TemporalFortress<Tick>,
     account: Account,
-    sheriff: Option<ComplianceSheriff>,
+    validator: Option<PropFirmValidator>,
     position: Option<Position>,
     trades: Vec<Trade>,
     equity_curve: Vec<(DateTime<Utc>, f64)>,
@@ -171,16 +171,15 @@ impl ReplayEngine {
             used_margin_usdt: 0.0,
         };
 
-        let sheriff = config
-            .prop_firm_rules
-            .as_ref()
-            .map(|rules| ComplianceSheriff::new(rules.clone(), initial_balance));
+        let validator = config.prop_firm_rules.as_ref().map(|rules| {
+            PropFirmValidator::with_rules(initial_balance, ChallengeType::OneStep, rules.clone())
+        });
 
         Self {
             config,
             fortress: TemporalFortress::new(),
             account,
-            sheriff,
+            validator,
             position: None,
             trades: Vec::new(),
             equity_curve: Vec::new(),
@@ -371,19 +370,19 @@ impl ReplayEngine {
         let quantity = available / execution_price;
 
         // Check prop firm rules if applicable
-        if let Some(ref sheriff) = self.sheriff {
+        if let Some(ref validator) = self.validator {
             let stop_loss = match side {
                 PositionSide::Long => Some(execution_price * 0.98), // 2% stop loss
                 PositionSide::Short => Some(execution_price * 1.02), // 2% stop loss
             };
 
-            let order_risk = (execution_price * quantity) * 0.02; // 2% risk
             let current_equity = self.calculate_equity(execution_price);
 
-            if sheriff
-                .validate_order(current_equity, order_risk, stop_loss)
-                .is_err()
-            {
+            // The checks ComplianceSheriff used to enforce, now routed through
+            // the canonical validator: stop-loss mandatory + daily-loss breach.
+            let stop_missing = validator.rules.stop_loss_required && stop_loss.is_none();
+            let daily_breach = validator.check_daily_drawdown(current_equity).is_some();
+            if stop_missing || daily_breach {
                 warn!("Position rejected by prop firm rules");
                 return Ok(());
             }
