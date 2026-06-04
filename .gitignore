@@ -15,3 +15,9 @@ target/
 # Logs
 logs/
 *.log
+
+# Trained-model binaries — only metadata (.json) + feature contracts are tracked
+**/checkpoints/**/*.bin
+**/*.onnx
+**/*.pt
+**/*.safetensors
