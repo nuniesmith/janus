@@ -66,6 +66,16 @@ pub struct TrainingConfig {
     pub model_dropout: f64,
     /// Directory for saving model checkpoints.
     pub checkpoint_dir: String,
+
+    // ── GAF seeding (ML Phase 1) ──────────────────────────────────────
+    /// Optional real close-price series used to seed the replay buffer with
+    /// real GAF-feature experiences instead of zero placeholders. `None` keeps
+    /// the historical placeholder behaviour (the default), so this is opt-in.
+    pub seed_closes: Option<Vec<f32>>,
+    /// Window length for GAF seeding.
+    pub gaf_window: usize,
+    /// GAF image size for seeding.
+    pub gaf_image_size: usize,
 }
 
 impl Default for TrainingConfig {
@@ -86,6 +96,9 @@ impl Default for TrainingConfig {
             model_num_layers: 2,
             model_dropout: 0.2,
             checkpoint_dir: "checkpoints/backward".to_string(),
+            seed_closes: None,
+            gaf_window: 32,
+            gaf_image_size: 16,
         }
     }
 }
@@ -122,6 +135,18 @@ fn create_placeholder_experience() -> Experience {
     let next_state = State::from_flat_gaf(vec![0.0_f32; 9], vec![], metadata);
     let action = Action::new(ActionType::Hold, "PLACEHOLDER".to_string(), 0.0);
     Experience::new(state, action, 0.0, next_state, false)
+}
+
+/// Build seed experiences for the replay buffer. Returns real GAF-feature
+/// experiences when `config.seed_closes` is set, otherwise an empty vec (the
+/// caller then falls back to [`create_placeholder_experience`]).
+fn build_seed_experiences(config: &TrainingConfig) -> Result<Vec<Experience>> {
+    match &config.seed_closes {
+        Some(closes) => {
+            experiences_from_series(closes, config.gaf_window, config.gaf_image_size, "SEED")
+        }
+        None => Ok(Vec::new()),
+    }
 }
 
 /// Build a *real* training experience from a price window, computing GAF
@@ -356,10 +381,24 @@ pub async fn handle_training(job: TrainJob, notifier: Option<&CheckpointNotifier
             "Replay buffer has fewer experiences than batch size — seeding with placeholders"
         );
         let needed = job.batch_size.saturating_sub(buffer_size);
+        // Seed with real GAF-feature experiences when configured (ML Phase 1),
+        // otherwise zero placeholders. Default config has `seed_closes: None`,
+        // so behaviour is unchanged unless real seed data is supplied.
+        let seed_exps = match build_seed_experiences(&config) {
+            Ok(exps) => exps,
+            Err(e) => {
+                warn!(error = %e, "GAF seeding failed; falling back to placeholders");
+                Vec::new()
+            }
+        };
         for i in 0..needed {
-            let exp = create_placeholder_experience();
+            let exp = if seed_exps.is_empty() {
+                create_placeholder_experience()
+            } else {
+                seed_exps[i % seed_exps.len()].clone()
+            };
             replay_buffer.add(exp, 1.0);
-            debug!(index = i, "Seeded placeholder experience");
+            debug!(index = i, "Seeded experience");
         }
     }
 
@@ -725,6 +764,27 @@ mod tests {
     fn test_experiences_from_series_handles_short_input() {
         let exps = experiences_from_series(&[1.0, 2.0, 3.0], 16, 16, "X").unwrap();
         assert!(exps.is_empty());
+    }
+
+    #[test]
+    fn test_build_seed_experiences_real_vs_placeholder() {
+        // Default (no seed_closes) -> empty, so seeding falls back to placeholders.
+        assert!(
+            build_seed_experiences(&TrainingConfig::default())
+                .unwrap()
+                .is_empty()
+        );
+
+        // With a real close series -> real-feature experiences.
+        let cfg = TrainingConfig {
+            gaf_window: 16,
+            gaf_image_size: 16,
+            seed_closes: Some((0..40).map(|t| 100.0 + (t as f32 * 0.2).sin()).collect()),
+            ..TrainingConfig::default()
+        };
+        let exps = build_seed_experiences(&cfg).unwrap();
+        assert!(!exps.is_empty());
+        assert!(exps[0].state.gaf_features_flat.iter().any(|&v| v != 0.0));
     }
 
     #[test]
