@@ -5980,7 +5980,6 @@ dependencies = [
  "approx",
  "chrono",
  "indicators-ta",
- "jflow-compliance",
  "jflow-models",
  "jflow-regime",
  "jflow-risk",
