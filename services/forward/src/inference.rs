@@ -1,53 +1,47 @@
-//! # ML Model Inference Module
+//! # ML Model Inference Module (Burn-native)
 //!
-//! Provides ONNX-based machine learning model inference for trading signal generation.
+//! Loads and runs the Burn `LstmPredictor` checkpoints the **backward** training
+//! service produces and uses them for live trading-signal generation.
 //!
-//! ## Overview
+//! ## Why Burn (and not ONNX)
 //!
-//! This module handles:
-//! - ONNX model loading and caching
-//! - Feature vector to tensor conversion
-//! - Model inference execution
-//! - Prediction result parsing
-//! - Performance metrics and monitoring
+//! The backward trainer (`services/backward`) trains a double-DQN over an LSTM
+//! and saves the inference network with [`janus_ml::models::LstmPredictor::save`]
+//! — a `postcard`-encoded `ModelRecord` (`config` + weights). The previous
+//! version of this module used `tract-onnx`, which **cannot load those Burn
+//! checkpoints** — so the train → checkpoint → reload path was a dead end. This
+//! module loads the exact same `LstmPredictor` type via the shared `jflow-ml`
+//! crate, so a checkpoint written by `backward` is loadable here by construction.
 //!
 //! ## Architecture
 //!
 //! ```text
-//! ┌─────────────────────────────────────────────────────────┐
-//! │                  Model Inference Pipeline                │
-//! ├─────────────────────────────────────────────────────────┤
-//! │                                                           │
-//! │  FeatureVector  →  Tensor  →  Model  →  Output  →  Result│
-//! │                                                           │
-//! │  ┌──────────┐   ┌────────┐   ┌─────┐   ┌──────┐        │
-//! │  │ Features │ → │ Tract  │ → │ONNX │ → │Parse │ → Signal│
-//! │  │  (f32)   │   │Tensor  │   │Model│   │Result│         │
-//! │  └──────────┘   └────────┘   └─────┘   └──────┘        │
-//! │                                                           │
-//! └─────────────────────────────────────────────────────────┘
+//! ┌──────────────────────────────────────────────────────────────────┐
+//! │                    Model Inference Pipeline (Burn)                 │
+//! ├──────────────────────────────────────────────────────────────────┤
+//! │  FeatureVector → Tensor[1,1,N] → LstmPredictor → Q-values → Signal │
+//! │     (f32)          (CpuBackend)     forward()      softmax   Buy/…  │
+//! └──────────────────────────────────────────────────────────────────┘
 //! ```
 //!
 //! ## Example
 //!
 //! ```rust,ignore
 //! use janus_forward::inference::{ModelInference, ModelCache};
-//! use janus::features::FeatureVector;
+//! use janus_forward::features::FeatureVector;
 //!
 //! # async fn example() -> anyhow::Result<()> {
 //! let cache = ModelCache::new();
 //! let inference = ModelInference::new(cache);
 //!
-//! // Load model
-//! inference.load_model("signal_classifier", "models/signal.onnx").await?;
+//! // Load a checkpoint the backward trainer wrote (latest_model.bin).
+//! inference.load_model("signal_classifier", "checkpoints/backward/latest_model.bin").await?;
 //!
-//! // Create feature vector
 //! let features = FeatureVector::new(
 //!     vec!["rsi".to_string(), "macd".to_string()],
 //!     vec![45.0, 10.0],
 //! );
 //!
-//! // Run inference
 //! let prediction = inference.predict("signal_classifier", &features).await?;
 //! println!("Prediction: {:?}", prediction.signal_type);
 //! # Ok(())
@@ -63,7 +57,20 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
-use tract_onnx::prelude::*;
+
+use janus_ml::backend::{BackendDevice, CpuBackend};
+use janus_ml::models::LstmPredictor;
+use janus_ml::tensor::{Backend, Tensor, TensorData};
+
+/// A cached, ready-to-run inference network.
+///
+/// Wrapped in a `Mutex` because Burn's `Param` holds a `!Sync`
+/// `OnceCell<Tensor>` (lazy materialisation), so a model can't be shared by
+/// shared reference across threads. The mutex makes the cache `Sync`
+/// (`Mutex<T>: Sync` whenever `T: Send`) and serialises the interior mutation
+/// the forward pass performs. Forward is fast/CPU-bound and the live loop runs
+/// one symbol at a time, so contention is a non-issue.
+type CachedModel = Arc<std::sync::Mutex<LstmPredictor<CpuBackend>>>;
 
 /// Model inference configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,7 +107,7 @@ impl Default for InferenceConfig {
     }
 }
 
-/// Prediction result from ML model
+/// Prediction result from the ML model
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PredictionResult {
     /// Predicted signal type
@@ -109,7 +116,7 @@ pub struct PredictionResult {
     /// Prediction confidence (0.0 - 1.0)
     pub confidence: f64,
 
-    /// Raw model output scores
+    /// Per-class probabilities (softmax over the model's raw outputs)
     pub scores: Vec<f64>,
 
     /// Inference latency (microseconds)
@@ -136,12 +143,9 @@ impl PredictionResult {
     }
 }
 
-/// Type alias for ONNX model plan
-type OnnxModel = SimplePlan<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>;
-
-/// Model cache for storing loaded ONNX models
+/// Cache of loaded Burn inference models, keyed by name.
 pub struct ModelCache {
-    models: Arc<RwLock<HashMap<String, OnnxModel>>>,
+    models: Arc<RwLock<HashMap<String, CachedModel>>>,
     config: InferenceConfig,
 }
 
@@ -159,46 +163,40 @@ impl ModelCache {
         }
     }
 
-    /// Load and cache a model
+    /// Load and cache a Burn `LstmPredictor` checkpoint.
+    ///
+    /// `path` must point to a checkpoint written by
+    /// [`janus_ml::models::LstmPredictor::save`] (e.g. `backward`'s
+    /// `latest_model.bin`). The architecture is read from the checkpoint's
+    /// embedded config, so the caller does not need to know it in advance.
     pub async fn load_model(&self, name: &str, path: &Path) -> Result<()> {
-        info!("Loading ONNX model '{}' from {:?}", name, path);
+        info!("Loading Burn LSTM model '{}' from {:?}", name, path);
 
-        // Load ONNX model using tract
-        let model = tract_onnx::onnx()
-            .model_for_path(path)
-            .map_err(|e| anyhow!("Failed to load ONNX model: {}", e))?
-            .into_optimized()
-            .map_err(|e| anyhow!("Failed to optimize model: {}", e))?
-            .into_runnable()
-            .map_err(|e| anyhow!("Failed to create runnable model: {}", e))?;
+        let model = LstmPredictor::<CpuBackend>::load(path, BackendDevice::cpu())
+            .map_err(|e| anyhow!("Failed to load Burn model from {:?}: {}", path, e))?;
 
-        // Cache the model
         let mut models = self.models.write().await;
 
-        // Check cache size limit
+        // Check cache size limit (simple eviction; could be improved with LRU).
         if models.len() >= self.config.max_cached_models && !models.contains_key(name) {
             warn!(
                 "Model cache full ({}/{}), evicting oldest model",
                 models.len(),
                 self.config.max_cached_models
             );
-            // Simple eviction: remove first entry (could be improved with LRU)
             if let Some(key) = models.keys().next().cloned() {
                 models.remove(&key);
             }
         }
 
-        models.insert(name.to_string(), model);
+        models.insert(name.to_string(), Arc::new(std::sync::Mutex::new(model)));
         info!("Model '{}' loaded and cached successfully", name);
 
         Ok(())
     }
 
-    /// Get a cached model
-    pub async fn get_model(
-        &self,
-        name: &str,
-    ) -> Result<SimplePlan<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>> {
+    /// Get a cached model (cheap `Arc` clone).
+    pub async fn get_model(&self, name: &str) -> Result<CachedModel> {
         let models = self.models.read().await;
         models
             .get(name)
@@ -238,7 +236,7 @@ impl Default for ModelCache {
     }
 }
 
-/// Model inference engine
+/// Burn inference engine over a [`ModelCache`].
 pub struct ModelInference {
     cache: Arc<ModelCache>,
     #[allow(dead_code)]
@@ -266,7 +264,7 @@ impl ModelInference {
         self.cache.load_model(name, path.as_ref()).await
     }
 
-    /// Run inference on a feature vector
+    /// Run inference on a feature vector.
     pub async fn predict(
         &self,
         model_name: &str,
@@ -274,20 +272,11 @@ impl ModelInference {
     ) -> Result<PredictionResult> {
         let start = std::time::Instant::now();
 
-        // Get model from cache
         let model = self.cache.get_model(model_name).await?;
 
-        // Convert features to tensor
-        let input_tensor = self.features_to_tensor(features)?;
-
-        // Run inference
-        debug!("Running inference with model '{}'", model_name);
-        let output = model
-            .run(tvec![input_tensor.into()])
-            .map_err(|e| anyhow!("Inference failed: {}", e))?;
-
-        // Parse output
-        let prediction = self.parse_output(output, model_name)?;
+        debug!("Running Burn inference with model '{}'", model_name);
+        let raw = run_forward(&model, features)?;
+        let prediction = self.parse_scores(raw, model_name)?;
 
         // Record metrics
         let latency_us = start.elapsed().as_micros() as u64;
@@ -302,7 +291,7 @@ impl ModelInference {
         })
     }
 
-    /// Run batch inference
+    /// Run batch inference.
     pub async fn predict_batch(
         &self,
         model_name: &str,
@@ -315,7 +304,7 @@ impl ModelInference {
         }
 
         // Sequential inference is functionally correct. True batched tensor
-        // inference (concatenating features into a single [N, D] tensor) is a
+        // inference (stacking features into one [N, 1, D] tensor) is a
         // throughput optimization for when batch sizes regularly exceed ~16.
         let mut results = Vec::new();
         for feature_vec in features {
@@ -333,46 +322,23 @@ impl ModelInference {
         Ok(results)
     }
 
-    /// Convert feature vector to tensor
-    fn features_to_tensor(&self, features: &FeatureVector) -> Result<Tensor> {
-        let values = features.to_array();
-        let shape = &[1, values.len()];
-
-        Tensor::from_shape(shape, &values).map_err(|e| anyhow!("Failed to create tensor: {}", e))
-    }
-
-    /// Parse model output to prediction result
-    fn parse_output(&self, output: TVec<TValue>, model_name: &str) -> Result<PredictionResult> {
-        if output.is_empty() {
-            return Err(anyhow!("Model output is empty"));
-        }
-
-        // Get first output tensor
-        let output_tensor = output[0]
-            .to_array_view::<f32>()
-            .map_err(|e| anyhow!("Failed to convert output to array: {}", e))?;
-
-        // Get scores from tensor view
-        let output_data = &output_tensor;
-
-        // Get scores (assume output is [batch_size, num_classes])
-        let scores: Vec<f64> = output_data.iter().map(|&v| v as f64).collect();
-
-        if scores.is_empty() {
+    /// Turn raw model outputs (Q-values / logits) into a [`PredictionResult`].
+    fn parse_scores(&self, raw: Vec<f64>, model_name: &str) -> Result<PredictionResult> {
+        if raw.is_empty() {
             return Err(anyhow!("Model output has no scores"));
         }
 
-        // Apply softmax to get probabilities
-        let scores = self.softmax(&scores);
+        // Softmax the raw outputs into a probability distribution over actions.
+        let scores = self.softmax(&raw);
 
-        // Find max score and corresponding class
         let (max_idx, &max_score) = scores
             .iter()
             .enumerate()
             .max_by(|(_, a), (_, b)| a.total_cmp(b))
             .ok_or_else(|| anyhow!("Failed to find max score"))?;
 
-        // Map class index to signal type
+        // Map class index to signal type (matches the trainer's action order:
+        // 0 = Buy, 1 = Sell, everything else = Hold).
         let signal_type = match max_idx {
             0 => SignalType::Buy,
             1 => SignalType::Sell,
@@ -383,7 +349,7 @@ impl ModelInference {
             signal_type,
             confidence: max_score,
             scores,
-            latency_us: 0, // Will be set by caller
+            latency_us: 0, // set by the caller
             model_name: model_name.to_string(),
         })
     }
@@ -394,6 +360,9 @@ impl ModelInference {
         let exp_scores: Vec<f64> = scores.iter().map(|&s| (s - max_score).exp()).collect();
         let sum: f64 = exp_scores.iter().sum();
 
+        if sum == 0.0 {
+            return vec![1.0 / scores.len() as f64; scores.len()];
+        }
         exp_scores.iter().map(|&s| s / sum).collect()
     }
 
@@ -407,6 +376,51 @@ impl ModelInference {
         let mut metrics = self.metrics.write().await;
         *metrics = ModelMetrics::default();
     }
+}
+
+/// Feed a [`FeatureVector`] through a cached model and return the raw outputs.
+///
+/// The feature vector is shaped as a `[1, 1, N]` tensor (batch 1, sequence 1,
+/// `N` features) — the same single-step layout the backward trainer uses for
+/// its inference forward pass.
+fn run_forward(
+    model: &std::sync::Mutex<LstmPredictor<CpuBackend>>,
+    features: &FeatureVector,
+) -> Result<Vec<f64>> {
+    let values = features.to_array();
+    let n = values.len();
+    if n == 0 {
+        return Err(anyhow!("empty feature vector"));
+    }
+
+    // Serialise access (see `CachedModel`): the guard is held only for this
+    // synchronous forward pass and is dropped before `predict` awaits anything.
+    let model = model
+        .lock()
+        .map_err(|e| anyhow!("model mutex poisoned: {e}"))?;
+
+    let expected = model.config().input_size;
+    if n != expected {
+        return Err(anyhow!(
+            "feature count {} does not match model input_size {}",
+            n,
+            expected
+        ));
+    }
+
+    let device = <CpuBackend as Backend>::Device::default();
+    let input = Tensor::<CpuBackend, 3>::from_data(TensorData::new(values, [1, 1, n]), &device);
+
+    let output = model
+        .forward(input)
+        .map_err(|e| anyhow!("Inference forward pass failed: {}", e))?;
+
+    let raw: Vec<f32> = output
+        .to_data()
+        .to_vec()
+        .map_err(|e| anyhow!("Failed to read model output tensor: {:?}", e))?;
+
+    Ok(raw.into_iter().map(|v| v as f64).collect())
 }
 
 /// Model inference metrics
@@ -451,11 +465,9 @@ impl ModelMetrics {
 
     /// Get average latency (microseconds)
     pub fn avg_latency_us(&self) -> u64 {
-        if self.total_inferences == 0 {
-            0
-        } else {
-            self.total_latency_us / self.total_inferences
-        }
+        self.total_latency_us
+            .checked_div(self.total_inferences)
+            .unwrap_or(0)
     }
 
     /// Get P50 latency estimate (simplified)
@@ -481,6 +493,26 @@ impl ModelMetrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use janus_ml::models::LstmConfig;
+
+    /// Build a tiny inference model, save it, and return the temp path.
+    fn write_temp_model(input_size: usize, output_size: usize) -> std::path::PathBuf {
+        let model = LstmPredictor::<CpuBackend>::new(
+            LstmConfig::new(input_size, 8, output_size),
+            BackendDevice::cpu(),
+        );
+        let path = std::env::temp_dir().join(format!(
+            "janus_fwd_inference_test_{}_{}.bin",
+            std::process::id(),
+            // unique-per-call suffix so parallel tests don't collide
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        model.save(&path).expect("save model checkpoint");
+        path
+    }
 
     #[test]
     fn test_inference_config_default() {
@@ -542,7 +574,6 @@ mod tests {
     fn test_model_inference_creation() {
         let cache = ModelCache::new();
         let inference = ModelInference::new(cache);
-        // Just verify it creates without panicking
         assert_eq!(inference.config.model_dir, "models");
     }
 
@@ -554,13 +585,70 @@ mod tests {
         let scores = vec![1.0, 2.0, 3.0];
         let result = inference.softmax(&scores);
 
-        // Check that probabilities sum to 1
         let sum: f64 = result.iter().sum();
         assert!((sum - 1.0).abs() < 1e-6);
-
-        // Check that highest input gets highest probability
         assert!(result[2] > result[1]);
         assert!(result[1] > result[0]);
+    }
+
+    /// End-to-end: a checkpoint written via `LstmPredictor::save` (the same
+    /// path the backward trainer uses) loads here and produces a sane signal.
+    #[tokio::test]
+    async fn test_burn_roundtrip_load_and_predict() {
+        let input_size = 4;
+        let path = write_temp_model(input_size, 3);
+
+        let cache = ModelCache::new();
+        cache
+            .load_model("signal_classifier", &path)
+            .await
+            .expect("load checkpoint");
+        assert!(cache.has_model("signal_classifier").await);
+
+        let inference = ModelInference::new(cache);
+        let features = FeatureVector::new(
+            (0..input_size).map(|i| format!("f{i}")).collect(),
+            vec![0.1, 0.2, 0.3, 0.4],
+        );
+
+        let pred = inference
+            .predict("signal_classifier", &features)
+            .await
+            .expect("predict");
+
+        assert_eq!(pred.scores.len(), 3, "three action classes");
+        assert!((0.0..=1.0).contains(&pred.confidence));
+        let prob_sum: f64 = pred.scores.iter().sum();
+        assert!((prob_sum - 1.0).abs() < 1e-6, "softmaxed scores sum to 1");
+        assert!(matches!(
+            pred.signal_type,
+            SignalType::Buy | SignalType::Sell | SignalType::Hold
+        ));
+
+        let metrics = inference.metrics().await;
+        assert_eq!(metrics.total_inferences, 1);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A feature vector whose length doesn't match the model's `input_size`
+    /// is rejected with a clear error (rather than panicking deep in Burn).
+    #[tokio::test]
+    async fn test_predict_rejects_feature_size_mismatch() {
+        let path = write_temp_model(4, 3);
+
+        let cache = ModelCache::new();
+        cache.load_model("m", &path).await.expect("load");
+        let inference = ModelInference::new(cache);
+
+        let wrong = FeatureVector::new(
+            vec!["a".to_string(), "b".to_string()],
+            vec![1.0, 2.0], // 2 features, model expects 4
+        );
+        let err = inference.predict("m", &wrong).await.unwrap_err();
+        assert!(err.to_string().contains("input_size"));
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -623,22 +711,5 @@ mod tests {
         inference.reset_metrics().await;
         let metrics = inference.metrics().await;
         assert_eq!(metrics.total_inferences, 0);
-    }
-
-    #[test]
-    fn test_features_to_tensor() {
-        let cache = ModelCache::new();
-        let inference = ModelInference::new(cache);
-
-        let features = FeatureVector::new(
-            vec!["a".to_string(), "b".to_string(), "c".to_string()],
-            vec![1.0, 2.0, 3.0],
-        );
-
-        let result = inference.features_to_tensor(&features);
-        assert!(result.is_ok());
-
-        let tensor = result.unwrap();
-        assert_eq!(tensor.shape(), &[1, 3]);
     }
 }
