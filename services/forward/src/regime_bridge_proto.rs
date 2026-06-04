@@ -221,7 +221,8 @@ pub fn make_push_batch_request(
 mod tests {
     use super::*;
     use crate::regime_bridge::{
-        AmygdalaRegime as RUSTCODE, BridgedRegimeState, HypothalamusRegime as RH, RegimeIndicators as RI,
+        AmygdalaRegime as RUSTCODE, BridgedRegimeState, HypothalamusRegime as RH,
+        RegimeIndicators as RI,
     };
 
     fn sample_bridged_state() -> BridgedRegimeState {

@@ -55,9 +55,7 @@ pub async fn registry_routing_sync_loop(router: Arc<ExchangeRouter>) {
                 if resp.status().is_success() {
                     match resp.json::<RoutingMapResponse>().await {
                         Ok(routing_map) => {
-                            let count = router
-                                .sync_routing_from_registry(routing_map.routes)
-                                .await;
+                            let count = router.sync_routing_from_registry(routing_map.routes).await;
                             info!(
                                 count,
                                 "Registry routing sync complete — applied routing rules"

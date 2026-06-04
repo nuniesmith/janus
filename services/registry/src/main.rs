@@ -523,7 +523,9 @@ async fn get_routing_map(State(state): State<AppState>) -> impl IntoResponse {
         for pair in &asset.trading_pairs {
             if let Some(ref exch_sym) = pair.exchange_symbol {
                 let key = format!("{}:{}", asset.symbol, best_exchange);
-                exchange_symbols.entry(key).or_insert_with(|| exch_sym.clone());
+                exchange_symbols
+                    .entry(key)
+                    .or_insert_with(|| exch_sym.clone());
             }
         }
     }
@@ -649,7 +651,10 @@ async fn sync_from_python_loop(registry: Arc<RegistryManager>) {
 
     // Initial delay to let the Python service start up
     tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-    tracing::info!("Python registry sync loop started (interval={}s)", interval_secs);
+    tracing::info!(
+        "Python registry sync loop started (interval={}s)",
+        interval_secs
+    );
 
     loop {
         match sync_once(&client, &base_url, &registry).await {
@@ -832,19 +837,12 @@ async fn sync_python_services(
     base_url: &str,
     registry: &RegistryManager,
 ) -> std::result::Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-    let url = format!(
-        "{}/api/registry/services",
-        base_url.trim_end_matches('/')
-    );
+    let url = format!("{}/api/registry/services", base_url.trim_end_matches('/'));
     tracing::debug!(url = %url, "Fetching Python service catalog");
 
     let resp = client.get(&url).send().await?;
     if !resp.status().is_success() {
-        return Err(format!(
-            "Python services endpoint returned HTTP {}",
-            resp.status()
-        )
-        .into());
+        return Err(format!("Python services endpoint returned HTTP {}", resp.status()).into());
     }
 
     let services: Vec<serde_json::Value> = resp.json().await?;
@@ -918,18 +916,9 @@ async fn sync_python_services(
 fn parse_python_asset(
     json: &serde_json::Value,
 ) -> std::result::Result<Asset, Box<dyn std::error::Error + Send + Sync>> {
-    let id = json["id"]
-        .as_str()
-        .ok_or("missing id")?
-        .to_string();
-    let name = json["name"]
-        .as_str()
-        .ok_or("missing name")?
-        .to_string();
-    let symbol = json["symbol"]
-        .as_str()
-        .ok_or("missing symbol")?
-        .to_string();
+    let id = json["id"].as_str().ok_or("missing id")?.to_string();
+    let name = json["name"].as_str().ok_or("missing name")?.to_string();
+    let symbol = json["symbol"].as_str().ok_or("missing symbol")?.to_string();
 
     let asset_type = match json["asset_type"].as_str().unwrap_or("Other") {
         "Crypto" => AssetType::Crypto,

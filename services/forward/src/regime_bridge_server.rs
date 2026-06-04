@@ -774,7 +774,8 @@ impl RegimeBridgeService for RegimeBridgeServer {
                     let seq = inner_for_stream
                         .stream_sequence
                         .fetch_add(1, Ordering::Relaxed);
-                    let mut proto_state = RegimeState::from(&bridged_state).with_sequence(seq as i64);
+                    let mut proto_state =
+                        RegimeState::from(&bridged_state).with_sequence(seq as i64);
 
                     // Transition detection
                     let hypo_i32 = proto_state.hypothalamus_regime;

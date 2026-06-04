@@ -759,7 +759,13 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(
             calls[0],
-            ("ema_cross".to_string(), "BTC".to_string(), -25.0, false, None)
+            (
+                "ema_cross".to_string(),
+                "BTC".to_string(),
+                -25.0,
+                false,
+                None
+            )
         );
     }
 }

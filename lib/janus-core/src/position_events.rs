@@ -791,7 +791,12 @@ mod tests {
         // Even with healthy pnl, a crisis regime triggers exit.
         let mut e = sample();
         e.pnl_unrealized = 100.0;
-        let g = compute_guidance(&e, Some("crisis_volatility_spike"), default_thresholds(), None);
+        let g = compute_guidance(
+            &e,
+            Some("crisis_volatility_spike"),
+            default_thresholds(),
+            None,
+        );
         assert_eq!(g.action, GuidanceAction::Exit);
         assert!(g.reason.contains("regime"));
     }
@@ -846,8 +851,14 @@ mod tests {
         // stay in sync — a divergence would silently change live behaviour.
         let params = OptimizedParams::default();
         let t = GuidanceThresholds::from_optimized_params(&params);
-        assert_eq!(t.stop_loss_ratio, GuidanceThresholds::default().stop_loss_ratio);
-        assert_eq!(t.take_profit_ratio, GuidanceThresholds::default().take_profit_ratio);
+        assert_eq!(
+            t.stop_loss_ratio,
+            GuidanceThresholds::default().stop_loss_ratio
+        );
+        assert_eq!(
+            t.take_profit_ratio,
+            GuidanceThresholds::default().take_profit_ratio
+        );
     }
 
     // ── widen_for_volatility ─────────────────────────────────────────
@@ -858,7 +869,10 @@ mod tests {
         // so the stop should loosen to -3%. Take-profit untouched.
         let t = GuidanceThresholds::default().widen_for_volatility(1.5, 2.0);
         assert!((t.stop_loss_ratio - (-0.03)).abs() < 1e-9);
-        assert_eq!(t.take_profit_ratio, GuidanceThresholds::default().take_profit_ratio);
+        assert_eq!(
+            t.take_profit_ratio,
+            GuidanceThresholds::default().take_profit_ratio
+        );
     }
 
     #[test]
@@ -1020,11 +1034,17 @@ mod tests {
         let base = GuidanceThresholds::default(); // stop -0.02
         // Bottom of band: no change.
         assert!(
-            (base.tighten_stop_for_fear(FEAR_ELEVATED_LEVEL).stop_loss_ratio - (-0.02)).abs()
+            (base
+                .tighten_stop_for_fear(FEAR_ELEVATED_LEVEL)
+                .stop_loss_ratio
+                - (-0.02))
+                .abs()
                 < 1e-9
         );
         // Top of band (→ exit level): tightened to STOP_TIGHTEN_FLOOR (0.25) of width.
-        let top = base.tighten_stop_for_fear(FEAR_EXIT_LEVEL - 1e-9).stop_loss_ratio;
+        let top = base
+            .tighten_stop_for_fear(FEAR_EXIT_LEVEL - 1e-9)
+            .stop_loss_ratio;
         assert!((top - (-0.005)).abs() < 1e-4, "got {top}");
         // Below band: inert.
         assert_eq!(base.tighten_stop_for_fear(0.2), base);
@@ -1122,7 +1142,11 @@ mod tests {
             .observe(&ev(Some("p3"), 100.0), Guidance::hold("within bounds"))
             .await;
         assert_eq!(g2.action, GuidanceAction::Exit);
-        assert!(g2.reason.contains("prior exit"), "reason was: {}", g2.reason);
+        assert!(
+            g2.reason.contains("prior exit"),
+            "reason was: {}",
+            g2.reason
+        );
     }
 
     #[tokio::test]

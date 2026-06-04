@@ -35,9 +35,11 @@ jobs:
         with:
           shared-key: ci-rust-check
 
-      # `cargo fmt --check` is intentionally not enforced yet — the
-      # pre-existing tree has unformatted regions that need a separate
-      # one-shot reformat PR. Add the step back once that lands.
+      # Formatting is enforced tree-wide now that the one-shot reformat has
+      # landed. Runs before the heavier check so style drift fails fast/cheap.
+      # (Unlike the build, fmt does not compile, so neuromorphic is not excluded.)
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
 
       # `--all-targets` exercises lib + bin + tests + examples + benches
       # so rot in any of them shows up at PR time instead of when someone
