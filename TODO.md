@@ -234,7 +234,11 @@ gaps are below.
 
 ## P2 — Documentation
 
-- [ ] **README crate list is out of date.** It omits `crates/models` (`janus-models`: trades/signals/account/performance/**prop-firm validator**). Audit the list against `crates/` and refresh the stats block.
+- [x] **README crate list refreshed.** Audited the `### Core crates` list
+      against `crates/` (39-member workspace): added `models` (prop-firm
+      validator) and `fks-proto`, dropped `indicators` (now the crates.io
+      `indicators-ta` dep) and `bybit-client` (removed). Stats block corrected
+      `50+ crate` → `39-crate`.
 - [ ] **Document the public surface.** Brain REST API (`/api/v1/brain/*`, `/api/v1/risk/evaluate`, `/api/v1/positions/event`), the JanusAI session-metrics contract, and the env-var reference.
 - [ ] **Surface prop-firm support.** `crates/models/src/prop_firm.rs` (`PropFirmValidator`, `ChallengeType`) is undocumented — note where/whether it's wired into execution.
 
