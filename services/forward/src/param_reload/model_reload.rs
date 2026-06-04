@@ -531,11 +531,93 @@ where
     }
 }
 
+/// Wire the backward trainer's checkpoint stream into a
+/// [`SignalGenerator`](crate::signal::SignalGenerator)'s Burn inference cache.
+///
+/// On each [`CheckpointNotification`] the listener reloads the model named
+/// `signal_classifier` from `notification.model_path` into the generator — the
+/// live half of the train → checkpoint → serve loop. Returns the listener's
+/// background task handle.
+///
+/// Two layers keep this safe in every configuration:
+/// * the listener is a no-op unless model hot-reload is enabled
+///   ([`ModelReloadConfig::from_env`]); a missing/broken Redis is handled inside
+///   the listener task and never blocks startup, and
+/// * the reload logs and returns an error (rather than panicking) unless the
+///   `SignalGenerator` was built with ML inference enabled (`with_ml_inference`).
+pub async fn spawn_signal_model_reloader(
+    signal_generator: Arc<crate::signal::SignalGenerator>,
+) -> anyhow::Result<tokio::task::JoinHandle<()>> {
+    let listener = Arc::new(ModelReloadListener::new(ModelReloadConfig::from_env()));
+
+    let handler = CallbackReloadHandler::new(
+        "signal-generator-inference",
+        move |notification: CheckpointNotification| {
+            let sg = Arc::clone(&signal_generator);
+            Box::pin(async move {
+                sg.load_model("signal_classifier", &notification.model_path)
+                    .await
+            })
+                as std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>>
+        },
+    );
+    listener.register_handler(Arc::new(handler)).await;
+    listener.start().await
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_signal_generator_reloads_burn_checkpoint() {
+        use crate::signal::{SignalGenerator, SignalGeneratorConfig};
+        use janus_ml::backend::{BackendDevice, CpuBackend};
+        use janus_ml::models::{LstmConfig, LstmPredictor};
+
+        // A checkpoint in the format the backward trainer writes.
+        let model =
+            LstmPredictor::<CpuBackend>::new(LstmConfig::new(4, 8, 3), BackendDevice::cpu());
+        let path = std::env::temp_dir().join(format!(
+            "janus_reload_test_{}.bin",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        model.save(&path).expect("save checkpoint");
+
+        // An ML-enabled generator reloads it — the exact call the reload handler makes.
+        let sg = SignalGenerator::with_ml_inference(SignalGeneratorConfig::default());
+        sg.load_model("signal_classifier", &path)
+            .await
+            .expect("reload checkpoint into ML-enabled generator");
+
+        // Without ML enabled, the reload is rejected gracefully (no panic).
+        let sg_no_ml = SignalGenerator::new(SignalGeneratorConfig::default());
+        assert!(
+            sg_no_ml
+                .load_model("signal_classifier", &path)
+                .await
+                .is_err()
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_spawn_signal_model_reloader_disabled_is_noop() {
+        use crate::signal::{SignalGenerator, SignalGeneratorConfig};
+        // With hot-reload unconfigured (default env) the helper returns a no-op
+        // task without error and without touching Redis.
+        let sg = Arc::new(SignalGenerator::new(SignalGeneratorConfig::default()));
+        let handle = spawn_signal_model_reloader(sg)
+            .await
+            .expect("spawn reloader");
+        handle.abort();
+    }
 
     #[test]
     fn test_config_default() {
