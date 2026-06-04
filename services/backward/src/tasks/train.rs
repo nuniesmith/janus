@@ -156,6 +156,46 @@ pub fn experience_from_closes(
     Ok(Experience::new(state, action, reward, next_state, done))
 }
 
+/// Build a batch of real training experiences by sliding a `window`-length
+/// window over `closes`.
+///
+/// Each step yields one experience whose features come from DiffGAF (real, not
+/// the zero placeholder) and whose action/reward use a simple directional
+/// scheme: the action is `Buy` when the next bar rises and `Sell` when it
+/// falls, rewarded by the realized next-bar return. This is a deliberately
+/// simple off-policy seed for the DQN replay buffer — the reward/label scheme
+/// is exactly the kind of thing the eventual feasibility probe will tune.
+///
+/// Returns an empty vec when `closes` is shorter than `window + 1`.
+pub fn experiences_from_series(
+    closes: &[f32],
+    window: usize,
+    image_size: usize,
+    symbol: &str,
+) -> Result<Vec<Experience>> {
+    let mut experiences = Vec::new();
+    if window == 0 || closes.len() < window + 1 {
+        return Ok(experiences);
+    }
+    for start in 0..(closes.len() - window) {
+        let cur = &closes[start..start + window];
+        let next = &closes[start + 1..start + 1 + window];
+        // Realized return of the bar just past the current window.
+        let last = closes[start + window - 1];
+        let nxt = closes[start + window];
+        let ret = (nxt - last) / last.abs().max(f32::EPSILON);
+        let action = if ret >= 0.0 {
+            ActionType::Buy
+        } else {
+            ActionType::Sell
+        };
+        experiences.push(experience_from_closes(
+            cur, next, action, ret, false, symbol, image_size,
+        )?);
+    }
+    Ok(experiences)
+}
+
 /// Build an [`LstmConfig`] (inference) from a [`TrainingConfig`].
 fn build_inference_config(config: &TrainingConfig) -> LstmConfig {
     LstmConfig::new(
@@ -665,6 +705,26 @@ mod tests {
         assert!(!exp.state.gaf_features_flat.is_empty());
         assert!(exp.state.gaf_features_flat.iter().any(|&v| v != 0.0));
         assert!(exp.state.gaf_features_flat.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn test_experiences_from_series_produces_real_experiences() {
+        let closes: Vec<f32> = (0..50).map(|t| 100.0 + (t as f32 * 0.15).sin()).collect();
+        let window = 16;
+        let exps = experiences_from_series(&closes, window, 16, "BTCUSD").unwrap();
+
+        assert_eq!(exps.len(), closes.len() - window);
+        for e in &exps {
+            assert!(e.state.gaf_features_flat.iter().any(|&v| v != 0.0));
+            assert!(e.state.gaf_features_flat.iter().all(|v| v.is_finite()));
+            assert!(e.reward.is_finite());
+        }
+    }
+
+    #[test]
+    fn test_experiences_from_series_handles_short_input() {
+        let exps = experiences_from_series(&[1.0, 2.0, 3.0], 16, 16, "X").unwrap();
+        assert!(exps.is_empty());
     }
 
     #[test]
