@@ -35,6 +35,7 @@ pub mod ensemble;
 pub mod error;
 pub mod execution;
 pub mod gaf;
+pub mod gaf_features;
 pub mod live;
 pub mod pipeline;
 pub mod portfolio;
@@ -80,6 +81,7 @@ pub use execution::{
     TWAPExecutor, TWAPStatistics, VWAPConfig, VWAPExecutor, VWAPSlice, VWAPStatistics, Venue,
     VenueStats, VolumeProfile,
 };
+pub use gaf_features::{GafFeatures, gaf_features_from_closes, gaf_features_from_series};
 pub use live::{
     BenchmarkResults, CachedFeature, CircularBuffer, FeatureCache, FeatureCacheKey, FeatureType,
     IncrementalGAFComputer, InferenceConfig, InferenceEngine, InferenceStats, LRUCache,
