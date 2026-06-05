@@ -12,12 +12,17 @@
 //! - **Public market feed** drives [`exchange_apiws::BybitConnector`] through
 //!   `run_feed`, translating `DataMessage::{OrderBook,Ticker,Trade}` into the
 //!   janus-shaped `WsMessage` stream.
+//! - **Private user-data feed** ([`BybitPrivateWebSocket`]) drives
+//!   [`exchange_apiws::bybit::BybitPrivateConnector`] (signed `op:"auth"` +
+//!   order/execution/position/wallet topics), translating
+//!   `DataMessage::{OrderUpdate,PositionChange}` into `WsMessage::{OrderUpdate,
+//!   ExecutionUpdate,PositionUpdate}` so janus's Bybit path is trade-aware.
 
 use std::sync::Arc;
 
 use anyhow::Result;
 use exchange_apiws::actors::{DataMessage, ExchangeConnector, TradeSide};
-use exchange_apiws::bybit::BybitConnector;
+use exchange_apiws::bybit::{BybitConnector, BybitPrivateConnector};
 use exchange_apiws::ws::{WsRunnerConfig, run_feed};
 use exchange_apiws::{BybitCategory, BybitOrderRequest, BybitPrivateClient};
 use tokio::sync::{mpsc, watch};
@@ -280,6 +285,98 @@ impl BybitWebSocket {
     }
 }
 
+// ── Private (authenticated) user-data feed ────────────────────────────────────
+
+/// Translate one normalised private [`DataMessage`] into the janus-shaped
+/// [`WsMessage`] the event loop's private arms expect. The exchange event is
+/// carried as JSON (the `exchange-apiws` structs are `Serialize`).
+///
+/// - order *state* → [`WsMessage::OrderUpdate`]
+/// - a fill (per-execution `match_price` present) → [`WsMessage::ExecutionUpdate`]
+/// - position change → [`WsMessage::PositionUpdate`]
+/// - wallet/balance → `None` (no `WsMessage` variant yet)
+fn translate_private(msg: DataMessage) -> Option<WsMessage> {
+    match msg {
+        DataMessage::OrderUpdate(o) => {
+            let json = serde_json::to_value(&o).unwrap_or(serde_json::Value::Null);
+            // `execution`-topic frames carry the per-fill match price/size;
+            // `order`-topic state changes don't.
+            Some(if o.match_price.is_some() {
+                WsMessage::ExecutionUpdate(json)
+            } else {
+                WsMessage::OrderUpdate(json)
+            })
+        }
+        DataMessage::PositionChange(p) => Some(WsMessage::PositionUpdate(
+            serde_json::to_value(&p).unwrap_or(serde_json::Value::Null),
+        )),
+        _ => None,
+    }
+}
+
+/// Private Bybit user-data feed presenting the same `(ws, rx)` + `connect()`
+/// surface as [`BybitWebSocket`], backed by `exchange-apiws`'s
+/// [`BybitPrivateConnector`] + `run_feed`.
+///
+/// The connector emits the signed `op:"auth"` frame on connect (via the WS
+/// runner's `auth_message` hook) and subscribes to the `order` / `execution` /
+/// `position` / `wallet` topics; events are translated by [`translate_private`].
+pub struct BybitPrivateWebSocket {
+    creds: exchange_apiws::BybitCredentials,
+    testnet: bool,
+    tx: mpsc::UnboundedSender<WsMessage>,
+}
+
+impl BybitPrivateWebSocket {
+    /// Create a private feed. Returns the driver plus the receiver the event
+    /// loop pulls `WsMessage`s from.
+    pub fn new(
+        creds: BybitCredentials,
+        testnet: bool,
+    ) -> (Self, mpsc::UnboundedReceiver<WsMessage>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let creds = exchange_apiws::BybitCredentials::new(creds.key, creds.secret);
+        (Self { creds, testnet, tx }, rx)
+    }
+
+    /// Authenticate, subscribe to the private topics, and stream until the feed
+    /// terminates.
+    pub async fn connect(self) -> Result<()> {
+        let (data_tx, mut data_rx) = mpsc::channel::<DataMessage>(1024);
+        let connector = if self.testnet {
+            BybitPrivateConnector::with_url(self.creds, "wss://stream-testnet.bybit.com/v5/private")
+        } else {
+            BybitPrivateConnector::new(self.creds)
+        };
+        // The connector builds the `op:"subscribe"` frame; the auth frame is
+        // sent by `run_feed` via the `auth_message` hook before it.
+        let subscriptions: Vec<String> = connector.subscription_message("").into_iter().collect();
+        let ws_url = connector.ws_url().to_string();
+        let connector = Arc::new(connector);
+        let (_sd_tx, sd_rx) = watch::channel(false);
+
+        let out = self.tx.clone();
+        tokio::spawn(async move {
+            while let Some(msg) = data_rx.recv().await {
+                if let Some(ws) = translate_private(msg) {
+                    let _ = out.send(ws);
+                }
+            }
+        });
+
+        run_feed(
+            ws_url,
+            subscriptions,
+            connector,
+            data_tx,
+            WsRunnerConfig::default(),
+            sd_rx,
+        )
+        .await?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -314,5 +411,76 @@ mod tests {
             mk("weird").time_in_force,
             Some(exchange_apiws::BybitTimeInForce::GTC)
         );
+    }
+
+    fn sample_order(match_price: Option<f64>) -> exchange_apiws::actors::OrderUpdate {
+        exchange_apiws::actors::OrderUpdate {
+            symbol: "BTCUSDT".into(),
+            exchange: "bybit".into(),
+            order_id: "o-1".into(),
+            client_oid: None,
+            side: TradeSide::Buy,
+            order_type: "limit".into(),
+            status: "open".into(),
+            price: 30000.0,
+            size: 0.5,
+            filled_size: 0.0,
+            remaining_size: 0.5,
+            fee: 0.0,
+            match_price,
+            match_size: match_price.map(|_| 0.5),
+            trade_id: match_price.map(|_| "t-1".into()),
+            exchange_ts: 1,
+            receipt_ts: 2,
+        }
+    }
+
+    #[test]
+    fn private_translation_routes_order_fill_position_balance() {
+        // Order *state* (no match price) → OrderUpdate, with the f64 size carried
+        // exactly (the whole point of the 0.6.0 widening — 0.5 is not truncated).
+        match translate_private(DataMessage::OrderUpdate(sample_order(None))).expect("order maps") {
+            WsMessage::OrderUpdate(v) => {
+                assert_eq!(v["symbol"], "BTCUSDT");
+                assert_eq!(v["size"], 0.5);
+                assert_eq!(v["remaining_size"], 0.5);
+            }
+            other => panic!("expected OrderUpdate, got {other:?}"),
+        }
+
+        // A fill (match_price present) → ExecutionUpdate.
+        assert!(matches!(
+            translate_private(DataMessage::OrderUpdate(sample_order(Some(30001.0)))),
+            Some(WsMessage::ExecutionUpdate(_))
+        ));
+
+        // Position change → PositionUpdate.
+        let pos = exchange_apiws::actors::PositionChange {
+            symbol: "BTCUSDT".into(),
+            exchange: "bybit".into(),
+            current_qty: -3,
+            avg_entry_price: 30000.0,
+            unrealised_pnl: 1.0,
+            realised_pnl: 2.0,
+            change_reason: "Normal".into(),
+            exchange_ts: 1,
+            receipt_ts: 2,
+        };
+        match translate_private(DataMessage::PositionChange(pos)).expect("position maps") {
+            WsMessage::PositionUpdate(v) => assert_eq!(v["current_qty"], -3),
+            other => panic!("expected PositionUpdate, got {other:?}"),
+        }
+
+        // Wallet/balance has no WsMessage variant yet → skipped.
+        let bal = exchange_apiws::actors::BalanceUpdate {
+            exchange: "bybit".into(),
+            currency: "USDT".into(),
+            available_balance: 100.0,
+            hold_balance: 0.0,
+            event: "wallet".into(),
+            exchange_ts: 1,
+            receipt_ts: 2,
+        };
+        assert!(translate_private(DataMessage::BalanceUpdate(bal)).is_none());
     }
 }
