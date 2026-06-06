@@ -93,6 +93,25 @@ pub struct JanusMetrics {
     /// Per-service uptime histogram (seconds).
     /// Maps to: `janus_supervisor_uptime_seconds`
     pub supervisor_uptime_seconds: HistogramVec,
+
+    // =========================================================================
+    // Live Account Metrics
+    //
+    // Reconciled from the forward service's Bybit private user-data feed.
+    // These are observability-only gauges; they never drive order entry.
+    // =========================================================================
+    /// Number of open positions in the live account.
+    /// Maps to: `janus_account_position_count`
+    pub account_position_count: Gauge,
+    /// Net unrealised PnL across all open positions.
+    /// Maps to: `janus_account_net_unrealized_pnl`
+    pub account_net_unrealized_pnl: Gauge,
+    /// Available wallet balance per currency.
+    /// Maps to: `janus_account_balance_available`
+    pub account_balance_available: GaugeVec,
+    /// Held / locked wallet balance per currency.
+    /// Maps to: `janus_account_balance_hold`
+    pub account_balance_hold: GaugeVec,
 }
 
 impl JanusMetrics {
@@ -247,6 +266,33 @@ impl JanusMetrics {
                 &["service"]
             )
             .unwrap(),
+
+            // Live account metrics
+            account_position_count: register_gauge!(
+                "janus_account_position_count",
+                "Number of open positions in the live account"
+            )
+            .unwrap(),
+
+            account_net_unrealized_pnl: register_gauge!(
+                "janus_account_net_unrealized_pnl",
+                "Net unrealised PnL across all open positions"
+            )
+            .unwrap(),
+
+            account_balance_available: register_gauge_vec!(
+                "janus_account_balance_available",
+                "Available wallet balance per currency",
+                &["currency"]
+            )
+            .unwrap(),
+
+            account_balance_hold: register_gauge_vec!(
+                "janus_account_balance_hold",
+                "Held / locked wallet balance per currency",
+                &["currency"]
+            )
+            .unwrap(),
         }
     }
 
@@ -258,6 +304,24 @@ impl JanusMetrics {
         self.signal_confidence
             .with_label_values(&[symbol, signal_type])
             .set(confidence);
+    }
+
+    /// Record live-account scalar gauges (position count + net unrealised PnL).
+    ///
+    /// Observability-only: this never participates in order entry.
+    pub fn record_account(&self, position_count: i64, net_unrealized_pnl: f64) {
+        self.account_position_count.set(position_count as f64);
+        self.account_net_unrealized_pnl.set(net_unrealized_pnl);
+    }
+
+    /// Record per-currency wallet balance gauges (available + hold).
+    pub fn record_account_balance(&self, currency: &str, available: f64, hold: f64) {
+        self.account_balance_available
+            .with_label_values(&[currency])
+            .set(available);
+        self.account_balance_hold
+            .with_label_values(&[currency])
+            .set(hold);
     }
 
     /// Record module health

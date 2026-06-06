@@ -394,6 +394,51 @@ impl ForwardService {
         // Surface the live Bybit account (read-only) on /api/v1/account.
         rest_server.set_live_account(Arc::clone(&self.live_account));
 
+        // Live-balance sampler: when the Bybit private feed is enabled, poll the
+        // reconciled account every 5s to (a) publish live-account gauges and
+        // (b) feed real USDT equity into the risk limits + portfolio total.
+        // This updates risk *limits* only — it never touches the order-submit
+        // path or the `JANUS_RISK_ENFORCE` gate (enforcement stays advisory).
+        if self.config.bybit_private_config.is_some() {
+            let live_account = self.live_account();
+            let risk_manager = self.risk_manager();
+            let portfolio = self.portfolio();
+            info!(
+                "📈 Live-balance sampler active — tracking Bybit USDT equity into risk limits + account gauges (5s interval)"
+            );
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+                loop {
+                    ticker.tick().await;
+                    // Snapshot the account under a short read lock.
+                    let (position_count, net_pnl, balances, usdt_equity) = {
+                        let acct = live_account.read().await;
+                        let usdt_equity = acct.balances.get("USDT").map(|b| b.available + b.hold);
+                        (
+                            acct.positions.len() as i64,
+                            acct.net_unrealized_pnl(),
+                            acct.balances.clone(),
+                            usdt_equity,
+                        )
+                    };
+
+                    // Publish observability gauges.
+                    janus_metrics().record_account(position_count, net_pnl);
+                    for (currency, bal) in &balances {
+                        janus_metrics().record_account_balance(currency, bal.available, bal.hold);
+                    }
+
+                    // Feed real USDT equity into the risk limits + portfolio total.
+                    if let Some(eq) = usdt_equity
+                        && eq > 0.0
+                    {
+                        risk_manager.write().await.set_account_balance(eq);
+                        portfolio.write().await.total_value = eq;
+                    }
+                }
+            });
+        }
+
         // Start REST server (this will block)
         info!("✅ Starting REST API server...");
         rest_server.start().await?;

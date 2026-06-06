@@ -24,22 +24,67 @@
 //! Actual persistence of trade outcomes is handled by the Python
 //! `MemoryRecorder` — Rust just logs and acknowledges here.
 
+use std::sync::Arc;
+
 use fks_proto::feedback::{
     GuidanceAction, PositionFeedback, TradeGuidance, TradeOutcome, TradeOutcomeAck,
     position_feedback_service_server::{PositionFeedbackService, PositionFeedbackServiceServer},
 };
+use tokio::sync::RwLock;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, info, warn};
 
+use crate::account_state::LiveAccount;
+
 // ── Service Implementation ─────────────────────────────────────────────────
 
-/// Stateless gRPC service that provides real-time trade guidance.
+/// gRPC service that provides real-time trade guidance and reconciles
+/// position feedback into the shared [`LiveAccount`].
 ///
-/// All guidance is computed on-the-fly from the position data — no external
-/// state or locks are needed for the current MVP implementation.  Wire the
-/// brain pipeline here in a future iteration to make guidance model-driven.
-#[derive(Debug, Default)]
-pub struct FeedbackGrpcService;
+/// Guidance is computed on-the-fly from the position data; in addition, each
+/// inbound `PositionFeedback` is upserted (best-effort) into the live account
+/// so the execution-service's view of open positions is reflected between
+/// Bybit snapshots. Wire the brain pipeline here in a future iteration to make
+/// guidance model-driven.
+#[derive(Debug, Clone, Default)]
+pub struct FeedbackGrpcService {
+    /// Shared live-account model reconciled from all inbound position sources.
+    live_account: Arc<RwLock<LiveAccount>>,
+}
+
+impl FeedbackGrpcService {
+    /// Create a service that reconciles feedback into `live_account`.
+    pub fn new(live_account: Arc<RwLock<LiveAccount>>) -> Self {
+        Self { live_account }
+    }
+}
+
+/// Infer the side-aware quantity for a [`PositionFeedback`] and upsert it into
+/// the live account.
+///
+/// `PositionFeedback.quantity` is an unsigned magnitude with no side, so the
+/// sign is inferred from price direction vs. PnL sign:
+/// long iff the price moved the same way as the PnL (price up ⇔ profitable).
+/// Ambiguous at breakeven → defaults long. Only primitives cross into
+/// [`LiveAccount`]; the proto type stays in this module.
+async fn reconcile_feedback(live_account: &Arc<RwLock<LiveAccount>>, feedback: &PositionFeedback) {
+    // Long iff price direction agrees with PnL sign; ambiguous at breakeven → default long.
+    let price_up = feedback.current_price >= feedback.entry_price;
+    let profitable = feedback.unrealized_pnl >= 0.0;
+    let long = price_up == profitable;
+    let signed = if long {
+        feedback.quantity
+    } else {
+        -feedback.quantity
+    };
+    live_account.write().await.apply_feedback_position(
+        &feedback.symbol,
+        signed,
+        feedback.entry_price,
+        feedback.unrealized_pnl,
+        feedback.timestamp_ms,
+    );
+}
 
 #[tonic::async_trait]
 impl PositionFeedbackService for FeedbackGrpcService {
@@ -63,6 +108,8 @@ impl PositionFeedbackService for FeedbackGrpcService {
                 count,
                 "StreamPositionUpdates: received update",
             );
+            // Best-effort reconcile each update into the live account.
+            reconcile_feedback(&self.live_account, &feedback).await;
             count += 1;
             last_feedback = Some(feedback);
         }
@@ -98,6 +145,8 @@ impl PositionFeedbackService for FeedbackGrpcService {
             entry_price    = feedback.entry_price,
             "ReportPosition received",
         );
+        // Best-effort reconcile into the live account before answering.
+        reconcile_feedback(&self.live_account, &feedback).await;
         Ok(Response::new(compute_guidance(&feedback)))
     }
 
@@ -190,12 +239,13 @@ fn compute_guidance(feedback: &PositionFeedback) -> TradeGuidance {
 
 // ── Server Builder ─────────────────────────────────────────────────────────
 
-/// Convenience wrapper that holds the port for the feedback gRPC server.
+/// Convenience wrapper that holds the port + shared live account for the
+/// feedback gRPC server.
 ///
 /// # Example
 ///
 /// ```rust,ignore
-/// let server = FeedbackGrpcServer::new(50052);
+/// let server = FeedbackGrpcServer::new(50052, live_account);
 /// tonic::transport::Server::builder()
 ///     .add_service(server.into_service())
 ///     .serve("0.0.0.0:50052".parse()?)
@@ -204,18 +254,21 @@ fn compute_guidance(feedback: &PositionFeedback) -> TradeGuidance {
 pub struct FeedbackGrpcServer {
     /// Port the tonic server will bind to.
     pub port: u16,
+    /// Shared live-account model the service reconciles feedback into.
+    live_account: Arc<RwLock<LiveAccount>>,
 }
 
 impl FeedbackGrpcServer {
-    /// Create a new server builder for the given *port*.
-    pub fn new(port: u16) -> Self {
-        Self { port }
+    /// Create a new server builder for the given *port*, reconciling inbound
+    /// feedback into `live_account`.
+    pub fn new(port: u16, live_account: Arc<RwLock<LiveAccount>>) -> Self {
+        Self { port, live_account }
     }
 
     /// Consume this builder and return a configured tonic service wrapper
     /// ready to be mounted on a [`tonic::transport::Server`].
     pub fn into_service(self) -> PositionFeedbackServiceServer<FeedbackGrpcService> {
-        PositionFeedbackServiceServer::new(FeedbackGrpcService)
+        PositionFeedbackServiceServer::new(FeedbackGrpcService::new(self.live_account))
     }
 }
 
@@ -271,20 +324,20 @@ mod tests {
 
     #[test]
     fn test_feedback_grpc_server_new() {
-        let server = FeedbackGrpcServer::new(50052);
+        let server = FeedbackGrpcServer::new(50052, Arc::new(RwLock::new(LiveAccount::default())));
         assert_eq!(server.port, 50052);
     }
 
     #[test]
     fn test_feedback_grpc_server_into_service() {
         // Smoke-test that into_service() doesn't panic.
-        let server = FeedbackGrpcServer::new(50052);
+        let server = FeedbackGrpcServer::new(50052, Arc::new(RwLock::new(LiveAccount::default())));
         let _svc = server.into_service();
     }
 
     #[tokio::test]
     async fn test_report_position_hold() {
-        let svc = FeedbackGrpcService;
+        let svc = FeedbackGrpcService::default();
         let fb = make_feedback("sig-5", 50000.0, 10.0); // pnl < 0.005 * 50_000 = 250
         let req = Request::new(fb);
         let resp = svc.report_position(req).await.unwrap();
@@ -293,7 +346,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_report_position_take_profit() {
-        let svc = FeedbackGrpcService;
+        let svc = FeedbackGrpcService::default();
         let fb = make_feedback("sig-6", 50000.0, 300.0); // pnl > 0.005 * 50_000 = 250
         let req = Request::new(fb);
         let resp = svc.report_position(req).await.unwrap();
@@ -301,8 +354,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_report_position_reconciles_into_live_account() {
+        let live_account = Arc::new(RwLock::new(LiveAccount::default()));
+        let svc = FeedbackGrpcService::new(Arc::clone(&live_account));
+
+        // Profitable + price up ⇒ long. quantity is the unsigned magnitude.
+        let fb = PositionFeedback {
+            signal_id: "sig-recon-long".to_string(),
+            symbol: "BTCUSDT".to_string(),
+            entry_price: 30000.0,
+            current_price: 30500.0,
+            unrealized_pnl: 50.0,
+            quantity: 2.0,
+            timestamp_ms: 1234,
+            ..Default::default()
+        };
+        svc.report_position(Request::new(fb)).await.unwrap();
+        {
+            let acct = live_account.read().await;
+            let pos = acct.positions.get("BTCUSDT").expect("reconciled long");
+            assert!(
+                (pos.qty - 2.0).abs() < 1e-9,
+                "expected +2 long, got {}",
+                pos.qty
+            );
+            assert!((pos.avg_entry - 30000.0).abs() < 1e-9);
+            assert_eq!(acct.last_update_ms, 1234);
+        }
+
+        // Price up but losing ⇒ short (price_up != profitable) → signed negative.
+        let fb_short = PositionFeedback {
+            signal_id: "sig-recon-short".to_string(),
+            symbol: "BTCUSDT".to_string(),
+            entry_price: 30000.0,
+            current_price: 30500.0,
+            unrealized_pnl: -40.0,
+            quantity: 1.0,
+            timestamp_ms: 5678,
+            ..Default::default()
+        };
+        svc.report_position(Request::new(fb_short)).await.unwrap();
+        let acct = live_account.read().await;
+        let pos = acct.positions.get("BTCUSDT").unwrap();
+        assert!(
+            (pos.qty + 1.0).abs() < 1e-9,
+            "expected -1 short, got {}",
+            pos.qty
+        );
+    }
+
+    #[tokio::test]
     async fn test_record_trade_outcome_ack() {
-        let svc = FeedbackGrpcService;
+        let svc = FeedbackGrpcService::default();
         let outcome = TradeOutcome {
             signal_id: "sig-7".to_string(),
             symbol: "ETHUSD".to_string(),

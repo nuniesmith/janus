@@ -10,6 +10,7 @@
 //! - `POST /api/v1/signals/batch` - Generate multiple signals
 //! - `GET /api/v1/health` - Health check
 //! - `GET /api/v1/version` - Service version info
+//! - `GET /api/v1/metrics` - Prometheus metrics (janus-core global registry)
 //!
 //! ### Risk Management Endpoints
 //! - `GET /api/v1/risk/config` - Get risk configuration
@@ -188,10 +189,15 @@ impl RestServer {
             .as_ref()
             .map(|brain_state| brain_rest::router(brain_state.clone()));
 
+        // Prometheus metrics endpoint — renders the janus-core global registry.
+        // Unconditional and stateless; Prometheus scrapes this on the REST port.
+        let metrics_router = Router::new().route("/api/v1/metrics", get(metrics_handler));
+
         // Combine all routers
         let mut app = Router::new()
             .merge(signal_router)
             .merge(health_router)
+            .merge(metrics_router)
             .merge(risk_router);
 
         if let Some(brain) = brain_router {
@@ -521,6 +527,19 @@ async fn version_handler() -> Json<VersionResponse> {
         version: crate::VERSION.to_string(),
         service: crate::SERVICE_NAME.to_string(),
     })
+}
+
+/// `GET /api/v1/metrics` — Prometheus text exposition of the janus-core global
+/// registry. Stateless; scraped by Prometheus on the REST port.
+async fn metrics_handler() -> impl IntoResponse {
+    let body = janus_core::metrics::metrics().encode();
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
+        body,
+    )
 }
 
 /// Generate signal endpoint
