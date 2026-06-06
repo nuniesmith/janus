@@ -20,7 +20,7 @@ use crate::indicators::IndicatorAnalysis;
 use crate::inference::{ModelCache, ModelInference};
 use crate::persistence::RedisKillSwitch;
 use anyhow::{Result, anyhow};
-use janus_regime::{ActiveStrategy, DetectionMethod, MarketRegime, RoutedSignal};
+use janus_regime::{ActiveStrategy, DetectionMethod, MarketRegime, RoutedSignal, TrendDirection};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, error, info, warn};
@@ -262,7 +262,12 @@ impl SignalGenerator {
     async fn submit_to_execution(&self, signal: &TradingSignal) -> Result<()> {
         // ── Brain-gated path ───────────────────────────────────────
         if let Some(gated) = &self.brain_gated_client {
-            let routed = Self::synthetic_routed_signal(signal.confidence);
+            // Feed the real per-symbol detected regime (written to metadata by
+            // the live loop) into the gate instead of a hardcoded `Uncertain`,
+            // so per-regime strategy gating actually fires. Absent/unmappable
+            // regimes fall back to `Uncertain` (the prior behavior).
+            let regime = Self::regime_from_metadata(signal.metadata.get("regime"));
+            let routed = Self::synthetic_routed_signal(signal.confidence, regime);
             let strategy_name = signal
                 .metadata
                 .get("strategy")
@@ -448,13 +453,59 @@ impl SignalGenerator {
         }
     }
 
-    /// Build a synthetic `RoutedSignal` for pipeline evaluation when
-    /// the caller doesn't have full regime context. Uses the signal's
-    /// confidence and defaults for other fields.
-    fn synthetic_routed_signal(confidence: f64) -> RoutedSignal {
+    /// Map the live per-symbol regime carried in a signal's metadata to a
+    /// [`MarketRegime`] for the brain strategy gate.
+    ///
+    /// The live loop writes the detected regime to the `"regime"` metadata key
+    /// as `MarketRegime`'s `Display` form (see `lib.rs`, where it stores
+    /// `regime.to_string()`). This is the inverse of that `Display` impl, so
+    /// the gate buckets on the *real* detected regime instead of a hardcoded
+    /// `Uncertain`.
+    ///
+    /// **Safe fallback:** any value that is absent or doesn't match a known
+    /// regime maps to [`MarketRegime::Uncertain`] — the pre-existing behavior,
+    /// which leaves the (advisory) gate allowing everything when no
+    /// `preferred_regime_strategies` are configured.
+    fn regime_from_metadata(value: Option<&String>) -> MarketRegime {
+        let Some(raw) = value else {
+            return MarketRegime::Uncertain;
+        };
+        let norm = raw.trim().to_ascii_lowercase();
+        // Anchored on `MarketRegime`'s `Display` strings, but tolerant of minor
+        // formatting drift (case / punctuation) so a relabel upstream doesn't
+        // silently fall back to `Uncertain`.
+        if norm.contains("trend") {
+            if norm.contains("bear") {
+                MarketRegime::Trending(TrendDirection::Bearish)
+            } else {
+                // Default a directionless / bullish "trending" to bullish; the
+                // gate only buckets `Trending(_)` → "TrendFollowing" regardless
+                // of direction.
+                MarketRegime::Trending(TrendDirection::Bullish)
+            }
+        } else if norm.contains("mean") || norm.contains("revert") {
+            MarketRegime::MeanReverting
+        } else if norm.contains("volatile") || norm.contains("chop") {
+            MarketRegime::Volatile
+        } else {
+            MarketRegime::Uncertain
+        }
+    }
+
+    /// Build a synthetic `RoutedSignal` for pipeline evaluation.
+    ///
+    /// Uses the signal's confidence plus the *real* per-symbol regime detected
+    /// by the live `RegimeManager` (carried in the signal metadata and mapped
+    /// via [`Self::regime_from_metadata`]). Other routing fields keep their
+    /// synthetic defaults — the gate only consumes `regime` (+ confidence).
+    fn synthetic_routed_signal(confidence: f64, regime: MarketRegime) -> RoutedSignal {
+        let trend_direction = match regime {
+            MarketRegime::Trending(dir) => Some(dir),
+            _ => None,
+        };
         RoutedSignal {
             strategy: ActiveStrategy::NoTrade,
-            regime: MarketRegime::Uncertain,
+            regime,
             confidence,
             position_factor: 1.0,
             reason: "synthetic-for-brain-gate".to_string(),
@@ -462,7 +513,7 @@ impl SignalGenerator {
             methods_agree: None,
             state_probabilities: None,
             expected_duration: None,
-            trend_direction: None,
+            trend_direction,
         }
     }
 
@@ -1232,5 +1283,130 @@ mod tests {
         assert_eq!(m.total_filtered(), 2);
         // Confidence accumulator only fed by record_generated.
         assert!((m.avg_confidence() - 0.9).abs() < 1e-5);
+    }
+
+    // ── Regime metadata → MarketRegime mapping (brain gate) ─────────────
+
+    /// Each detected-regime value (as the live loop writes it — i.e.
+    /// `MarketRegime`'s `Display` form) maps back to the right `MarketRegime`.
+    #[test]
+    fn test_regime_from_metadata_known_variants() {
+        // Exactly the strings the live loop emits via `regime.to_string()`.
+        assert_eq!(
+            SignalGenerator::regime_from_metadata(Some(&"Trending (Bullish)".to_string())),
+            MarketRegime::Trending(TrendDirection::Bullish),
+        );
+        assert_eq!(
+            SignalGenerator::regime_from_metadata(Some(&"Trending (Bearish)".to_string())),
+            MarketRegime::Trending(TrendDirection::Bearish),
+        );
+        assert_eq!(
+            SignalGenerator::regime_from_metadata(Some(&"Mean-Reverting".to_string())),
+            MarketRegime::MeanReverting,
+        );
+        assert_eq!(
+            SignalGenerator::regime_from_metadata(Some(&"Volatile/Choppy".to_string())),
+            MarketRegime::Volatile,
+        );
+        assert_eq!(
+            SignalGenerator::regime_from_metadata(Some(&"Uncertain".to_string())),
+            MarketRegime::Uncertain,
+        );
+    }
+
+    /// Absent / unrecognized regime metadata falls back to `Uncertain`
+    /// (the pre-existing synthetic behavior — the gate keeps allowing
+    /// everything when no per-regime preferences are configured).
+    #[test]
+    fn test_regime_from_metadata_unknown_and_absent_fall_back() {
+        assert_eq!(
+            SignalGenerator::regime_from_metadata(None),
+            MarketRegime::Uncertain,
+        );
+        assert_eq!(
+            SignalGenerator::regime_from_metadata(Some(&"".to_string())),
+            MarketRegime::Uncertain,
+        );
+        assert_eq!(
+            SignalGenerator::regime_from_metadata(Some(&"banana".to_string())),
+            MarketRegime::Uncertain,
+        );
+    }
+
+    /// Tolerant of minor formatting drift (case / a bare "trending" label).
+    #[test]
+    fn test_regime_from_metadata_is_tolerant() {
+        assert_eq!(
+            SignalGenerator::regime_from_metadata(Some(&"trending".to_string())),
+            MarketRegime::Trending(TrendDirection::Bullish),
+        );
+        assert_eq!(
+            SignalGenerator::regime_from_metadata(Some(&"MEAN-REVERTING".to_string())),
+            MarketRegime::MeanReverting,
+        );
+        assert_eq!(
+            SignalGenerator::regime_from_metadata(Some(&"volatile".to_string())),
+            MarketRegime::Volatile,
+        );
+    }
+
+    /// A `TradingSignal` carrying a "trending" regime in metadata yields a
+    /// `RoutedSignal` whose `MarketRegime` is `Trending(_)` — which the
+    /// strategy gate buckets to the `"TrendFollowing"` key
+    /// (`gating::regime_to_key`, mirrored by `recommended_strategy()`).
+    #[test]
+    fn test_routed_signal_carries_trending_regime_for_gate() {
+        let mut signal = TradingSignal::new(
+            "BTC/USD".to_string(),
+            SignalType::Buy,
+            Timeframe::M15,
+            0.7,
+            SignalSource::TechnicalIndicator {
+                name: "EMAFlip".to_string(),
+            },
+        );
+        signal
+            .metadata
+            .insert("regime".to_string(), "Trending (Bullish)".to_string());
+
+        let regime = SignalGenerator::regime_from_metadata(signal.metadata.get("regime"));
+        let routed = SignalGenerator::synthetic_routed_signal(signal.confidence, regime);
+
+        assert!(matches!(routed.regime, MarketRegime::Trending(_)));
+        // The gate keys `Trending(_)` → "TrendFollowing"; `recommended_strategy`
+        // mirrors that same bucketing.
+        assert_eq!(
+            routed.regime.recommended_strategy(),
+            janus_regime::RecommendedStrategy::TrendFollowing,
+        );
+        assert_eq!(
+            routed.trend_direction,
+            Some(TrendDirection::Bullish),
+            "trend_direction should stay consistent with the trending regime",
+        );
+        // Confidence is carried through unchanged (no regime-confidence in
+        // metadata, so it stays the signal confidence).
+        assert!((routed.confidence - 0.7).abs() < f64::EPSILON);
+    }
+
+    /// A signal with no regime metadata produces a `RoutedSignal` that still
+    /// defaults to `Uncertain` — confirming the safe fallback end-to-end.
+    #[test]
+    fn test_routed_signal_defaults_to_uncertain_without_regime() {
+        let signal = TradingSignal::new(
+            "BTC/USD".to_string(),
+            SignalType::Buy,
+            Timeframe::M15,
+            0.5,
+            SignalSource::TechnicalIndicator {
+                name: "EMAFlip".to_string(),
+            },
+        );
+
+        let regime = SignalGenerator::regime_from_metadata(signal.metadata.get("regime"));
+        let routed = SignalGenerator::synthetic_routed_signal(signal.confidence, regime);
+
+        assert_eq!(routed.regime, MarketRegime::Uncertain);
+        assert_eq!(routed.trend_direction, None);
     }
 }
