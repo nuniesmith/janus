@@ -2137,3 +2137,116 @@ async fn test_pipeline_works_without_indicators() {
         "Pipeline should work without optional indicators"
     );
 }
+
+// ============================================================================
+// Per-strategy affinity attribution (PipelineAffinityRecorder)
+//
+// A realized close carries the fused consensus label (e.g.
+// "ema_flip+mean_reversion"). The recorder must attribute the outcome to each
+// contributing strategy so the tracker learns per-individual-strategy affinity
+// rather than on the fused label.
+// ============================================================================
+
+use janus_core::AffinityRecorder;
+use janus_forward::affinity_recorder::PipelineAffinityRecorder;
+
+#[tokio::test]
+async fn test_recorder_attributes_close_to_each_contributing_strategy() {
+    // affinity_min_trades = 1 so a single recorded trade is a real entry.
+    let config = TradingPipelineConfig {
+        affinity_min_trades: 1,
+        ..Default::default()
+    };
+    let pipeline = Arc::new(TradingPipeline::new(config));
+    let recorder = PipelineAffinityRecorder::new(Arc::clone(&pipeline));
+
+    // One realized close for a 3-strategy consensus signal.
+    recorder
+        .record_trade(
+            "ema_flip+mean_reversion+squeeze",
+            "BTC",
+            300.0,
+            true,
+            Some(2.0),
+        )
+        .await;
+
+    let gate = pipeline.strategy_gate().await;
+    let tracker = gate.tracker();
+
+    // Every contributor has its own (strategy, asset) record with the full
+    // outcome — equal credit/blame — and the fused label is NOT a key.
+    for strat in ["ema_flip", "mean_reversion", "squeeze"] {
+        let perf = tracker
+            .get_performance(strat, "BTC")
+            .unwrap_or_else(|| panic!("missing affinity entry for contributor {strat}"));
+        assert_eq!(perf.total_trades, 1, "{strat} should have one trade");
+        assert_eq!(perf.winning_trades, 1, "{strat} should have one win");
+        assert!(
+            (perf.total_pnl - 300.0).abs() < f64::EPSILON,
+            "{strat} should carry the full trade pnl"
+        );
+        assert!(
+            (perf.avg_rr_realized - 2.0).abs() < f64::EPSILON,
+            "{strat} should carry the trade RR"
+        );
+    }
+    assert!(
+        tracker
+            .get_performance("ema_flip+mean_reversion+squeeze", "BTC")
+            .is_none(),
+        "the fused label must not be recorded as its own strategy"
+    );
+    assert_eq!(
+        tracker.pair_count(),
+        3,
+        "exactly one record per contributor"
+    );
+}
+
+#[tokio::test]
+async fn test_recorder_single_strategy_records_once() {
+    let config = TradingPipelineConfig {
+        affinity_min_trades: 1,
+        ..Default::default()
+    };
+    let pipeline = Arc::new(TradingPipeline::new(config));
+    let recorder = PipelineAffinityRecorder::new(Arc::clone(&pipeline));
+
+    // A non-fused (single-strategy) close behaves exactly as before.
+    recorder
+        .record_trade("ema_flip", "ETH", -40.0, false, None)
+        .await;
+
+    let gate = pipeline.strategy_gate().await;
+    let tracker = gate.tracker();
+    let perf = tracker.get_performance("ema_flip", "ETH").unwrap();
+    assert_eq!(perf.total_trades, 1);
+    assert_eq!(perf.winning_trades, 0);
+    assert!((perf.total_pnl - (-40.0)).abs() < f64::EPSILON);
+    assert_eq!(tracker.pair_count(), 1);
+}
+
+#[tokio::test]
+async fn test_recorder_fallback_when_label_unsplittable() {
+    let config = TradingPipelineConfig {
+        affinity_min_trades: 1,
+        ..Default::default()
+    };
+    let pipeline = Arc::new(TradingPipeline::new(config));
+    let recorder = PipelineAffinityRecorder::new(Arc::clone(&pipeline));
+
+    // A blank label yields no contributors; fall back to a single record under
+    // the original name so behaviour never regresses (no dropped outcome).
+    recorder.record_trade("", "SOL", 10.0, true, None).await;
+
+    let gate = pipeline.strategy_gate().await;
+    let tracker = gate.tracker();
+    assert_eq!(
+        tracker.pair_count(),
+        1,
+        "fallback must still record exactly one outcome"
+    );
+    let perf = tracker.get_performance("", "SOL").unwrap();
+    assert_eq!(perf.total_trades, 1);
+}

@@ -269,6 +269,43 @@ impl StrategyAffinityTracker {
         perf.record(pnl, is_winner, rr_ratio);
     }
 
+    /// Attribute one realized trade outcome to **each** contributing strategy
+    /// on an asset.
+    ///
+    /// The live consensus loop fuses several agreeing strategies into a single
+    /// signal (e.g. `"ema_flip+mean_reversion"`); the realized close is a
+    /// single P&L number for that fused signal. To learn *per-individual-
+    /// strategy* affinity rather than on the fused label, the same outcome is
+    /// recorded once for every strategy that contributed to the signal.
+    ///
+    /// **Attribution model — equal credit/blame.** Each contributing strategy
+    /// receives the *full* trade outcome (the same `pnl`, `is_winner`, and
+    /// `rr_ratio`), not a fractional share. The rationale: every strategy in
+    /// the contributor set agreed on the direction, so each is equally
+    /// responsible for the entry; splitting the P&L would understate per-trade
+    /// magnitudes and distort the Sharpe / drawdown estimates, which are
+    /// computed from the per-trade series. Each `(strategy, asset)` pair thus
+    /// sees the trade exactly once.
+    ///
+    /// `strategies` is the de-duplicated contributor set. Duplicate names are
+    /// collapsed so a strategy that appears twice in the fused label is still
+    /// credited only once. An empty slice is a no-op.
+    pub fn record_trade_result_for_strategies(
+        &mut self,
+        strategies: &[&str],
+        asset: &str,
+        pnl: f64,
+        is_winner: bool,
+        rr_ratio: Option<f64>,
+    ) {
+        let mut seen = std::collections::HashSet::new();
+        for strategy in strategies {
+            if seen.insert(*strategy) {
+                self.record_trade_result_with_rr(strategy, asset, pnl, is_winner, rr_ratio);
+            }
+        }
+    }
+
     // ────────────────────────────────────────────────────────────────────
     // Querying
     // ────────────────────────────────────────────────────────────────────
@@ -596,6 +633,65 @@ mod tests {
         let perf = restored.get_performance("EMAFlip", "BTCUSD").unwrap();
         assert_eq!(perf.total_trades, 2);
         assert!((perf.total_pnl - 70.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_record_for_strategies_credits_each_contributor() {
+        let mut tracker = StrategyAffinityTracker::new(1);
+        // A fused signal where two strategies agreed; the close is one outcome.
+        tracker.record_trade_result_for_strategies(
+            &["ema_flip", "mean_reversion"],
+            "BTCUSD",
+            120.0,
+            true,
+            Some(2.0),
+        );
+
+        // Each contributor gets the full outcome for this asset, exactly once.
+        let ema = tracker.get_performance("ema_flip", "BTCUSD").unwrap();
+        assert_eq!(ema.total_trades, 1);
+        assert_eq!(ema.winning_trades, 1);
+        assert!((ema.total_pnl - 120.0).abs() < f64::EPSILON);
+        assert!((ema.avg_rr_realized - 2.0).abs() < f64::EPSILON);
+
+        let mr = tracker.get_performance("mean_reversion", "BTCUSD").unwrap();
+        assert_eq!(mr.total_trades, 1);
+        assert_eq!(mr.winning_trades, 1);
+        assert!((mr.total_pnl - 120.0).abs() < f64::EPSILON);
+
+        assert_eq!(tracker.pair_count(), 2);
+    }
+
+    #[test]
+    fn test_record_for_strategies_dedups_repeated_names() {
+        let mut tracker = StrategyAffinityTracker::new(1);
+        // A duplicate in the contributor set must be credited only once.
+        tracker.record_trade_result_for_strategies(
+            &["ema_flip", "ema_flip"],
+            "ETHUSD",
+            -50.0,
+            false,
+            None,
+        );
+        let perf = tracker.get_performance("ema_flip", "ETHUSD").unwrap();
+        assert_eq!(perf.total_trades, 1, "duplicate contributor double-counted");
+        assert_eq!(tracker.pair_count(), 1);
+    }
+
+    #[test]
+    fn test_record_for_strategies_single_contributor() {
+        let mut tracker = StrategyAffinityTracker::new(1);
+        tracker.record_trade_result_for_strategies(&["squeeze"], "SOLUSD", 80.0, true, None);
+        let perf = tracker.get_performance("squeeze", "SOLUSD").unwrap();
+        assert_eq!(perf.total_trades, 1);
+        assert!((perf.total_pnl - 80.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_record_for_strategies_empty_is_noop() {
+        let mut tracker = StrategyAffinityTracker::new(1);
+        tracker.record_trade_result_for_strategies(&[], "BTCUSD", 100.0, true, None);
+        assert_eq!(tracker.pair_count(), 0);
     }
 
     #[test]
