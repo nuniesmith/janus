@@ -275,20 +275,20 @@ The optimizer is automatically built and included in the janus Docker image:
 docker build -f infrastructure/docker/base/rust/Dockerfile \
   --target workspace \
   --build-arg SERVICE_NAME=janus \
-  -t nuniesmith/fks:janus .
+  -t nuniesmith/janus:latest .
 ```
 
 ### Running the Optimizer in Docker
 
 ```bash
 # Run optimizer inside the janus container
-docker exec -it fks_janus /app/janus-optimizer
+docker exec -it janus /app/janus-optimizer
 
 # Or start it as a background process
-docker exec -d fks_janus /app/janus-optimizer
+docker exec -d janus /app/janus-optimizer
 
 # Run a one-shot optimization
-docker exec fks_janus /app/janus-optimizer --run-once
+docker exec janus /app/janus-optimizer --run-once
 ```
 
 ### Docker Compose Configuration
@@ -568,10 +568,10 @@ cargo test -p janus-forward --test param_reload_integration
 docker compose -f infrastructure/compose/docker-compose.yml up -d
 
 # View optimizer logs
-docker logs -f fks_janus 2>&1 | grep optimizer
+docker logs -f janus 2>&1 | grep optimizer
 
 # Run optimizer manually
-docker exec -it fks_janus /app/janus-optimizer --run-once
+docker exec -it janus /app/janus-optimizer --run-once
 ```
 
 ### Logs

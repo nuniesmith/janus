@@ -1,10 +1,10 @@
-# fks-janus — TODO & Roadmap
+# janus — TODO & Roadmap
 
 > **Repo:** `github.com/nuniesmith/janus`
 > **Scope:** janus-only (Rust ML inference + neuromorphic + signal generation).
-> Infrastructure orchestration lives in [fks](https://github.com/nuniesmith/fks);
-> rustcode / claw / RC-CRATES items live under `fks/src/rustcode/` and are
-> **not** tracked here.
+> The workspace is standalone — its own `Dockerfile` + `docker-compose.yml`
+> live here. Unrelated rustcode / claw / RC-CRATES items are **not** tracked
+> here (see "Out of scope" below).
 > **Last synced:** 2026-05-31
 >
 > 📋 **Consolidation plan:** [`CONSOLIDATION_PLAN.md`](CONSOLIDATION_PLAN.md) —
@@ -254,7 +254,7 @@ gaps are below.
 
 ## Out of scope for this repo
 
-Tracked in the parent [fks](https://github.com/nuniesmith/fks) repo:
+Tracked in the [fks-full](https://github.com/nuniesmith/fks-full) repo:
 
 - `RC-CRATES-*` (rustcode workspace: runtime/api/tools/plugins/commands/server/claw-cli/compat-harness/lsp)
 - `API-*` (rustcode API security & config; rc-core/rc-api/rc-rag/rc-llm split)
