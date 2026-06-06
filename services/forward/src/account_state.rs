@@ -161,6 +161,43 @@ impl LiveAccount {
         pos.realized_pnl = num(v, "realised_pnl");
     }
 
+    /// Best-effort position upsert from the execution-service feedback channel
+    /// (the `PositionFeedback` gRPC stream).
+    ///
+    /// Bybit `apply_position` snapshots remain **authoritative**; this is purely
+    /// best-effort reconciliation between snapshots. Only primitives cross the
+    /// boundary — the proto type is never imported here (see module docs).
+    ///
+    /// `signed_qty` is the side-aware quantity (+long / -short). A magnitude
+    /// below `1e-9` removes the position; otherwise the position is upserted
+    /// (`qty`, `avg_entry`, `unrealized_pnl`) leaving `realized_pnl` untouched.
+    pub fn apply_feedback_position(
+        &mut self,
+        symbol: &str,
+        signed_qty: f64,
+        avg_entry: f64,
+        unrealized_pnl: f64,
+        ts_ms: i64,
+    ) {
+        if symbol.is_empty() {
+            return;
+        }
+        if ts_ms > self.last_update_ms {
+            self.last_update_ms = ts_ms;
+        }
+        if signed_qty.abs() < 1e-9 {
+            self.positions.remove(symbol);
+            return;
+        }
+        let pos = self.positions.entry(symbol.to_string()).or_default();
+        pos.symbol = symbol.to_string();
+        pos.qty = signed_qty;
+        pos.avg_entry = avg_entry;
+        pos.unrealized_pnl = unrealized_pnl;
+        // `realized_pnl` is intentionally left untouched — feedback frames carry
+        // no realised-PnL field, and the authoritative snapshot owns it.
+    }
+
     /// Wallet balance update for one currency.
     pub fn apply_balance(&mut self, v: &Value) {
         self.touch(v);
@@ -388,6 +425,34 @@ mod tests {
         // current_qty 0 closes the position.
         acct.apply_position(&json!({ "symbol": "ETHUSDT", "current_qty": 0 }));
         assert!(!acct.positions.contains_key("ETHUSDT"));
+    }
+
+    #[test]
+    fn feedback_position_upserts_and_clears() {
+        let mut acct = LiveAccount::default();
+
+        // Open a short via feedback (signed -2). realized_pnl stays at default 0.
+        acct.apply_feedback_position("BTCUSDT", -2.0, 30000.0, -15.0, 100);
+        let pos = acct.positions.get("BTCUSDT").expect("position upserted");
+        assert!(approx(pos.qty, -2.0) && approx(pos.avg_entry, 30000.0));
+        assert!(approx(pos.unrealized_pnl, -15.0) && approx(pos.realized_pnl, 0.0));
+        assert_eq!(acct.last_update_ms, 100);
+
+        // Newer timestamp advances last_update_ms; updates the fields in place.
+        acct.apply_feedback_position("BTCUSDT", -1.0, 30100.0, 5.0, 200);
+        let pos = acct.positions.get("BTCUSDT").unwrap();
+        assert!(approx(pos.qty, -1.0) && approx(pos.avg_entry, 30100.0));
+        assert!(approx(pos.unrealized_pnl, 5.0));
+        assert_eq!(acct.last_update_ms, 200);
+
+        // An older timestamp must not roll last_update_ms backwards.
+        acct.apply_feedback_position("BTCUSDT", -1.0, 30100.0, 5.0, 50);
+        assert_eq!(acct.last_update_ms, 200);
+
+        // A sub-epsilon magnitude clears the position.
+        acct.apply_feedback_position("BTCUSDT", 0.0, 0.0, 0.0, 300);
+        assert!(!acct.positions.contains_key("BTCUSDT"));
+        assert_eq!(acct.last_update_ms, 300);
     }
 
     #[test]

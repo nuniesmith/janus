@@ -324,7 +324,7 @@ async fn main() -> Result<()> {
         let addr: std::net::SocketAddr = format!("0.0.0.0:{port}")
             .parse()
             .expect("valid feedback gRPC socket address");
-        let svc = FeedbackGrpcServer::new(port).into_service();
+        let svc = FeedbackGrpcServer::new(port, service.live_account()).into_service();
         info!("🔌 PositionFeedbackService gRPC server on port {port}");
         tokio::spawn(async move {
             if let Err(e) = tonic::transport::Server::builder()
