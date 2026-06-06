@@ -1,4 +1,4 @@
-# FKS Execution Service - Architecture Overview
+# Janus Execution Service - Architecture Overview
 
 ## System Architecture (Week 5)
 
