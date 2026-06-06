@@ -456,6 +456,18 @@ impl RiskManager {
         self.config = config;
     }
 
+    /// Set the live account balance and rebuild all derived limits/sizers.
+    ///
+    /// Wired from the forward service's live-balance sampler so that
+    /// balance-relative risk limits (position size, exposure, daily loss)
+    /// track the real Bybit USDT equity. This only updates *limits* — it never
+    /// touches the order-submit path or the `JANUS_RISK_ENFORCE` gate.
+    pub fn set_account_balance(&mut self, balance: f64) {
+        let mut cfg = self.config().clone();
+        cfg.account_balance = balance;
+        self.update_config(cfg);
+    }
+
     /// Check if param reload is configured
     pub fn has_param_reload(&self) -> bool {
         self.param_query_handle.is_some()
