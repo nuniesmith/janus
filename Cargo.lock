@@ -3751,32 +3751,8 @@ dependencies = [
 
 [[package]]
 name = "exchange-apiws"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "281c517f242c930bd9fb9c1160b69f1a7f247e33960aac7b6f2ef5f9973ef47b"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "chrono",
- "futures-util",
- "hmac",
- "reqwest 0.13.4",
- "serde",
- "serde_json",
- "sha2",
- "thiserror 2.0.18",
- "tokio",
- "tokio-tungstenite 0.29.0",
- "tracing",
- "uuid",
- "zeroize",
-]
-
-[[package]]
-name = "exchange-apiws"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "122c43b81f6e4f60ab4dfcf3448ae52bede7399fabb74554e910d0d77765c81a"
+version = "0.6.0"
+source = "git+https://github.com/nuniesmith/exchange-apiws?rev=daf30914bb288043f4bf8b0d9a5962700dbb384f#daf30914bb288043f4bf8b0d9a5962700dbb384f"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -5665,7 +5641,7 @@ dependencies = [
  "chrono",
  "config",
  "dotenvy",
- "exchange-apiws 0.5.0",
+ "exchange-apiws",
  "futures-util",
  "governor 0.10.4",
  "hex",
@@ -5772,7 +5748,7 @@ dependencies = [
  "axum 0.8.8",
  "chrono",
  "config",
- "exchange-apiws 0.4.0",
+ "exchange-apiws",
  "fks-proto",
  "futures",
  "futures-util",

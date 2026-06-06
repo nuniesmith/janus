@@ -65,7 +65,7 @@ janus-risk = { path = "../../crates/risk", package = "jflow-risk" }
 janus-cns = { path = "../../crates/cns", package = "jflow-cns" }
 # Bybit connectivity now comes from the published exchange-apiws crate; the
 # `bybit_compat` module adapts it to the API the event loop expects.
-exchange-apiws = { version = "0.4", default-features = false, features = ["bybit"] }
+exchange-apiws = { version = "0.6", default-features = false, features = ["bybit"] }
 janus-questdb-writer = { path = "../../crates/questdb-writer", package = "jflow-questdb-writer" }
 
 # Async Runtime
