@@ -1,8 +1,8 @@
-# fks-janus
+# janus
 
-**Rust ML inference engine and neuromorphic trading brain — source code only.**
+**Rust ML inference engine and neuromorphic trading brain.**
 
-This repo contains the Janus engine: a 39-crate Rust workspace implementing ML inference, neuromorphic GPU compute, signal generation, gRPC services, QuestDB data pipelines, and risk management. Infrastructure (Docker, compose, CI/CD) lives in [fks](https://github.com/nuniesmith/fks).
+A self-contained 39-crate Rust workspace implementing ML inference, neuromorphic GPU compute, signal generation, gRPC services, QuestDB data pipelines, and risk management. The workspace builds and runs **standalone** — its own [`Dockerfile`](Dockerfile) and [`docker-compose.yml`](docker-compose.yml) live in this repo. It can also be consumed as a service by the [fks-full](https://github.com/nuniesmith/fks-full) orchestrator.
 
 ---
 
@@ -33,7 +33,7 @@ Brain-region-mapped Rust modules — experimental (30-day live validation requir
 
 ### Proto definitions (`services/forward/proto/`)
 
-gRPC service definitions — see `src/proto/` in the root for the shared `fks-proto` crate.
+gRPC service definitions. The shared protobuf surface is the `fks-proto` crate at `crates/fks-proto/`.
 
 ## Architecture
 
@@ -57,7 +57,17 @@ Kill Switch → Regime → Hypothalamus → Amygdala → Strategy Gate → Corre
 - `POST /api/v1/brain/affinity/record` — record trade outcome for learning
 - `GET /api/v1/risk/evaluate` — risk gate evaluation
 
-## Building
+## Quick start (Docker)
+
+```bash
+docker compose up -d           # build + run janus with Redis, Postgres, QuestDB
+docker compose logs -f janus   # tail janus
+docker compose down            # stop & remove
+```
+
+`docker-compose.yml` boots the janus binary together with the backing services it needs to come up cleanly (Redis, Postgres, QuestDB) on its own bridge network. Downstream consumers (Alertmanager, JanusAI, a Ruby executor) are **not** included — janus tolerates their absence (signal pushes log a warning and continue); fks-full provides them when janus runs as part of that stack.
+
+## Building (from source)
 
 ```bash
 # Full workspace build
@@ -82,14 +92,18 @@ Requires Rust stable (edition 2024). GPU features require CUDA toolkit + matchin
 | `ENABLE_BRAIN_RUNTIME` | `true` | Start brain REST server |
 | `JANUS_BOOTSTRAP_DAYS` | `30` | Days of memories to load on cold start |
 | `JANUS_BOOTSTRAP_LIMIT` | `500` | Max memory records to bootstrap |
-| `ALERTMANAGER_URL` | `http://fks_alertmanager:9093` | Signal push endpoint |
-| `JANUS_FORWARD_URL` | `http://fks_janus:8180` | Brain REST (for Ruby to call) |
+| `REDIS_URL` | `redis://redis:6379/0` | Redis URL (compose points this at the bundled service) |
+| `DATABASE_URL` | `postgres://janus:janus@postgres:5432/janus` | Postgres URL (compose-bundled) |
+| `QUESTDB_HOST` | `questdb` | QuestDB host (compose-bundled) |
+| `ALERTMANAGER_URL` | `http://fks_alertmanager:9093` | Signal push endpoint — optional; if unreachable (standalone), pushes warn and continue |
+| `JANUS_FORWARD_URL` | `http://fks_janus:8180` | Brain REST URL an external executor calls |
 
-Full env reference in [fks/.env.example](https://github.com/nuniesmith/fks/blob/main/.env.example).
+The compose file sets the backing-service URLs above; see `config/janus.toml` and `docker-compose.yml` for the full set.
 
 ## Deployment
 
-Deployed via [fks](https://github.com/nuniesmith/fks). The Dockerfile clones this repo at build time. No Docker config lives here.
+- **Standalone** — `docker compose up -d` in this repo builds the image (multi-stage [`Dockerfile`](Dockerfile), unified `janus` binary) and runs it with its backing services.
+- **As part of [fks-full](https://github.com/nuniesmith/fks-full)** — the orchestrator builds this repo's image and runs janus alongside the shared infrastructure (Alertmanager, Ruby executor, Grafana, …). It's the same self-contained workspace in both cases.
 
 ## Stats
 
