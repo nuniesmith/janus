@@ -1,4 +1,4 @@
-# FKS Execution Service - Overall Status (Week 6 Complete)
+# Janus Execution Service - Overall Status (Week 6 Complete)
 
 **Last Updated**: Week 6 Complete  
 **Version**: 0.1.0  
