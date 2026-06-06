@@ -15,8 +15,9 @@
 //! - **Private user-data feed** ([`BybitPrivateWebSocket`]) drives
 //!   [`exchange_apiws::bybit::BybitPrivateConnector`] (signed `op:"auth"` +
 //!   order/execution/position/wallet topics), translating
-//!   `DataMessage::{OrderUpdate,PositionChange}` into `WsMessage::{OrderUpdate,
-//!   ExecutionUpdate,PositionUpdate}` so janus's Bybit path is trade-aware.
+//!   `DataMessage::{OrderUpdate,PositionChange,BalanceUpdate}` into
+//!   `WsMessage::{OrderUpdate,ExecutionUpdate,PositionUpdate,BalanceUpdate}` so
+//!   janus's Bybit path is trade-aware.
 
 use std::sync::Arc;
 
@@ -87,6 +88,7 @@ pub enum WsMessage {
     OrderUpdate(serde_json::Value),
     PositionUpdate(serde_json::Value),
     ExecutionUpdate(serde_json::Value),
+    BalanceUpdate(serde_json::Value),
 }
 
 // ── Order request (janus literal shape) ───────────────────────────────────────
@@ -294,7 +296,7 @@ impl BybitWebSocket {
 /// - order *state* → [`WsMessage::OrderUpdate`]
 /// - a fill (per-execution `match_price` present) → [`WsMessage::ExecutionUpdate`]
 /// - position change → [`WsMessage::PositionUpdate`]
-/// - wallet/balance → `None` (no `WsMessage` variant yet)
+/// - wallet/balance → [`WsMessage::BalanceUpdate`]
 fn translate_private(msg: DataMessage) -> Option<WsMessage> {
     match msg {
         DataMessage::OrderUpdate(o) => {
@@ -309,6 +311,9 @@ fn translate_private(msg: DataMessage) -> Option<WsMessage> {
         }
         DataMessage::PositionChange(p) => Some(WsMessage::PositionUpdate(
             serde_json::to_value(&p).unwrap_or(serde_json::Value::Null),
+        )),
+        DataMessage::BalanceUpdate(b) => Some(WsMessage::BalanceUpdate(
+            serde_json::to_value(&b).unwrap_or(serde_json::Value::Null),
         )),
         _ => None,
     }
@@ -471,7 +476,7 @@ mod tests {
             other => panic!("expected PositionUpdate, got {other:?}"),
         }
 
-        // Wallet/balance has no WsMessage variant yet → skipped.
+        // Wallet/balance → BalanceUpdate, carrying the f64 available balance.
         let bal = exchange_apiws::actors::BalanceUpdate {
             exchange: "bybit".into(),
             currency: "USDT".into(),
@@ -481,6 +486,12 @@ mod tests {
             exchange_ts: 1,
             receipt_ts: 2,
         };
-        assert!(translate_private(DataMessage::BalanceUpdate(bal)).is_none());
+        match translate_private(DataMessage::BalanceUpdate(bal)).expect("balance maps") {
+            WsMessage::BalanceUpdate(v) => {
+                assert_eq!(v["currency"], "USDT");
+                assert_eq!(v["available_balance"], 100.0);
+            }
+            other => panic!("expected BalanceUpdate, got {other:?}"),
+        }
     }
 }
