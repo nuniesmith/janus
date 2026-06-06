@@ -1,6 +1,6 @@
-# FKS DataRecorder Monitoring
+# Janus DataRecorder Monitoring
 
-This directory contains Grafana dashboards and Prometheus alerting rules for monitoring the FKS DataRecorder component.
+This directory contains Grafana dashboards and Prometheus alerting rules for monitoring the Janus DataRecorder component.
 
 ## Overview
 
@@ -56,8 +56,8 @@ cp provisioning/dashboards.yaml /etc/grafana/provisioning/dashboards/
 cp provisioning/datasources.yaml /etc/grafana/provisioning/datasources/
 
 # Copy dashboard JSON
-mkdir -p /var/lib/grafana/dashboards/fks
-cp dashboards/data-recorder-health.json /var/lib/grafana/dashboards/fks/
+mkdir -p /var/lib/grafana/dashboards/janus
+cp dashboards/data-recorder-health.json /var/lib/grafana/dashboards/janus/
 ```
 
 Restart Grafana:
@@ -75,7 +75,7 @@ services:
   prometheus:
     image: prom/prometheus:latest
     volumes:
-      - ./prometheus/alert-rules.yaml:/etc/prometheus/rules/fks-alerts.yaml
+      - ./prometheus/alert-rules.yaml:/etc/prometheus/rules/janus-alerts.yaml
       - ./prometheus.yml:/etc/prometheus/prometheus.yml
     ports:
       - "9090:9090"
@@ -84,7 +84,7 @@ services:
     image: grafana/grafana:latest
     volumes:
       - ./grafana/provisioning:/etc/grafana/provisioning
-      - ./grafana/dashboards:/var/lib/grafana/dashboards/fks
+      - ./grafana/dashboards:/var/lib/grafana/dashboards/janus
     ports:
       - "3000:3000"
     environment:
@@ -244,7 +244,7 @@ receivers:
   - name: 'slack-warnings'
     slack_configs:
       - api_url: '<your-slack-webhook>'
-        channel: '#fks-alerts'
+        channel: '#janus-alerts'
         title: '{{ .CommonAnnotations.summary }}'
         text: '{{ .CommonAnnotations.description }}'
 ```

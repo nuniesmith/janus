@@ -1,4 +1,4 @@
-# FKS Execution Service
+# Janus Execution Service
 
 **Standalone trade execution and position management microservice**
 
