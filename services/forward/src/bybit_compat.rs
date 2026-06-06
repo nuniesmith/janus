@@ -463,7 +463,7 @@ mod tests {
         let pos = exchange_apiws::actors::PositionChange {
             symbol: "BTCUSDT".into(),
             exchange: "bybit".into(),
-            current_qty: -3,
+            current_qty: -3.0,
             avg_entry_price: 30000.0,
             unrealised_pnl: 1.0,
             realised_pnl: 2.0,
@@ -472,7 +472,7 @@ mod tests {
             receipt_ts: 2,
         };
         match translate_private(DataMessage::PositionChange(pos)).expect("position maps") {
-            WsMessage::PositionUpdate(v) => assert_eq!(v["current_qty"], -3),
+            WsMessage::PositionUpdate(v) => assert_eq!(v["current_qty"], -3.0),
             other => panic!("expected PositionUpdate, got {other:?}"),
         }
 
