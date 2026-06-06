@@ -75,7 +75,7 @@ pub use api::server::RestServer;
 pub use brain_runtime::{BrainHealthReport, BrainRuntime, BrainRuntimeConfig};
 pub use brain_wiring::{
     PipelineStage, TradeAction, TradingDecision, TradingPipeline, TradingPipelineBuilder,
-    TradingPipelineConfig,
+    TradingPipelineConfig, load_gating_config, load_gating_config_from_env,
 };
 pub use execution::{
     BrainGatedConfig, BrainGatedExecutionClient, ExecutionClient, ExecutionClientConfig,
@@ -723,8 +723,15 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
 
             let preflight = PreflightRuntimeConfig::default();
 
+            // Per-asset strategy gating from janus.toml ([gating] table); empty
+            // (no-op) when the file/section is absent.
+            let pipeline = brain_wiring::TradingPipelineConfig {
+                gating: brain_wiring::load_gating_config_from_env(),
+                ..Default::default()
+            };
+
             BrainRuntimeConfig {
-                pipeline: brain_wiring::TradingPipelineConfig::default(),
+                pipeline,
                 watchdog,
                 preflight,
                 enforce_preflight: parse_env_bool("BRAIN_ENFORCE_PREFLIGHT", true),
