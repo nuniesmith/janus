@@ -26,8 +26,8 @@ use janus_forward::{
     AffinityRedisConfig, AffinityRedisStore, BrainGatedConfig, BrainGatedExecutionClient,
     BrainHealthReport, BrainHealthState, BrainRuntime, BrainRuntimeConfig, ExecutionClient,
     ExecutionClientConfig, FeedbackGrpcServer, ForwardService, ForwardServiceConfig,
-    ParamReloadConfig, TradingPipelineConfig, load_pipeline_affinity, save_pipeline_affinity,
-    spawn_affinity_autosave,
+    ParamReloadConfig, TradingPipelineConfig, load_gating_config_from_env, load_pipeline_affinity,
+    save_pipeline_affinity, spawn_affinity_autosave,
 };
 use std::sync::Arc;
 use tracing::{error, info, warn};
@@ -748,6 +748,9 @@ fn load_brain_runtime_config() -> BrainRuntimeConfig {
         high_risk_scale_factor: parse_env_f64("BRAIN_HIGH_RISK_SCALE", 0.5),
         allow_new_positions_in_crisis: parse_env_bool("BRAIN_ALLOW_CRISIS_POSITIONS", false),
         min_regime_confidence: parse_env_f64("BRAIN_MIN_REGIME_CONFIDENCE", 0.3),
+        // Per-asset strategy gating from janus.toml ([gating] table). Falls back
+        // to an empty (no-op) config when the file/section is absent.
+        gating: load_gating_config_from_env(),
         ..Default::default()
     };
 

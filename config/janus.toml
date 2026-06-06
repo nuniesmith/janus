@@ -42,3 +42,58 @@ default_quote = "USD"
 
 [trading]
 mode = "simulation"
+
+# ───────────────────────────────────────────────────────────────────────────
+# Strategy gating (advisory, brain runtime only)
+# ───────────────────────────────────────────────────────────────────────────
+# Per-asset allow/deny + regime preferences consulted by the StrategyGate at
+# execution-submit time. Only active when ENABLE_BRAIN_RUNTIME + ENABLE_EXECUTION
+# are on. It blocks/allows a *candidate* signal; it never initiates an order.
+#
+# Loaded by janus-forward from this file (JANUS_CONFIG_PATH; override the gating
+# file alone with JANUS_GATING_CONFIG_PATH). If this whole [gating] table is
+# absent, the gate is a no-op (empty allow/deny → everything passes), so leaving
+# it out keeps existing deploys unchanged.
+#
+# Asset keys must match the runtime trading symbol (e.g. "BTCUSD" / "BTCUSDT"),
+# NOT the bare base asset from [assets].enabled above. Strategy names match the
+# strategy modules (case-insensitive): ema_flip, ema_ribbon_scalper,
+# mean_reversion, momentum_surge, multi_tf_trend, opening_range,
+# trend_pullback, vwap_scalper, bollinger_squeeze.
+# Regime keys: TrendFollowing, MeanReverting, Volatile, Uncertain.
+[gating]
+# Global minimum affinity weight to keep a strategy enabled (0.0–1.0).
+min_weight = 0.30
+# Allow strategies with no recorded trades yet (benefit of the doubt).
+allow_untested = true
+
+# ── Per-asset overrides (commented examples; uncomment + edit to pin) ──
+# enabled_strategies:  non-empty = allowlist (only these run for the asset).
+# disabled_strategies: never run for the asset, regardless of regime/affinity.
+# preferred_regime_strategies: per regime, only these run (others gated out).
+#
+# [gating.assets.BTCUSD]
+# enabled_strategies  = ["ema_flip", "trend_pullback", "momentum_surge"]
+# disabled_strategies = ["mean_reversion"]
+#
+# [gating.assets.BTCUSD.preferred_regime_strategies]
+# TrendFollowing = ["ema_flip", "trend_pullback", "multi_tf_trend"]
+# MeanReverting  = ["bollinger_squeeze", "vwap_scalper"]
+# Volatile       = ["momentum_surge"]
+#
+# [gating.assets.ETHUSD]
+# enabled_strategies  = ["ema_flip", "mean_reversion", "vwap_scalper"]
+# disabled_strategies = ["momentum_surge"]
+#
+# [gating.assets.ETHUSD.preferred_regime_strategies]
+# TrendFollowing = ["ema_flip", "multi_tf_trend"]
+# MeanReverting  = ["vwap_scalper", "mean_reversion"]
+#
+# [gating.assets.SOLUSD]
+# enabled_strategies  = ["ema_flip", "momentum_surge", "opening_range"]
+# disabled_strategies = ["multi_tf_trend"]
+#
+# [gating.assets.SOLUSD.preferred_regime_strategies]
+# TrendFollowing = ["ema_flip", "momentum_surge"]
+# MeanReverting  = ["opening_range"]
+# Volatile       = ["momentum_surge"]

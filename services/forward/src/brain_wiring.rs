@@ -156,6 +156,109 @@ impl Default for TradingPipelineConfig {
 }
 
 // ============================================================================
+// Gating config loading (TOML)
+// ============================================================================
+
+/// Default path to the janus TOML configuration file.
+const DEFAULT_JANUS_CONFIG_PATH: &str = "config/janus.toml";
+
+/// Load the per-asset [`StrategyGatingConfig`] from a janus TOML config file.
+///
+/// Reads the `[gating]` table out of the same TOML used by `janus-core`
+/// (`JANUS_CONFIG_PATH`, defaulting to `config/janus.toml`). The shape of the
+/// `[gating]` table mirrors [`StrategyGatingConfig`]:
+///
+/// ```toml
+/// [gating]
+/// min_weight     = 0.3
+/// allow_untested = true
+///
+/// [gating.assets.BTCUSD]
+/// enabled_strategies  = ["ema_flip", "trend_pullback"]
+/// disabled_strategies = ["mean_reversion"]
+///
+/// [gating.assets.BTCUSD.preferred_regime_strategies]
+/// TrendFollowing = ["ema_flip", "trend_pullback"]
+/// ```
+///
+/// Resolution order for the config path:
+/// 1. `JANUS_GATING_CONFIG_PATH` env var (dedicated override), if set.
+/// 2. `JANUS_CONFIG_PATH` env var (the shared janus config), if set.
+/// 3. The `default_path` argument (callers pass [`DEFAULT_JANUS_CONFIG_PATH`]).
+///
+/// This is intentionally infallible: on *any* problem (file missing, unreadable,
+/// malformed TOML, malformed `[gating]` table) it logs a warning and returns
+/// [`StrategyGatingConfig::default()`] (empty `assets`), so existing deploys
+/// that have no `[gating]` section keep working unchanged. A missing `[gating]`
+/// table is treated as normal (debug-level), not a warning.
+pub fn load_gating_config(default_path: &str) -> StrategyGatingConfig {
+    let path = std::env::var("JANUS_GATING_CONFIG_PATH")
+        .or_else(|_| std::env::var("JANUS_CONFIG_PATH"))
+        .unwrap_or_else(|_| default_path.to_string());
+
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(
+                path = %path,
+                error = %e,
+                "Could not read janus config for strategy gating; using default (empty) gating config"
+            );
+            return StrategyGatingConfig::default();
+        }
+    };
+
+    let table: toml::Table = match toml::from_str(&contents) {
+        Ok(t) => t,
+        Err(e) => {
+            warn!(
+                path = %path,
+                error = %e,
+                "Failed to parse janus config TOML for strategy gating; using default (empty) gating config"
+            );
+            return StrategyGatingConfig::default();
+        }
+    };
+
+    let Some(gating_value) = table.get("gating") else {
+        debug!(
+            path = %path,
+            "No [gating] section in janus config; using default (empty) gating config"
+        );
+        return StrategyGatingConfig::default();
+    };
+
+    match gating_value.clone().try_into::<StrategyGatingConfig>() {
+        Ok(config) => {
+            info!(
+                path = %path,
+                asset_count = config.assets.len(),
+                min_weight = config.min_weight,
+                allow_untested = config.allow_untested,
+                "Loaded strategy gating config from janus.toml"
+            );
+            config
+        }
+        Err(e) => {
+            warn!(
+                path = %path,
+                error = %e,
+                "Malformed [gating] section in janus config; using default (empty) gating config"
+            );
+            StrategyGatingConfig::default()
+        }
+    }
+}
+
+/// Load the per-asset gating config from the default janus config path
+/// ([`DEFAULT_JANUS_CONFIG_PATH`]), honouring the `JANUS_GATING_CONFIG_PATH` /
+/// `JANUS_CONFIG_PATH` env overrides. Convenience wrapper around
+/// [`load_gating_config`] for the pipeline-assembly call sites.
+pub fn load_gating_config_from_env() -> StrategyGatingConfig {
+    load_gating_config(DEFAULT_JANUS_CONFIG_PATH)
+}
+
+// ============================================================================
 // Trade Action / Decision
 // ============================================================================
 
@@ -1975,5 +2078,136 @@ mod tests {
             )
             .await;
         assert_eq!(enabled.len(), 3);
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // load_gating_config (TOML → StrategyGatingConfig → StrategyGate)
+    // ────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_load_gating_config_from_toml_and_gate() {
+        // A janus.toml-shaped document: the gating lives under a [gating]
+        // sub-table (alongside the other top-level janus tables), exactly as it
+        // is written in config/janus.toml.
+        let toml_str = r#"
+[assets]
+enabled = ["BTC", "ETH", "SOL"]
+
+[gating]
+min_weight     = 0.30
+allow_untested = true
+
+[gating.assets.BTCUSD]
+enabled_strategies  = ["ema_flip", "trend_pullback", "momentum_surge"]
+disabled_strategies = ["mean_reversion"]
+
+[gating.assets.BTCUSD.preferred_regime_strategies]
+TrendFollowing = ["ema_flip", "trend_pullback"]
+MeanReverting  = ["bollinger_squeeze"]
+
+[gating.assets.ETHUSD]
+enabled_strategies  = ["ema_flip", "vwap_scalper"]
+disabled_strategies = ["momentum_surge"]
+"#;
+
+        // Write to a unique temp file and load through the real loader so the
+        // file-read + [gating] extraction path is exercised, not just serde.
+        let path = std::env::temp_dir().join(format!(
+            "janus_gating_test_{}_{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, toml_str).expect("write temp gating config");
+
+        // Defend against a leaked JANUS_CONFIG_PATH / JANUS_GATING_CONFIG_PATH
+        // in the test environment (they take precedence over the arg). These
+        // are process-global, hence `unsafe`, mirroring other tests here.
+        unsafe {
+            std::env::remove_var("JANUS_GATING_CONFIG_PATH");
+            std::env::remove_var("JANUS_CONFIG_PATH");
+        }
+
+        let config = load_gating_config(path.to_str().expect("utf-8 temp path"));
+        let _ = std::fs::remove_file(&path);
+
+        // (a) deserialized into the expected per-asset entries
+        assert!((config.min_weight - 0.30).abs() < f64::EPSILON);
+        assert!(config.allow_untested);
+        assert_eq!(config.assets.len(), 2);
+
+        let btc = config.assets.get("BTCUSD").expect("BTCUSD entry");
+        assert_eq!(
+            btc.enabled_strategies,
+            vec!["ema_flip", "trend_pullback", "momentum_surge"]
+        );
+        assert_eq!(btc.disabled_strategies, vec!["mean_reversion"]);
+        assert_eq!(
+            btc.preferred_regime_strategies
+                .get("MeanReverting")
+                .expect("MeanReverting prefs"),
+            &vec!["bollinger_squeeze".to_string()]
+        );
+
+        let eth = config.assets.get("ETHUSD").expect("ETHUSD entry");
+        assert_eq!(eth.disabled_strategies, vec!["momentum_surge"]);
+
+        // (b) the resulting StrategyGate honours the config via should_run.
+        // Use allow_untested=true so the affinity step (untested → 0.5) does not
+        // mask the allow/deny behaviour we are asserting.
+        let tracker = StrategyAffinityTracker::new(10);
+        let gate = StrategyGate::new(config, tracker);
+        let trending = MarketRegime::Trending(TrendDirection::Bullish);
+
+        // disabled strategy is blocked
+        assert!(!gate.should_run("mean_reversion", "BTCUSD", &trending));
+        // enabled strategy on the allowlist (and a preferred trend strategy) runs
+        assert!(gate.should_run("ema_flip", "BTCUSD", &trending));
+        // a strategy not on BTCUSD's non-empty allowlist is blocked
+        assert!(!gate.should_run("opening_range", "BTCUSD", &trending));
+        // ETHUSD's disabled strategy is blocked there
+        assert!(!gate.should_run("momentum_surge", "ETHUSD", &trending));
+        // unconfigured asset → no per-asset rules → untested strategy allowed
+        assert!(gate.should_run("opening_range", "ADAUSD", &trending));
+    }
+
+    #[test]
+    fn test_load_gating_config_missing_file_is_default() {
+        unsafe {
+            std::env::remove_var("JANUS_GATING_CONFIG_PATH");
+            std::env::remove_var("JANUS_CONFIG_PATH");
+        }
+        let missing = std::env::temp_dir().join(format!(
+            "janus_gating_does_not_exist_{}.toml",
+            std::process::id()
+        ));
+        let config = load_gating_config(missing.to_str().unwrap());
+        // Missing file → default (empty assets), must not panic.
+        assert!(config.assets.is_empty());
+        assert!((config.min_weight - 0.3).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_load_gating_config_no_gating_section_is_default() {
+        unsafe {
+            std::env::remove_var("JANUS_GATING_CONFIG_PATH");
+            std::env::remove_var("JANUS_CONFIG_PATH");
+        }
+        // A valid janus.toml with no [gating] table → default (empty), no error.
+        let toml_str = "[assets]\nenabled = [\"BTC\"]\n";
+        let path = std::env::temp_dir().join(format!(
+            "janus_gating_nosection_{}_{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, toml_str).expect("write temp config");
+        let config = load_gating_config(path.to_str().unwrap());
+        let _ = std::fs::remove_file(&path);
+        assert!(config.assets.is_empty());
     }
 }
