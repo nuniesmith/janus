@@ -36,6 +36,7 @@
 //! └─────────────────────────────────────────────────────────────┘
 //! ```
 
+pub mod account_state;
 pub mod affinity_recorder;
 pub mod api;
 pub mod brain_runtime;
@@ -176,6 +177,11 @@ pub struct ForwardServiceConfig {
     /// Execution client configuration (None = signals generated but not executed)
     pub execution_config: Option<ExecutionClientConfig>,
 
+    /// Optional Bybit private user-data feed (None = disabled). When set, a
+    /// background reconciler folds fills/positions/balances into a live account
+    /// model. Read-only — it never initiates orders.
+    pub bybit_private_config: Option<account_state::BybitPrivateFeedConfig>,
+
     /// Enable metrics endpoint
     pub enable_metrics: bool,
 
@@ -195,6 +201,7 @@ impl Default for ForwardServiceConfig {
             websocket_config: websocket::WebSocketConfig::default(),
             data_service_config: None,
             execution_config: None,
+            bybit_private_config: None,
             enable_metrics: true,
             metrics_port: 9090,
         }
@@ -207,6 +214,8 @@ pub struct ForwardService {
     signal_generator: Arc<SignalGenerator>,
     risk_manager: Arc<RwLock<RiskManager>>,
     portfolio: Arc<RwLock<PortfolioState>>,
+    /// Live Bybit account state reconciled from the private feed (read-only).
+    live_account: Arc<RwLock<account_state::LiveAccount>>,
     #[allow(dead_code)]
     websocket_server: Option<Arc<WebSocketServer>>,
     /// Optional brain health state for wiring brain REST endpoints into the
@@ -237,11 +246,26 @@ impl ForwardService {
         let risk_manager = Arc::new(RwLock::new(RiskManager::new(config.risk_config.clone())));
         let portfolio = Arc::new(RwLock::new(PortfolioState::new(account_balance)));
 
+        // Optional Bybit private user-data feed → live account reconciler.
+        // Read-only: it never initiates orders (see `account_state` module docs).
+        let live_account = Arc::new(RwLock::new(account_state::LiveAccount::default()));
+        if let Some(pf) = config.bybit_private_config.clone() {
+            info!(
+                "📒 Bybit private user-data feed enabled (testnet={}) — reconciling fills/positions/balances (read-only, no order entry)",
+                pf.testnet
+            );
+            tokio::spawn(account_state::run_private_feed(
+                pf,
+                Arc::clone(&live_account),
+            ));
+        }
+
         Ok(Self {
             config,
             signal_generator,
             risk_manager,
             portfolio,
+            live_account,
             websocket_server: None,
             brain_health_state: None,
         })
@@ -298,6 +322,11 @@ impl ForwardService {
     /// Get portfolio state
     pub fn portfolio(&self) -> Arc<RwLock<PortfolioState>> {
         Arc::clone(&self.portfolio)
+    }
+
+    /// Get the live Bybit account state reconciled from the private feed.
+    pub fn live_account(&self) -> Arc<RwLock<account_state::LiveAccount>> {
+        Arc::clone(&self.live_account)
     }
 
     /// Get service configuration
@@ -580,7 +609,8 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
         websocket_config: websocket::WebSocketConfig::default(),
         data_service_config: None,
         execution_config,
-        enable_metrics: false, // Metrics handled by janus-api
+        bybit_private_config: None, // orchestrator path: standalone binary opts in via env
+        enable_metrics: false,      // Metrics handled by janus-api
         metrics_port: 0,
     };
 

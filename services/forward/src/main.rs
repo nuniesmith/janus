@@ -20,6 +20,7 @@
 //! 6. Wait for shutdown signal
 
 use anyhow::Result;
+use janus_forward::account_state::BybitPrivateFeedConfig;
 use janus_forward::brain_runtime::{PreflightRuntimeConfig, RuntimeState, WatchdogRuntimeConfig};
 use janus_forward::{
     AffinityRedisConfig, AffinityRedisStore, BrainGatedConfig, BrainGatedExecutionClient,
@@ -613,6 +614,39 @@ fn load_config() -> Result<ForwardServiceConfig> {
         None
     };
 
+    // Optional Bybit private user-data feed (read-only account reconciler).
+    let bybit_private_config = if std::env::var("ENABLE_BYBIT_PRIVATE_FEED")
+        .unwrap_or_else(|_| "false".to_string())
+        .parse::<bool>()
+        .unwrap_or(false)
+    {
+        match (
+            read_bybit_secret("BYBIT_API_KEY"),
+            read_bybit_secret("BYBIT_API_SECRET"),
+        ) {
+            (Some(key), Some(secret)) => {
+                let testnet = std::env::var("BYBIT_TESTNET")
+                    .unwrap_or_else(|_| "true".to_string())
+                    .parse()
+                    .unwrap_or(true);
+                info!("Bybit private user-data feed enabled (testnet={testnet})");
+                Some(BybitPrivateFeedConfig {
+                    key,
+                    secret,
+                    testnet,
+                })
+            }
+            _ => {
+                warn!(
+                    "ENABLE_BYBIT_PRIVATE_FEED=true but BYBIT_API_KEY/BYBIT_API_SECRET not set — private feed disabled"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let config = ForwardServiceConfig {
         host: std::env::var("FORWARD_HOST").unwrap_or_else(|_| "0.0.0.0".to_string()),
         grpc_port: std::env::var("FORWARD_GRPC_PORT")
@@ -632,10 +666,23 @@ fn load_config() -> Result<ForwardServiceConfig> {
             .parse()
             .unwrap_or(true),
         execution_config,
+        bybit_private_config,
         ..Default::default()
     };
 
     Ok(config)
+}
+
+/// Read a secret from `<NAME>_FILE` (Docker secret) first, then the `<NAME>`
+/// env var. Mirrors the data service's `read_secret` pattern; never logs values.
+fn read_bybit_secret(name: &str) -> Option<String> {
+    if let Ok(path) = std::env::var(format!("{name}_FILE")) {
+        match std::fs::read_to_string(&path) {
+            Ok(contents) => return Some(contents.trim().to_string()),
+            Err(e) => warn!("Failed to read {name}_FILE ({path}): {e}"),
+        }
+    }
+    std::env::var(name).ok().filter(|s| !s.is_empty())
 }
 
 /// Load parameter hot-reload configuration from environment variables
