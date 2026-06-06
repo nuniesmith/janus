@@ -43,6 +43,7 @@ use axum::{
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_http::trace::TraceLayer;
@@ -54,6 +55,7 @@ pub struct RestServerState {
     signal_generator: Arc<RwLock<SignalGenerator>>,
     risk_api_state: Arc<RiskApiState>,
     brain_health_state: Option<Arc<BrainHealthState>>,
+    live_account: Option<Arc<RwLock<crate::account_state::LiveAccount>>>,
     start_time: std::time::Instant,
 }
 
@@ -69,6 +71,7 @@ impl RestServerState {
             signal_generator,
             risk_api_state,
             brain_health_state: None,
+            live_account: None,
             start_time: std::time::Instant::now(),
         }
     }
@@ -86,6 +89,7 @@ impl RestServerState {
             signal_generator,
             risk_api_state,
             brain_health_state: Some(brain_state),
+            live_account: None,
             start_time: std::time::Instant::now(),
         }
     }
@@ -93,6 +97,15 @@ impl RestServerState {
     /// Set the brain health state after construction.
     pub fn set_brain_health_state(&mut self, state: Arc<BrainHealthState>) {
         self.brain_health_state = Some(state);
+    }
+
+    /// Set the live Bybit account state after construction (mounts
+    /// `GET /api/v1/account`).
+    pub fn set_live_account(
+        &mut self,
+        live_account: Arc<RwLock<crate::account_state::LiveAccount>>,
+    ) {
+        self.live_account = Some(live_account);
     }
 }
 
@@ -143,6 +156,15 @@ impl RestServer {
         Self { port, host, state }
     }
 
+    /// Mount the live Bybit account endpoint (`GET /api/v1/account`). Call
+    /// before [`Self::start`].
+    pub fn set_live_account(
+        &mut self,
+        live_account: Arc<RwLock<crate::account_state::LiveAccount>>,
+    ) {
+        self.state.set_live_account(live_account);
+    }
+
     /// Build the combined router with all endpoints
     pub fn router(state: RestServerState) -> Router {
         // Create signal endpoints router
@@ -174,6 +196,15 @@ impl RestServer {
 
         if let Some(brain) = brain_router {
             app = app.merge(brain);
+        }
+
+        // Live Bybit account endpoint (read-only), when the private feed is wired.
+        if let Some(live_account) = state.live_account.clone() {
+            app = app.merge(
+                Router::new()
+                    .route("/api/v1/account", get(get_account_handler))
+                    .with_state(live_account),
+            );
         }
 
         app.layer(TraceLayer::new_for_http())
@@ -370,6 +401,108 @@ impl IntoResponse for ApiError {
 // ===== Handlers =====
 
 /// Health check endpoint
+/// Read-only snapshot of the live Bybit account (reconciled from the private feed).
+#[derive(Serialize)]
+struct LiveAccountDto {
+    positions: HashMap<String, LivePositionDto>,
+    open_orders: HashMap<String, OrderStateDto>,
+    balances: HashMap<String, BalanceDto>,
+    last_update_ms: i64,
+    fills_applied: u64,
+    net_unrealized_pnl: f64,
+}
+
+#[derive(Serialize)]
+struct LivePositionDto {
+    symbol: String,
+    qty: f64,
+    avg_entry: f64,
+    unrealized_pnl: f64,
+    realized_pnl: f64,
+}
+
+#[derive(Serialize)]
+struct OrderStateDto {
+    order_id: String,
+    symbol: String,
+    side: String,
+    price: f64,
+    qty: f64,
+    remaining: f64,
+    status: String,
+}
+
+#[derive(Serialize)]
+struct BalanceDto {
+    available: f64,
+    hold: f64,
+}
+
+impl From<&crate::account_state::LiveAccount> for LiveAccountDto {
+    fn from(a: &crate::account_state::LiveAccount) -> Self {
+        Self {
+            positions: a
+                .positions
+                .iter()
+                .map(|(k, p)| {
+                    (
+                        k.clone(),
+                        LivePositionDto {
+                            symbol: p.symbol.clone(),
+                            qty: p.qty,
+                            avg_entry: p.avg_entry,
+                            unrealized_pnl: p.unrealized_pnl,
+                            realized_pnl: p.realized_pnl,
+                        },
+                    )
+                })
+                .collect(),
+            open_orders: a
+                .open_orders
+                .iter()
+                .map(|(k, o)| {
+                    (
+                        k.clone(),
+                        OrderStateDto {
+                            order_id: o.order_id.clone(),
+                            symbol: o.symbol.clone(),
+                            side: o.side.clone(),
+                            price: o.price,
+                            qty: o.qty,
+                            remaining: o.remaining,
+                            status: o.status.clone(),
+                        },
+                    )
+                })
+                .collect(),
+            balances: a
+                .balances
+                .iter()
+                .map(|(k, b)| {
+                    (
+                        k.clone(),
+                        BalanceDto {
+                            available: b.available,
+                            hold: b.hold,
+                        },
+                    )
+                })
+                .collect(),
+            last_update_ms: a.last_update_ms,
+            fills_applied: a.fills_applied,
+            net_unrealized_pnl: a.net_unrealized_pnl(),
+        }
+    }
+}
+
+/// `GET /api/v1/account` — current live Bybit account snapshot (read-only).
+async fn get_account_handler(
+    State(live_account): State<Arc<RwLock<crate::account_state::LiveAccount>>>,
+) -> Json<LiveAccountDto> {
+    let acct = live_account.read().await;
+    Json(LiveAccountDto::from(&*acct))
+}
+
 async fn health_handler(State(state): State<RestServerState>) -> Json<HealthResponse> {
     let signal_gen = state.signal_generator.read().await;
     let _ = signal_gen.metrics(); // Touch metrics to ensure service is responsive

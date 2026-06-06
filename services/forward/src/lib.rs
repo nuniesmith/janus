@@ -353,7 +353,7 @@ impl ForwardService {
         )));
 
         // Start REST API server — include brain health endpoints when available
-        let rest_server = if let Some(ref brain_state) = self.brain_health_state {
+        let mut rest_server = if let Some(ref brain_state) = self.brain_health_state {
             info!("🧠 Mounting brain REST endpoints on REST server");
             api::server::RestServer::with_brain_health(
                 self.config.host.clone(),
@@ -390,6 +390,9 @@ impl ForwardService {
                 self.config.host, self.config.rest_port
             );
         }
+
+        // Surface the live Bybit account (read-only) on /api/v1/account.
+        rest_server.set_live_account(Arc::clone(&self.live_account));
 
         // Start REST server (this will block)
         info!("✅ Starting REST API server...");
