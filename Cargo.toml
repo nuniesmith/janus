@@ -252,10 +252,3 @@ panic = "abort"  # Prevent silent task disappearance in Tokio — panics termina
 [profile.dev]
 opt-level = 0
 debug = true
-
-# INTERIM: consume exchange-apiws 0.6.0 (private-WS connectors + the f64
-# OrderUpdate quantity fix) before it is published to crates.io. Pinned to the
-# 0.6.0 merge on `main`. REMOVE this patch once 0.6.0 is on crates.io — the
-# `exchange-apiws = "0.6"` requirements then resolve from the registry.
-[patch.crates-io]
-exchange-apiws = { git = "https://github.com/nuniesmith/exchange-apiws", rev = "daf30914bb288043f4bf8b0d9a5962700dbb384f" }
