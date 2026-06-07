@@ -1,16 +1,20 @@
-//! Mirrors the execution gate's in-memory block/eval counters to Redis so
-//! Grafana can chart them (Track C observability).
+//! Syncs the execution gate ↔ Redis: mirrors the gate's block/eval counters for
+//! Grafana **and** persists the consecutive-loss breaker state across restarts
+//! (Track C observability + durability).
 //!
-//! Best-effort + opt-in (`JANUS_GATE_METRICS_REDIS=1`): a periodic flush task,
-//! spawned at forward startup, snapshots the shared [`ForwardGate`]'s counters
-//! and writes them under keys wire-compatible with the Python gate's scheme:
+//! Best-effort + opt-in (`JANUS_GATE_METRICS_REDIS=1`): a periodic task, spawned
+//! at forward startup, snapshots the shared [`ForwardGate`] and writes, under
+//! keys wire-compatible with the Python gate's scheme:
 //!
 //! - `{prefix}gate_evals:{asset}`            — total evaluations
 //! - `{prefix}gate_blocks:{asset}:{reason}`  — per-reason block count
+//! - `{prefix}gate_breaker_state`            — JSON breaker snapshot (durability)
 //!
-//! The pure key/value mapping ([`redis_kv`]) is unit-tested; the Redis I/O is a
-//! thin wrapper that never blocks trading — if Redis is unreachable the exporter
-//! simply doesn't start (logged once), and per-SET errors are logged + skipped.
+//! On startup the task restores the persisted breaker state — a tripped breaker
+//! should survive a restart, not silently reset. The pure key/value mapping
+//! ([`redis_kv`]) is unit-tested; the Redis I/O is a thin wrapper that never
+//! blocks trading — if Redis is unreachable the task simply doesn't start
+//! (logged once), and per-SET errors are logged + skipped.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,7 +24,7 @@ use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
-use crate::gate_integration::{ForwardGate, GateMetricsSnapshot};
+use crate::gate_integration::{BreakerSnapshotEntry, ForwardGate, GateMetricsSnapshot};
 
 /// Default Redis key prefix.
 const DEFAULT_PREFIX: &str = "janus:";
@@ -128,19 +132,44 @@ pub async fn spawn(
         }
     };
 
+    let breaker_key = format!("{}gate_breaker_state", config.prefix);
+
+    // Restore persisted breaker state before the first flush — a tripped breaker
+    // should survive a restart, not silently reset.
+    if let Ok(Some(json)) = conn.get::<_, Option<String>>(&breaker_key).await
+        && let Ok(entries) = serde_json::from_str::<Vec<BreakerSnapshotEntry>>(&json)
+        && !entries.is_empty()
+    {
+        let n = entries.len();
+        gate.write().await.import_breaker(entries);
+        info!("gate → Redis: restored breaker state for {n} asset(s)");
+    }
+
     info!(
-        "✅ gate metrics → Redis exporter started (prefix={}, every {:?})",
+        "✅ gate → Redis sync started (prefix={}, every {:?})",
         config.prefix, config.interval
     );
 
     Some(tokio::spawn(async move {
         loop {
             tokio::time::sleep(config.interval).await;
-            let snapshot = gate.read().await.metrics_snapshot();
-            for (key, val) in redis_kv(&snapshot, &config.prefix) {
+            let (counters, breaker) = {
+                let g = gate.read().await;
+                (
+                    redis_kv(&g.metrics_snapshot(), &config.prefix),
+                    g.export_breaker(),
+                )
+            };
+            for (key, val) in counters {
                 let res: redis::RedisResult<()> = conn.set(&key, val).await;
                 if let Err(e) = res {
-                    warn!("gate metrics → Redis: SET {key} failed: {e}");
+                    warn!("gate → Redis: SET {key} failed: {e}");
+                }
+            }
+            if let Ok(json) = serde_json::to_string(&breaker) {
+                let res: redis::RedisResult<()> = conn.set(&breaker_key, json).await;
+                if let Err(e) = res {
+                    warn!("gate → Redis: persist breaker state failed: {e}");
                 }
             }
         }

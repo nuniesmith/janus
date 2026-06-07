@@ -63,7 +63,7 @@ pub mod gate;
 pub mod verdict;
 
 pub use adaptive_threshold::AdaptiveThreshold;
-pub use circuit_breaker::ConsecutiveLossBreaker;
+pub use circuit_breaker::{BreakerSnapshotEntry, ConsecutiveLossBreaker};
 pub use context::{CnnVote, GateContext, Side};
 pub use correlation::CorrelationGuard;
 pub use gate::{ExecutionGate, GateMetrics, GateMetricsSnapshot};
