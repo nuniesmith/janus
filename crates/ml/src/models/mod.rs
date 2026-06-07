@@ -34,9 +34,11 @@ pub mod master_cnn;
 pub mod mlp;
 pub mod per_asset_cnn;
 pub mod trainable;
+pub mod trainable_per_asset_cnn;
 
 // Re-export trainable models
 pub use trainable::{TrainableLstm, TrainableLstmConfig, TrainableMlp, TrainableMlpConfig};
+pub use trainable_per_asset_cnn::{CnnTrainer, TrainablePerAssetCnn, TrainablePerAssetCnnConfig};
 
 // Re-export inference models
 pub use lstm::{LstmConfig, LstmPredictor};
