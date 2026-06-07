@@ -287,7 +287,7 @@ mod tests {
             "valid classes only"
         );
         assert!(
-            labels.iter().any(|&l| l == LABEL_LONG),
+            labels.contains(&LABEL_LONG),
             "a consolidation→breakout→TP must yield a LONG label"
         );
         // counts sum to n
