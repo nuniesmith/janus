@@ -328,6 +328,7 @@ fn st3<B: Backend>(name: &str, t: &Tensor<B, 3>) -> SerializedTensor {
 pub struct CnnTrainer {
     model: TrainablePerAssetCnn<AutodiffCpuBackend>,
     optimizer: OptimizerAdaptor<Adam, TrainablePerAssetCnn<AutodiffCpuBackend>, AutodiffCpuBackend>,
+    config: TrainablePerAssetCnnConfig,
     lr: f64,
     class_weights: Option<Vec<f32>>,
 }
@@ -350,9 +351,15 @@ impl CnnTrainer {
         Self {
             model,
             optimizer,
+            config: config.clone(),
             lr,
             class_weights,
         }
+    }
+
+    /// Override the learning rate (for LR schedules).
+    pub fn set_lr(&mut self, lr: f64) {
+        self.lr = lr;
     }
 
     /// Run one optimisation step on a batch; returns the (weighted) CE loss.
@@ -386,12 +393,7 @@ impl CnnTrainer {
 
     /// Transfer the trained weights into a ready-to-serve inference model.
     pub fn to_inference(&self, window: usize) -> PerAssetCnn<crate::backend::CpuBackend> {
-        let cfg = TrainablePerAssetCnnConfig {
-            n_features: 20,
-            n_classes: 4,
-            embedding_dim: 64,
-        }
-        .inference(window);
+        let cfg = self.config.inference(window);
         let device = Default::default();
         let mut inf = PerAssetCnn::<crate::backend::CpuBackend>::new(cfg, &device);
         inf.apply_weights(&self.model.extract_weights(), &device);

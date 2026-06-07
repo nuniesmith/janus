@@ -63,6 +63,7 @@ pub mod labeler;
 pub mod models;
 pub mod optimizer;
 pub mod per_asset_dataset;
+pub mod train_per_asset;
 pub mod training;
 pub mod training_autodiff;
 

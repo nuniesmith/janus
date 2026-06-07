@@ -26,7 +26,8 @@
 //! (`book_imbalance`, `wave_ratio`, `vol_percentile`) are constant broadcasts
 //! of the live scalars, not the training-time random walks.
 
-const N_FEATURES: usize = 20;
+/// Number of feature channels.
+pub const N_FEATURES: usize = 20;
 /// Default candle window (time dimension of the output tensor).
 pub const DEFAULT_WINDOW: usize = 60;
 
@@ -542,6 +543,41 @@ fn compute_channels(
 /// Minimum bars required by [`extract_features`].
 pub fn min_rows(window: usize) -> usize {
     window + CONSOL_BARS.max(RSI_PERIOD).max(ATR_PERIOD) + 5
+}
+
+/// Compute all [`N_FEATURES`] channels over the WHOLE series → row-major
+/// `(N_FEATURES, n_bars)` (`channel * n_bars + bar`). The training counterpart
+/// of [`extract_features`] (which returns only the last window). Uses the
+/// inference-path channels (7–9 are the constant live-scalar broadcasts).
+/// Returns `None` if the input lengths disagree or there are fewer than
+/// `window` bars.
+pub fn precompute_features(
+    open: &[f32],
+    high: &[f32],
+    low: &[f32],
+    close: &[f32],
+    volume: &[f32],
+    state: &LiveState,
+    window: usize,
+) -> Option<Vec<f32>> {
+    let n = close.len();
+    if n < window
+        || [open.len(), high.len(), low.len(), volume.len()]
+            .iter()
+            .any(|&l| l != n)
+    {
+        return None;
+    }
+    let f64s = |a: &[f32]| a.iter().map(|&v| v as f64).collect::<Vec<_>>();
+    Some(compute_channels(
+        &f64s(open),
+        &f64s(high),
+        &f64s(low),
+        &f64s(close),
+        &f64s(volume),
+        state,
+        window,
+    ))
 }
 
 /// Extract the `(N_FEATURES, window)` feature tensor (row-major, `channel *
