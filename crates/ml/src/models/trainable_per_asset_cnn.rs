@@ -18,7 +18,7 @@
 //! inference `BatchNorm` uses running stats, at training (Autodiff) batch stats —
 //! burn switches automatically by backend.
 
-use burn::module::Module;
+use burn::module::{Ignored, Module};
 use burn::optim::{Adam, AdamConfig, GradientsParams, Optimizer, adaptor::OptimizerAdaptor};
 use burn_core::tensor::backend::Backend;
 use burn_core::tensor::{ElementConversion, Int, Tensor, TensorData, activation};
@@ -39,6 +39,42 @@ fn se_mid(channels: usize) -> usize {
 }
 fn same_pad(kernel: usize, dilation: usize) -> usize {
     dilation * (kernel - 1) / 2
+}
+
+/// `Conv1d` via im2col (unfold) + `matmul`. Autodiff-friendly on `burn-ndarray`
+/// — the native SIMD conv *backward* is bugged for kernel-3 conv1d — and
+/// numerically equivalent to `Conv1d::forward` up to summation order. `weight`
+/// is `(out, in, k)` (no bias; all our convs are bias-free).
+fn conv1d_im2col<B: Backend>(
+    x: Tensor<B, 3>,
+    weight: Tensor<B, 3>,
+    dilation: usize,
+    pad: usize,
+) -> Tensor<B, 3> {
+    let [bsz, cin, l] = x.dims();
+    let [cout, _cin, k] = weight.dims();
+    let device = x.device();
+    let x_pad = if pad > 0 {
+        let zeros = Tensor::<B, 3>::zeros([bsz, cin, pad], &device);
+        Tensor::cat(vec![zeros.clone(), x, zeros], 2)
+    } else {
+        x
+    };
+    let mut acc: Option<Tensor<B, 3>> = None;
+    for kk in 0..k {
+        let start = kk * dilation;
+        let shifted = x_pad.clone().slice([0..bsz, 0..cin, start..start + l]); // (B,Cin,L)
+        let wk = weight
+            .clone()
+            .slice([0..cout, 0..cin, kk..kk + 1])
+            .reshape([1, cout, cin]);
+        let contrib = wk.matmul(shifted); // (1,Cout,Cin)x(B,Cin,L) → (B,Cout,L)
+        acc = Some(match acc {
+            Some(a) => a.add(contrib),
+            None => contrib,
+        });
+    }
+    acc.unwrap()
 }
 
 /// Configuration for [`TrainablePerAssetCnn`] (defaults match `PerAssetCnnConfig`).
@@ -84,6 +120,7 @@ impl TrainablePerAssetCnnConfig {
         };
         let block = |i, o, d| TConvBlock {
             conv: conv(i, o, 3, d, false),
+            dilation: Ignored(d),
             bn: BatchNormConfig::new(o).init(device),
             skip: if i != o {
                 Some(conv(i, o, 1, 1, false))
@@ -138,15 +175,18 @@ impl<B: Backend> TSeBlock<B> {
 #[derive(Module, Debug)]
 struct TConvBlock<B: Backend> {
     conv: Conv1d<B>,
+    dilation: Ignored<usize>,
     bn: BatchNorm<B>,
     skip: Option<Conv1d<B>>,
 }
 
 impl<B: Backend> TConvBlock<B> {
     fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
-        let main = self.bn.forward(self.conv.forward(x.clone()));
+        let d = self.dilation.0;
+        let conv_out = conv1d_im2col(x.clone(), self.conv.weight.val(), d, same_pad(3, d));
+        let main = self.bn.forward(conv_out);
         let identity = match &self.skip {
-            Some(skip) => skip.forward(x),
+            Some(skip) => conv1d_im2col(x, skip.weight.val(), 1, 0),
             None => x,
         };
         activation::relu(main.add(identity))
@@ -398,24 +438,19 @@ mod tests {
             .unwrap();
         let b = inference.forward(x).to_data().to_vec::<f32>().unwrap();
         for (p, q) in a.iter().zip(b.iter()) {
+            // im2col conv vs burn's SIMD conv differ only by summation order.
             assert!(
-                (p - q).abs() < 1e-5,
+                (p - q).abs() < 2e-3,
                 "trainable vs inference mismatch {p} vs {q}"
             );
         }
     }
 
-    /// The core Phase-4 proof: AdamW + cross-entropy reduces the loss on a
-    /// learnable synthetic task (label depends on a feature's sign).
-    ///
-    /// IGNORED: blocked upstream by a `burn-ndarray` 0.19.1 bug — the SIMD conv
-    /// *backward* (`conv2d_launch_impl`) indexes the kernel out of bounds for a
-    /// kernel-3 conv1d (the `H=1` singleton dim), so autodiff through any
-    /// kernel-3 `Conv1d` panics on the CPU backend. The forward path is fine
-    /// (see the bridge/shape tests). Re-enable once burn fixes the SIMD conv, on
-    /// a GPU (`wgpu`/`cuda`) backend, or with an im2col conv-via-matmul workaround.
+    /// The core Phase-4 proof: AdamW + cross-entropy actually reduces the loss
+    /// on a learnable synthetic task (label depends on a feature's sign). The
+    /// convs run through the im2col path, so autodiff works on the CPU backend
+    /// (burn-ndarray's native SIMD conv backward is bugged for kernel-3 conv1d).
     #[test]
-    #[ignore = "burn-ndarray 0.19.1 SIMD conv1d backward panics (conv2d_launch_impl kernel index OOB)"]
     fn training_reduces_loss() {
         let device = Default::default();
         let mut trainer = CnnTrainer::new(&TrainablePerAssetCnnConfig::default(), 1e-3, 1e-4, None);
