@@ -102,23 +102,29 @@ leaving janus's native ingestion (exchange WS → QuestDB) as the only data path
       read. (`services/registry` + `crates/registry` exist — confirm scope.)
 - [ ] **Exit:** janus is the sole data writer; all Ruby data calls gone.
 
-### Track B — burn-native ML parity · RUST_MIGRATION Phase 2 + 4
-Scaffolding is built in `crates/ml` (PerAssetCnn, MasterCnn, 20-ch features,
-labeler, dataset, trainer, `train_champion`) but **gated off** and blocked on
-parity goldens. (Supersedes the P0 "run the probe" item.)
-- [ ] **Champion goldens — the one real blocker.** In a Python env, dump ~1,000
-      `(20×60 input → logits)` pairs + the `.pt` weights into
-      `crates/ml/tests/golden/` (recorders ready in `tools/parity/`). The
-      skip-if-absent parity tests then light up.
-- [ ] **Weight-transfer oracle** — lift `.pt` weights into the burn `PerAssetCnn`
-      (`crates/ml/src/models/convert.rs`) for a known-good baseline, then retrain.
-- [ ] **Training polish** — cosine LR, train/val split + best-val checkpoint,
-      temperature calibration, champion save/load + promotion (`.json` sidecar)
-      in `train_per_asset.rs`.
-- [ ] **Resolve the version-skewed CNN contract** (15/20/37 features, v8/v9/v10)
-      to ground truth from the model `.json` sidecars.
-- [ ] **Flip the gate** only once parity holds: `ENABLE_CNN_INFERENCE` →
-      `ENABLE_BRAIN_RUNTIME`, on a shadow basis.
+### Track B — burn-native ML, no PyTorch champions · RUST_MIGRATION Phase 2 + 4
+**Reframed (2026-06-07): there are no `.pt` champion weights**, so there's
+nothing to PyTorch→burn parity against — that framing (goldens / weight-transfer
+oracle) is dropped. janus already does the right thing without champions: CNN
+inference is **off by default** (`ENABLE_CNN_INFERENCE`), and even when enabled a
+missing/bad checkpoint just logs a warning and disables — falling back to the
+rule-based 9-gate chain (`services/forward/src/cnn_inference.rs:105`). So no
+models are required to run. The burn scaffolding in `crates/ml` (PerAssetCnn,
+MasterCnn, 20-ch features, labeler, dataset, trainer, `train_champion`) is the
+path to *create* champions from scratch later.
+- [x] **Sane defaults / graceful-disable verified.** No champion ⇒ CNN inactive
+      ⇒ rule-based path; `CnnConfig::default()` is off-by-default. "Run without
+      weights" already works — nothing to do.
+- [ ] **Resolve the CNN feature contract** — the Ruby `models/` README says 15
+      features / 3 classes / window 60; janus's pipeline is 20-channel. Pick the
+      ground-truth shape for `crates/ml` before training from scratch.
+- [ ] **Train champions from scratch in burn** (when data + GPU available):
+      `train_champion(ohlcv)` → features → labels → train → save the `.bin` +
+      `.json` sidecar. Then cosine LR / train-val split / temperature calibration
+      as training polish.
+- [ ] **Flip the gate** only once a trained model shows edge on a shadow basis:
+      `ENABLE_CNN_INFERENCE` → `ENABLE_BRAIN_RUNTIME`. The CNN-agreement /
+      -confidence gates already consume the vote (Track C).
 
 ### Track C — Safety: execution gate + risk · RUST_MIGRATION Phase 3 · ◀ all 9 gates live (advisory)
 - [x] **Port the 9-gate `ExecutionGate`** → `crates/execution-gate` (faithful
@@ -174,6 +180,16 @@ parity goldens. (Supersedes the P0 "run the probe" item.)
 - [ ] **Dedupe the correlation guard** — the gate's parity-faithful
       `CorrelationGuard` (log-returns, 0.7/50/3) vs `jflow-risk`'s
       `CorrelationTracker` (prices, 0.75/100/3). Pick one once the gate is wired.
+- [ ] **Enforcement flip (runbook).** The gate is **advisory by default** — it
+      stamps `gate` metadata on every signal but never blocks. To enforce, set
+      `JANUS_GATE_ENFORCE=1`: a blocking verdict then joins the prop-firm/risk
+      `block_reason` chain and suppresses the execution *submit* only (the signal
+      still publishes to the bus — no-autonomous-execution preserved). Procedure:
+      (1) run advisory for N days, watch the `gate` metadata + block reasons;
+      (2) confirm the block mix looks right (esp. that warmup-empty producers
+      aren't over-blocking); (3) flip `JANUS_GATE_ENFORCE=1`. Related tunables:
+      `JANUS_GATE_TP_ATR_MULT` (fee-viability TP target), `ENABLE_CNN_INFERENCE`
+      (CNN gates), `JANUS_PROP_FIRM_ENFORCE` / `JANUS_RISK_ENFORCE` (sibling gates).
 - [ ] **Exit:** order flow gated entirely in Rust; the human-confirmation
       invariant (`EXECUTION_MODE=paper_trading` default) preserved throughout.
 
