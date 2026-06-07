@@ -8,24 +8,25 @@
 //! # Staged wiring
 //!
 //! This mirrors how prop-firm / risk enforcement landed (advisory first, then
-//! enforce behind a flag). **Stage 1** (this module) puts the gate on the live
-//! path in *advisory* mode and feeds it the inputs already available at the
-//! signal-emission point — the `RiskManager` verdict and the confidence
-//! threshold. The remaining gate inputs are fed as follow-ups (janus `TODO.md`,
-//! Track C):
+//! enforce behind a flag). The gate is on the live path in *advisory* mode (set
+//! `JANUS_GATE_ENFORCE=1` to let a block suppress the execution submit). Inputs
+//! are fed incrementally:
 //!
-//! - the CNN vote (currently folded into the strategy consensus),
-//! - realised-vol / quality / AO / fee producer values,
-//! - per-tick correlation log-returns + open-position symbols,
-//! - closed-trade outcomes that drive the consecutive-loss breaker.
+//! - **Live now:** the `RiskManager` verdict (`risk`); the CNN vote
+//!   (`cnn_agreement` + `cnn_confidence`, active only when `ENABLE_CNN_INFERENCE`);
+//!   and open positions + per-tick log-returns (`correlation`).
+//! - **Follow-ups (janus `TODO.md`, Track C):** realised-vol / quality / AO / fee
+//!   producer values, and closed-trade outcomes for the consecutive-loss breaker.
 //!
-//! Until those land, the corresponding gates are **inert pass-throughs** — the
-//! context builder picks values that clear them, so the gate never emits a
-//! spurious block. The only gate that can act in Stage 1 is `risk`.
+//! Gates without a real input yet are **inert pass-throughs** — `build_context`
+//! picks values that clear them, so the gate never emits a spurious block.
 
 use std::env;
 
-pub use janus_execution_gate::{CnnVote, ExecutionGate, GateContext, GateVerdict, Side};
+pub use janus_execution_gate::{
+    CnnVote, ConsecutiveLossBreaker, CorrelationGuard, ExecutionGate, GateContext, GateVerdict,
+    Side,
+};
 
 fn env_flag(name: &str) -> bool {
     env::var(name)
@@ -50,20 +51,32 @@ pub struct GateOutcome {
 }
 
 /// Live-loop wrapper around the execution gate.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ForwardGate {
     gate: ExecutionGate,
     enforce: bool,
+}
+
+impl Default for ForwardGate {
+    fn default() -> Self {
+        Self::new(false)
+    }
 }
 
 impl ForwardGate {
     /// Construct with an explicit enforcement flag (used by tests / callers that
     /// already resolved config).
     pub fn new(enforce: bool) -> Self {
-        Self {
-            gate: ExecutionGate::default(),
-            enforce,
-        }
+        // Enable the correlation guard so the correlation gate goes live once the
+        // loop feeds it returns + open positions. The consecutive-loss breaker is
+        // present by default; it stays closed until `record_trade_outcome` is fed
+        // from the position-close path (a follow-up).
+        let gate = ExecutionGate::new(
+            ConsecutiveLossBreaker::default(),
+            Some(CorrelationGuard::default()),
+            None,
+        );
+        Self { gate, enforce }
     }
 
     /// Build from the environment. `JANUS_GATE_ENFORCE=1` makes a blocking
@@ -239,6 +252,26 @@ mod tests {
             g.evaluate_entry("eth", Side::Sell, false, &sell, NOW)
                 .verdict,
             GateVerdict::Pass
+        );
+    }
+
+    #[test]
+    fn correlation_gate_blocks_a_correlated_cluster() {
+        // The guard is enabled by `new`; feed an identical up-trend to four
+        // assets so they are perfectly correlated, then enter `btc` with three
+        // correlated positions already open (default max_correlated = 3).
+        let mut g = ForwardGate::new(false);
+        let series: Vec<f64> = (0..20).map(|i| (i as f64) * 0.001).collect();
+        for v in &series {
+            for a in ["btc", "eth", "sol", "ada"] {
+                g.update_correlation(a, *v);
+            }
+        }
+        let open = vec!["eth".to_string(), "sol".to_string(), "ada".to_string()];
+        let ctx = ForwardGate::build_context(Side::Buy, "ok", 0.6, None, open);
+        assert_eq!(
+            g.evaluate_entry("btc", Side::Buy, false, &ctx, NOW).verdict,
+            GateVerdict::BlockCorrelation
         );
     }
 }
