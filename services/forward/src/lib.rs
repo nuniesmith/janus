@@ -1317,6 +1317,14 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
             // natural "open"; see the strategies' own session docs).
             let mut session_day: HashMap<String, chrono::NaiveDate> = HashMap::new();
 
+            // Optional gated CNN signal source (ENABLE_CNN_INFERENCE; off by
+            // default). Maintains a per-symbol rolling OHLCV buffer feeding
+            // PerAssetCnn. When disabled, none of this runs and the rule-based
+            // consensus below is unchanged.
+            let cnn = crate::cnn_inference::CnnInference::from_env();
+            let mut cnn_buffers: HashMap<String, crate::cnn_inference::CandleBuffer> =
+                HashMap::new();
+
             // Live market-regime detector (Track 3). Task-owned, so it needs no
             // lock; it's fed each closed candle below and its per-symbol regime is
             // emitted into every signal's metadata, closing the producer gap that
@@ -1490,6 +1498,23 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                                 // indicator analysis and produce a consensus.
 
                                 let mut strategy_votes: Vec<(janus_core::SignalType, f64, String)> = Vec::new();
+
+                                // Optional gated CNN vote — only when
+                                // ENABLE_CNN_INFERENCE is set and a champion loaded.
+                                // Disabled by default; never perturbs the rule path.
+                                if cnn.is_active() {
+                                    let open = kline.open.to_f64().unwrap_or(0.0) as f32;
+                                    let volume = kline.volume.to_f64().unwrap_or(0.0) as f32;
+                                    let buf =
+                                        cnn_buffers.entry(analyzer_key.clone()).or_default();
+                                    buf.push(open, high as f32, low as f32, close as f32, volume);
+                                    if let Some(vote) = cnn.consensus_vote(
+                                        buf,
+                                        janus_ml::features::per_asset_cnn::LiveState::default(),
+                                    ) {
+                                        strategy_votes.push(vote);
+                                    }
+                                }
 
                                 // 1. EMA Flip strategy (ported from the event_loop suite —
                                 //    proper crossover detection with per-symbol state,

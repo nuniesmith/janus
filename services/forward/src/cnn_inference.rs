@@ -164,6 +164,98 @@ impl CnnInference {
         };
         Some((signal, confidence))
     }
+
+    /// Convenience for the strategy-consensus loop: turn a per-symbol
+    /// [`CandleBuffer`] into a ready-to-push consensus vote tuple
+    /// `(janus_core::SignalType, weight, source)`. Returns `None` when CNN
+    /// inference is inactive, there are too few bars, or the signal is
+    /// non-actionable / low-confidence — so the rule path is untouched.
+    pub fn consensus_vote(
+        &self,
+        buffer: &CandleBuffer,
+        state: LiveState,
+    ) -> Option<(janus_core::SignalType, f64, String)> {
+        let (signal, confidence) = self.vote(
+            &buffer.open,
+            &buffer.high,
+            &buffer.low,
+            &buffer.close,
+            &buffer.volume,
+            state,
+        )?;
+        let core = match signal {
+            SignalType::Buy => janus_core::SignalType::Buy,
+            SignalType::Sell => janus_core::SignalType::Sell,
+            _ => return None,
+        };
+        Some((core, confidence, "per_asset_cnn".to_string()))
+    }
+}
+
+/// Per-symbol rolling OHLCV buffer feeding [`CnnInference::consensus_vote`].
+///
+/// Accumulates the most recent `cap` closed candles (FIFO eviction). The live
+/// loop keeps one per symbol+interval and pushes each closed kline; once enough
+/// bars are present, `extract_features` produces the `(20, window)` window.
+#[derive(Debug, Clone)]
+pub struct CandleBuffer {
+    cap: usize,
+    open: Vec<f32>,
+    high: Vec<f32>,
+    low: Vec<f32>,
+    close: Vec<f32>,
+    volume: Vec<f32>,
+}
+
+impl CandleBuffer {
+    /// Buffer sized with headroom for an `extract_features(window)` call.
+    pub fn for_window(window: usize) -> Self {
+        Self::with_capacity(feat::min_rows(window) + 64)
+    }
+
+    /// Buffer holding at most `cap` candles.
+    pub fn with_capacity(cap: usize) -> Self {
+        Self {
+            cap: cap.max(1),
+            open: Vec::new(),
+            high: Vec::new(),
+            low: Vec::new(),
+            close: Vec::new(),
+            volume: Vec::new(),
+        }
+    }
+
+    /// Append one closed candle, evicting the oldest beyond `cap`.
+    pub fn push(&mut self, open: f32, high: f32, low: f32, close: f32, volume: f32) {
+        for (series, value) in [
+            (&mut self.open, open),
+            (&mut self.high, high),
+            (&mut self.low, low),
+            (&mut self.close, close),
+            (&mut self.volume, volume),
+        ] {
+            series.push(value);
+            if series.len() > self.cap {
+                series.remove(0);
+            }
+        }
+    }
+
+    /// Number of buffered candles.
+    pub fn len(&self) -> usize {
+        self.close.len()
+    }
+
+    /// Whether the buffer is empty.
+    pub fn is_empty(&self) -> bool {
+        self.close.is_empty()
+    }
+}
+
+impl Default for CandleBuffer {
+    fn default() -> Self {
+        Self::for_window(feat::DEFAULT_WINDOW)
+    }
 }
 
 #[cfg(test)]
@@ -193,6 +285,46 @@ mod tests {
                 ..CnnConfig::default()
             },
             model: Some(model),
+        }
+    }
+
+    #[test]
+    fn candle_buffer_respects_capacity() {
+        let mut buf = CandleBuffer::with_capacity(3);
+        for i in 0..5 {
+            let f = i as f32;
+            buf.push(f, f, f, f, f);
+        }
+        assert_eq!(buf.len(), 3);
+        assert_eq!(buf.close, vec![2.0, 3.0, 4.0]); // oldest evicted, FIFO
+    }
+
+    #[test]
+    fn consensus_vote_disabled_is_none() {
+        let cnn = CnnInference::new(CnnConfig::default());
+        let mut buf = CandleBuffer::for_window(60);
+        let (o, h, l, c, v) = synth(140);
+        for i in 0..o.len() {
+            buf.push(o[i], h[i], l[i], c[i], v[i]);
+        }
+        assert!(cnn.consensus_vote(&buf, LiveState::default()).is_none());
+    }
+
+    #[test]
+    fn consensus_vote_active_returns_tagged_tuple() {
+        let cnn = active(0.0);
+        let mut buf = CandleBuffer::for_window(60);
+        let (o, h, l, c, v) = synth(140);
+        for i in 0..o.len() {
+            buf.push(o[i], h[i], l[i], c[i], v[i]);
+        }
+        if let Some((sig, conf, src)) = cnn.consensus_vote(&buf, LiveState::default()) {
+            assert_eq!(src, "per_asset_cnn");
+            assert!((0.0..=1.0).contains(&conf));
+            assert!(matches!(
+                sig,
+                janus_core::SignalType::Buy | janus_core::SignalType::Sell
+            ));
         }
     }
 
