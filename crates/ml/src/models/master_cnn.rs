@@ -34,9 +34,12 @@ use burn_nn::{LayerNorm, LayerNormConfig, Linear, LinearConfig};
 use serde::{Deserialize, Serialize};
 
 use super::per_asset_cnn::{
-    AssetEncoder, reference_encoder, set_linear_b, set_linear_w, set_param1, st1, st2,
+    AssetEncoder, load_record, reference_encoder, save_record, set_linear_b, set_linear_w,
+    set_param1, st1, st2,
 };
 use super::{SerializedTensor, WeightMap};
+use crate::error::Result;
+use std::path::Path;
 
 /// LayerNorm / numerical epsilon (matches PyTorch / burn default).
 const LN_EPS: f32 = 1e-5;
@@ -308,6 +311,29 @@ impl<B: Backend> MasterCnn<B> {
             );
         }
     }
+
+    /// Persist config + weights to `path` (postcard `ModelRecord`), loadable by
+    /// the forward service the same way as `PerAssetCnn` / `LstmPredictor`.
+    pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+        save_record(
+            path.as_ref(),
+            &self.config,
+            &self.extract_weights(),
+            "master_cnn",
+            self.config.n_features,
+            1,
+        )
+    }
+
+    /// Load a model persisted by [`save`](Self::save).
+    pub fn load<P: AsRef<Path>>(path: P, device: &B::Device) -> Result<Self> {
+        let (config, weights) = load_record::<MasterCnnConfig>(path.as_ref())?;
+        let mut model = Self::new(config, device);
+        if !weights.is_empty() {
+            model.apply_weights(&weights, device);
+        }
+        Ok(model)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -493,6 +519,36 @@ mod tests {
         (0..b * a * nf * w)
             .map(|i| ((i * 2_654_435_761usize % 1009) as f32 / 1009.0) - 0.5)
             .collect()
+    }
+
+    #[test]
+    fn save_load_roundtrip() {
+        let device = Default::default();
+        let cfg = MasterCnnConfig::default();
+        let model = MasterCnn::<CpuBackend>::new(cfg.clone(), &device);
+        let input = Tensor::<CpuBackend, 4>::from_data(
+            TensorData::new(
+                make_input(2, cfg.n_assets, cfg.n_features, cfg.window),
+                [2, cfg.n_assets, cfg.n_features, cfg.window],
+            ),
+            &device,
+        );
+        let before = model
+            .forward(input.clone())
+            .to_data()
+            .to_vec::<f32>()
+            .unwrap();
+
+        let path = std::env::temp_dir().join("master_cnn_roundtrip.bin");
+        model.save(&path).unwrap();
+        let loaded = MasterCnn::<CpuBackend>::load(&path, &device).unwrap();
+        let after = loaded.forward(input).to_data().to_vec::<f32>().unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(loaded.config(), model.config());
+        for (a, b) in before.iter().zip(after.iter()) {
+            assert!((a - b).abs() < 1e-6, "save/load mismatch {a} vs {b}");
+        }
     }
 
     #[test]
