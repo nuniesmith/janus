@@ -135,10 +135,14 @@ parity goldens. (Supersedes the P0 "run the probe" item.)
       `VolatilityPercentile` over engine ATR), and a **`quality`** proxy
       (momentum + wave-ratio percentile blend, 0–100). Producers stay `None`
       (gates inert) until the engine warms (~100 bars), so no spurious blocks.
-- [ ] **Producer plumbing — Stage 2c (fee/TP gate)** — the last entry gate. Not
-      an indicator: feed a config-driven taker fee + slippage and the strategy's
-      `tp_pct` (exchange-apiws exposes only funding rates, not a trading-fee
-      schedule). Until then the fee gate is a viable-TP pass-through.
+- [x] **Producer plumbing — Stage 2c (fee/TP gate) done.** `GateProducers`
+      derives a `tp_pct` (`tp_atr_mult × ATR / close`, default 4.0 ≈ 2R on a
+      2×ATR stop, override `JANUS_GATE_TP_ATR_MULT`) and feeds it to the
+      fee-viability gate, which measures the round-trip taker + slippage fees
+      (GateContext defaults) against it. **All 8 entry gates now act on real
+      data** — only the consecutive-loss breaker (close-driven) remains. (Wiring
+      a config-driven taker/slippage schedule to replace the GateContext fee
+      defaults is a minor follow-up.)
 - [ ] **Quality refinement (optional)** — replace the momentum/wave quality
       proxy with `indicators-ta`'s `compute_signal` confluence/`bull_score` once
       the `LiquidityProfile` + `ConfluenceEngine` inputs are assembled per bar.
