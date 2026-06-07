@@ -1,0 +1,16 @@
+[package]
+name = "jflow-execution-gate"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Execution gate chain — centralized trade-entry filtering for the JANUS trading engine (Rust port of Ruby's services/execution_gate.py)."
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+
+[lib]
+name = "janus_execution_gate"
+path = "src/lib.rs"
