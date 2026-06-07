@@ -6067,6 +6067,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "jflow-execution-gate"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "jflow-gap-detection"
 version = "0.1.0"
 dependencies = [

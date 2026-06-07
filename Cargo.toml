@@ -27,6 +27,7 @@ members = [
     # the published `indicators-ta` crate (see [workspace.dependencies]).
     "crates/strategies",
     "crates/risk",
+    "crates/execution-gate",
     "crates/models",
     "crates/questdb-writer",
     "crates/compliance",
@@ -106,6 +107,7 @@ janus-gap-detection = { path = "crates/gap-detection", package = "jflow-gap-dete
 janus-indicators = { package = "indicators-ta", version = "0.1.5" }
 janus-strategies = { path = "crates/strategies", package = "jflow-strategies", version = "0.1.0" }
 janus-risk = { path = "crates/risk", package = "jflow-risk", version = "0.1.0" }
+janus-execution-gate = { path = "crates/execution-gate", package = "jflow-execution-gate", version = "0.1.0" }
 janus-models = { path = "crates/models", package = "jflow-models", version = "0.1.0" }
 janus-questdb-writer = { path = "crates/questdb-writer", package = "jflow-questdb-writer", version = "0.1.0" }
 janus-compliance = { path = "crates/compliance", package = "jflow-compliance", version = "0.1.0" }

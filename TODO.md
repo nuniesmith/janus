@@ -5,7 +5,14 @@
 > The workspace is standalone — its own `Dockerfile` + `docker-compose.yml`
 > live here. Unrelated rustcode / claw / RC-CRATES items are **not** tracked
 > here (see "Out of scope" below).
-> **Last synced:** 2026-05-31
+> **Last synced:** 2026-06-07
+>
+> ⭐ **2026-06-07 — janus is now the platform.** `src/ruby/` was deleted from
+> `fks-full`; the Python data/engine/trainer service is gone. janus no longer
+> *suggests to* Ruby — it **is** the trading platform fks-full runs. The forward
+> roadmap is therefore the **Ruby→Rust migration** (see *"The migration is the
+> roadmap now"* right after the status snapshot, and
+> `fks-full/docs/architecture/RUST_MIGRATION.md`).
 >
 > 📋 **Consolidation plan:** [`CONSOLIDATION_PLAN.md`](CONSOLIDATION_PLAN.md) —
 > staged plan to consume `indicators-ta` (TA) + `exchange-apiws` (exchanges)
@@ -14,23 +21,141 @@
 
 ---
 
-## Status snapshot (2026-05-31)
+## Status snapshot (2026-06-07)
 
+- **Platform shift (2026-06-07):** `src/ruby/` was deleted from fks-full —
+  **janus is the platform now**, not just the brain. The remaining roadmap is
+  the **Ruby→Rust migration**: rebuild the capabilities fks-full used to get
+  from the Python service as janus crates/services. See *"The migration is the
+  roadmap now"* below and `fks-full/docs/architecture/RUST_MIGRATION.md`.
 - **Build:** `cargo check --workspace --all-targets` is green in CI (needs
-  `protobuf-compiler` on the runner for the `fks-proto` build script).
-- **CI/CD:** PR checks (`ci.yml`: check + `--lib` tests + Docker build) and
+  `protobuf-compiler` on the runner for the `fks-proto` build script). The new
+  `crates/execution-gate` is dependency-light and builds/tests standalone
+  (`cargo test -p jflow-execution-gate`).
+- **CI/CD:** PR checks (`ci.yml`: fmt + check + `--lib` tests + Docker build) and
   Docker Hub publish on merge to `main` (`docker-publish.yml`) are both live.
-- **Signal flow:** JFLOW-A/B/C/D have all landed on the Janus side (PRs #1–#23).
-  Position guidance now blends regime + per-asset optimizer thresholds +
-  volatility (ATR) + amygdala fear. Remaining JFLOW work is producer-side
-  (fks repo) or the cross-module `ParamManager` dedupe.
-- **Size:** ~50 workspace crates, ~583K LOC (≈250K of it neuromorphic),
-  9,888+ tests. ~312 `#[allow(dead_code)]` annotations remain (see P0).
+- **Execution gate (NEW, 2026-06-07):** Ruby's 9-gate `ExecutionGate` ported to
+  `crates/execution-gate` — a faithful, pure/synchronous chain (circuit-breaker
+  → risk → vol → quality → AO → fee → CNN-agree → CNN-conf → correlation) plus
+  the `ConsecutiveLossBreaker`, `CorrelationGuard`, and `AdaptiveThreshold` it
+  needs. 36 unit tests + doctest, clippy-clean. **Not yet wired** into the live
+  loop — see Track C below.
+- **Signal flow:** JFLOW-A/B/C/D landed on the Janus side. Position guidance
+  blends regime + per-asset optimizer thresholds + ATR volatility + amygdala
+  fear. NB: the "producer-side" JFLOW work the old notes pushed to "the fks
+  repo" is **now janus's own job** — janus is the producer.
+- **Size:** ~51 workspace crates, ~583K LOC (≈250K of it neuromorphic),
+  9,900+ tests. ~312 `#[allow(dead_code)]` annotations remain (see P0).
 
 > **Heads-up:** `services/data/docs/TODO_IMPLEMENTATION_PLAN.md` is a stale
 > 2024 doc that reports ~everything as 0% done. It is **wrong** — circuit
 > breaker, backfill lock/throttle, dedup, Prometheus export, and Docker
 > secrets all exist today. Reconcile or retire it (P0 item below).
+
+---
+
+## ⭐ The Ruby→Rust migration is the roadmap now (2026-06-07)
+
+`src/ruby/` is gone from fks-full; janus must stand alone as the platform. This
+section is the **forward plan** — the capabilities to rebuild natively, in
+dependency order, each shippable behind a flag so the running service never
+degrades. It's the janus-side companion to
+`fks-full/docs/architecture/RUST_MIGRATION.md` (phase rationale + parity
+strategy). Method throughout: **strangler-fig + golden-vector parity**, never
+rewrite-and-pray.
+
+**Sequencing (highest leverage first):**
+
+```
+Track A (data SoT) ───┐
+Track C (safety/gate) ─┼─► together they unblock a janus-only live path
+Track B (ML parity) ──┘    (Track B gated on the user's .pt goldens)
+Track D (infra contract) ── coordinates with fks-full's nginx/WebUI repoint
+Track E (long tail) ──────── rebuild-if-needed; Rithmic stays Python
+```
+
+### Track A — Data layer: make janus the sole source of truth · RUST_MIGRATION Phase 1
+The #1-leverage, lowest-ML-risk cut. Two data paths still exist: janus ingests
+natively **and** still calls Ruby via
+`services/data/src/backfill/python_data_client.rs`.
+- [ ] **Port the data factory** (gap-scan → backfill → reconcile) fully into
+      `services/data`. Pieces exist (`crates/gap-detection` is a stub,
+      `crates/data-quality` is rich, `services/data/src/backfill/`); the Ruby
+      reference is `ruby/src/data/{gap_scanner,backfill_manager,dataset_generator}.py`.
+- [ ] **Retire `python_data_client.rs`** once janus is the only QuestDB/Postgres/
+      Redis writer — it's the clean cut-over seam, not permanent architecture.
+- [ ] **Asset registry in janus** (subsumes JFLOW-B's env-only list + the old
+      "pull from Ruby's registry" follow-ups): port
+      `ruby/src/services/asset_registry.py` → a registry the optimizer + forward
+      read. (`services/registry` + `crates/registry` exist — confirm scope.)
+- [ ] **Exit:** janus is the sole data writer; `python_data_client.rs` deleted.
+
+### Track B — burn-native ML parity · RUST_MIGRATION Phase 2 + 4
+Scaffolding is built in `crates/ml` (PerAssetCnn, MasterCnn, 20-ch features,
+labeler, dataset, trainer, `train_champion`) but **gated off** and blocked on
+parity goldens. (Supersedes the P0 "run the probe" item.)
+- [ ] **Champion goldens — the one real blocker.** In a Python env, dump ~1,000
+      `(20×60 input → logits)` pairs + the `.pt` weights into
+      `crates/ml/tests/golden/` (recorders ready in `tools/parity/`). The
+      skip-if-absent parity tests then light up.
+- [ ] **Weight-transfer oracle** — lift `.pt` weights into the burn `PerAssetCnn`
+      (`crates/ml/src/models/convert.rs`) for a known-good baseline, then retrain.
+- [ ] **Training polish** — cosine LR, train/val split + best-val checkpoint,
+      temperature calibration, champion save/load + promotion (`.json` sidecar)
+      in `train_per_asset.rs`.
+- [ ] **Resolve the version-skewed CNN contract** (15/20/37 features, v8/v9/v10)
+      to ground truth from the model `.json` sidecars.
+- [ ] **Flip the gate** only once parity holds: `ENABLE_CNN_INFERENCE` →
+      `ENABLE_BRAIN_RUNTIME`, on a shadow basis.
+
+### Track C — Safety: execution gate + risk · RUST_MIGRATION Phase 3 · ◀ in progress
+- [x] **Port the 9-gate `ExecutionGate`** → `crates/execution-gate` (faithful
+      chain + `ConsecutiveLossBreaker` + `CorrelationGuard` + `AdaptiveThreshold`;
+      pure/synchronous core; 36 tests + doctest; clippy-clean). 2026-06-07.
+- [ ] **Wire into the live loop** (`services/forward/src/lib.rs`): build a
+      `GateContext` per prospective entry from the existing indicator/risk/CNN
+      state, call `ExecutionGate::evaluate`, surface the verdict as `gate` signal
+      metadata. **Advisory first**, then enforcing behind `JANUS_GATE_ENFORCE` —
+      mirror exactly how prop-firm/risk enforcement landed (#43/#44/#49).
+      Consolidates today's scattered prop-firm + risk + CNN + kill-switch checks
+      (~`lib.rs:1338–1937`) into one auditable chain.
+- [ ] **Producer plumbing** — feed the gate real `vol_pct`, `quality`, `ao`,
+      `tp_pct`/fees, and the `cnn_result` vote (`cnn_inference.rs` already returns
+      `(SignalType, conf)`); today those are scattered/absent.
+- [ ] **Close the loop** — call `ExecutionGate::record_trade_outcome` on close
+      events so the breaker + adaptive threshold actually engage (pairs with the
+      P1 "feed closed-trade outcomes" item below).
+- [ ] **Redis persistence adapter** — a thin layer mirroring the gate's in-memory
+      breaker/threshold state + block counters to Redis
+      (`gate_blocks:{asset}:{reason}`, `gate_evals:{asset}` — labels already
+      wire-compatible) for cross-restart durability + Grafana. Keep it OUT of the
+      gate crate.
+- [ ] **Dedupe the correlation guard** — the gate's parity-faithful
+      `CorrelationGuard` (log-returns, 0.7/50/3) vs `jflow-risk`'s
+      `CorrelationTracker` (prices, 0.75/100/3). Pick one once the gate is wired.
+- [ ] **Exit:** order flow gated entirely in Rust; the human-confirmation
+      invariant (`EXECUTION_MODE=paper_trading` default) preserved throughout.
+
+### Track D — Infra contract: serve what fks-full repoints to · RUST_MIGRATION §12-C
+fks-full's removal of Ruby left its WebUI + nginx pointing at `fks_ruby` (still
+74 refs in nginx, 9 in `vite.config.ts`, 10 `ruby_signal` refs in the WebUI).
+janus must serve the contract before fks-full can repoint cleanly — that's the
+janus half of the work.
+- [ ] **Serve the WebUI/data contract from `lib/janus-api`** — the routes the
+      SvelteKit dashboard + nginx call (`/api/bars` / `/bars/{symbol}`, asset
+      list, health, the signals/SSE feed). Either version janus's axum API to
+      cover them or agree a trimmed janus-native set.
+- [ ] **Document the public surface** (also a P2 doc item): `/api/v1/brain/*`,
+      `/api/v1/risk/evaluate`, `/api/v1/positions/event`, the session-metrics
+      contract, env-var reference.
+
+### Track E — Long tail: rebuild only what's needed · RUST_MIGRATION Phase 5
+- [ ] News/sentiment, on-chain — port from `ruby/src/data/{news,chain}` *only if
+      the demo needs them*; mostly I/O + glue.
+- [ ] **Rithmic stays Python** behind a thin gRPC/HTTP sidecar (proprietary
+      mTLS+gRPC; no Rust equivalent) — migrate last or never.
+- [ ] Multi-account routing, journal, dashboards — rebuild as janus crates if
+      required.
 
 ---
 
@@ -254,11 +379,19 @@ gaps are below.
 
 ## Out of scope for this repo
 
-Tracked in the [fks-full](https://github.com/nuniesmith/fks-full) repo:
+Cross-cutting / fks-full-owned items (tracked in
+[fks-full](https://github.com/nuniesmith/fks-full)):
 
 - `RC-CRATES-*` (rustcode workspace: runtime/api/tools/plugins/commands/server/claw-cli/compat-harness/lsp)
 - `API-*` (rustcode API security & config; rc-core/rc-api/rc-rag/rc-llm split)
 - `OSS-*` evaluation queue (OpenViking, Heretic, Nanochat)
-- **JanusAI Python service** endpoints (`POST /api/janus-ai/sessions/{id}/metrics`, memory compaction, optimizer search-space)
-- **Ruby execution engine** + asset registry (Janus only *suggests* — Ruby decides and executes)
-- Session-start config producer (writes `fks:janus:config` to Redis when a JanusAI session starts)
+- **fks-full infrastructure repoint** — nginx / WebUI / test scripts off
+  `fks_ruby` (RUST_MIGRATION §12-C). janus's half (serving the contract) is
+  **Track D** above.
+
+> **No longer out of scope (Ruby is gone, 2026-06-07):** the **execution engine
+> + asset registry** (janus no longer merely *suggests* — it's the platform; see
+> Tracks A + C), the **JanusAI session-metrics / memory compaction / optimizer
+> search-space**, and the **session-start config producer** (`fks:janus:config`)
+> are now janus's own responsibility or obsolete. Fold the live ones into the
+> tracks above as they surface.
