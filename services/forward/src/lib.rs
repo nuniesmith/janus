@@ -1391,6 +1391,9 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
             // Per-symbol previous close, for the close-to-close log returns fed to
             // the gate's correlation guard.
             let mut prev_close: HashMap<String, f64> = HashMap::new();
+            // Per-symbol indicators-ta signal engine feeding the gate's AO /
+            // volatility-percentile / quality producers (Track C Stage 2b).
+            let mut gate_producers = crate::gate_integration::GateProducers::new();
 
             let mut klines_processed: u64 = 0;
             let mut signals_generated: u64 = 0;
@@ -1509,6 +1512,20 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                                         .update_correlation(&symbol_str, (close / pc).ln());
                                 }
                                 prev_close.insert(symbol_str.clone(), close);
+
+                                // Feed the same candle to the gate's indicators-ta
+                                // signal engine (AO / volatility percentile / quality).
+                                gate_producers.on_candle(
+                                    &symbol_str,
+                                    crate::gate_integration::Bar {
+                                        time_ms: kline.open_time / 1_000,
+                                        open: kline.open.to_f64().unwrap_or(0.0),
+                                        high,
+                                        low,
+                                        close,
+                                        volume: kline.volume.to_f64().unwrap_or(0.0),
+                                    },
+                                );
 
                                 klines_processed += 1;
 
@@ -1941,13 +1958,16 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                                             let pf = portfolio.read().await;
                                             pf.positions.keys().cloned().collect()
                                         };
+                                        // AO / volatility percentile / quality from the engine.
+                                        let producers = gate_producers.snapshot(&symbol_str);
                                         let ctx =
-                                            crate::gate_integration::ForwardGate::build_context(
+                                            crate::gate_integration::ForwardGate::build_context_with_producers(
                                                 side,
                                                 &risk_check,
                                                 min_confidence,
                                                 cnn_gate_vote,
                                                 open_assets,
+                                                producers,
                                             );
                                         Some(forward_gate.evaluate_entry(
                                             &symbol_str,

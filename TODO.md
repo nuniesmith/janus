@@ -128,11 +128,20 @@ parity goldens. (Supersedes the P0 "run the probe" item.)
       position symbols from `PortfolioState`. With the guard enabled in
       `ForwardGate`, the `correlation` gate is live. (CNN gates stay inert until
       `ENABLE_CNN_INFERENCE`.)
-- [ ] **Producer plumbing — Stage 2b (remaining producers)** — feed real
-      `vol_pct`, `quality`, `ao` (no Awesome-Oscillator indicator exists yet —
-      build one), and `tp_pct`/fees so the vol / quality / AO / fee gates leave
-      pass-through. These need new producers in the analysis path, not just
-      threading.
+- [x] **Producer plumbing — Stage 2b (AO + vol + quality) done.** Rather than
+      hand-roll indicators, the loop runs the published `indicators-ta` signal
+      engine per symbol (`gate_integration::GateProducers`, fed each candle) and
+      feeds the gate **`ao`** (its Awesome Oscillator), **`vol_pct`** (a
+      `VolatilityPercentile` over engine ATR), and a **`quality`** proxy
+      (momentum + wave-ratio percentile blend, 0–100). Producers stay `None`
+      (gates inert) until the engine warms (~100 bars), so no spurious blocks.
+- [ ] **Producer plumbing — Stage 2c (fee/TP gate)** — the last entry gate. Not
+      an indicator: feed a config-driven taker fee + slippage and the strategy's
+      `tp_pct` (exchange-apiws exposes only funding rates, not a trading-fee
+      schedule). Until then the fee gate is a viable-TP pass-through.
+- [ ] **Quality refinement (optional)** — replace the momentum/wave quality
+      proxy with `indicators-ta`'s `compute_signal` confluence/`bull_score` once
+      the `LiquidityProfile` + `ConfluenceEngine` inputs are assembled per bar.
 - [ ] **Close the loop** — call `ExecutionGate::record_trade_outcome` on close
       events so the breaker + adaptive threshold actually engage (pairs with the
       P1 "feed closed-trade outcomes" item below).

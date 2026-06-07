@@ -14,19 +14,27 @@
 //!
 //! - **Live now:** the `RiskManager` verdict (`risk`); the CNN vote
 //!   (`cnn_agreement` + `cnn_confidence`, active only when `ENABLE_CNN_INFERENCE`);
-//!   and open positions + per-tick log-returns (`correlation`).
-//! - **Follow-ups (janus `TODO.md`, Track C):** realised-vol / quality / AO / fee
-//!   producer values, and closed-trade outcomes for the consecutive-loss breaker.
+//!   open positions + per-tick log-returns (`correlation`); and — via the
+//!   `indicators-ta` signal engine ([`GateProducers`]) — the Awesome Oscillator
+//!   (`ao`), volatility percentile (`vol_pct`), and a momentum/wave quality proxy.
+//! - **Follow-ups (janus `TODO.md`, Track C):** the fee/TP gate (config-driven
+//!   taker/slippage + the strategy `tp_pct`) and closed-trade outcomes for the
+//!   consecutive-loss breaker.
 //!
 //! Gates without a real input yet are **inert pass-throughs** — `build_context`
 //! picks values that clear them, so the gate never emits a spurious block.
 
+use std::collections::{HashMap, HashSet};
 use std::env;
 
 pub use janus_execution_gate::{
     CnnVote, ConsecutiveLossBreaker, CorrelationGuard, ExecutionGate, GateContext, GateVerdict,
     Side,
 };
+use janus_indicators::{Candle, IndicatorConfig, Indicators, VolatilityPercentile};
+
+/// Rolling window (bars) for the volatility-percentile tracker.
+const VOL_PCT_WINDOW: usize = 100;
 
 fn env_flag(name: &str) -> bool {
     env::var(name)
@@ -48,6 +56,104 @@ pub struct GateOutcome {
     /// should then suppress the execution submit (the signal still publishes to
     /// the bus for observability, preserving "no autonomous execution").
     pub enforce_block: bool,
+}
+
+/// Real producer values from the `indicators-ta` signal engine. A `None` field
+/// leaves the corresponding gate an inert pass-through.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Producers {
+    /// Awesome Oscillator (drives the AO-divergence gate).
+    pub ao: Option<f64>,
+    /// Volatility percentile in `[0, 1]` (drives the vol-filter gate).
+    pub vol_pct: Option<f64>,
+    /// Signal-quality score in `[0, 100]` (drives the quality gate).
+    pub quality: Option<f64>,
+}
+
+/// One closed OHLCV bar fed to [`GateProducers::on_candle`]. `time_ms` is the
+/// candle open time in milliseconds.
+#[derive(Debug, Clone, Copy)]
+pub struct Bar {
+    pub time_ms: i64,
+    pub open: f64,
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
+    pub volume: f64,
+}
+
+/// Per-symbol producer state driven by the `indicators-ta` streaming signal
+/// engine. Feed every closed candle via [`on_candle`](Self::on_candle); read the
+/// current [`Producers`] for an asset via [`snapshot`](Self::snapshot).
+///
+/// `ao` comes straight from the engine; `vol_pct` from a `VolatilityPercentile`
+/// tracker fed the engine's ATR; `quality` is a proxy blending the engine's
+/// momentum + wave-ratio percentiles (a tunable stand-in for Ruby's quality
+/// score — the fuller `compute_signal` confluence score is a later refinement).
+/// A symbol reports `Producers::default()` (all `None`) until the engine warms
+/// up, so the gates stay inert during warmup rather than acting on noise.
+pub struct GateProducers {
+    engines: HashMap<String, Indicators>,
+    vol: HashMap<String, VolatilityPercentile>,
+    warmed: HashSet<String>,
+}
+
+impl Default for GateProducers {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl GateProducers {
+    pub fn new() -> Self {
+        Self {
+            engines: HashMap::new(),
+            vol: HashMap::new(),
+            warmed: HashSet::new(),
+        }
+    }
+
+    /// Feed a closed [`Bar`] for `symbol`.
+    pub fn on_candle(&mut self, symbol: &str, bar: Bar) {
+        let ind = self
+            .engines
+            .entry(symbol.to_string())
+            .or_insert_with(|| Indicators::new(IndicatorConfig::default()));
+        let warm = ind.update(&Candle {
+            time: bar.time_ms,
+            open: bar.open,
+            high: bar.high,
+            low: bar.low,
+            close: bar.close,
+            volume: bar.volume,
+        });
+        let vp = self
+            .vol
+            .entry(symbol.to_string())
+            .or_insert_with(|| VolatilityPercentile::new(VOL_PCT_WINDOW));
+        vp.update(ind.atr);
+        if warm {
+            self.warmed.insert(symbol.to_string());
+        }
+    }
+
+    /// Current producer snapshot for `symbol` (all `None` until the engine warms).
+    pub fn snapshot(&self, symbol: &str) -> Producers {
+        if !self.warmed.contains(symbol) {
+            return Producers::default();
+        }
+        let Some(ind) = self.engines.get(symbol) else {
+            return Producers::default();
+        };
+        // Quality proxy: blend the momentum + wave-ratio percentiles (each 0–1)
+        // into a 0–100 score. Tunable; see the type docs.
+        let quality = ((ind.mom_pct + ind.wr_pct) * 0.5 * 100.0).clamp(0.0, 100.0);
+        Producers {
+            ao: Some(ind.ao),
+            vol_pct: self.vol.get(symbol).map(|v| v.vol_pct),
+            quality: Some(quality),
+        }
+    }
 }
 
 /// Live-loop wrapper around the execution gate.
@@ -90,14 +196,9 @@ impl ForwardGate {
         self.enforce
     }
 
-    /// Build a [`GateContext`] from the inputs available at signal emission.
-    ///
-    /// `risk_check` is the `RiskManager` verdict string (`"ok"` / `"rejected:…"`).
-    /// `cnn_vote` is the CNN's `(side, confidence)` when CNN gating is active.
-    /// `open_assets` are the symbols with open positions (for the correlation
-    /// gate). Producer inputs not yet plumbed (vol / quality / AO / fees) are
-    /// set to pass-through values so their gates stay inert — notably the AO
-    /// pass-through is direction-dependent, hence `side` is required here.
+    /// Build a [`GateContext`] with no engine producers (all inert pass-throughs).
+    /// Convenience over
+    /// [`build_context_with_producers`](Self::build_context_with_producers).
     pub fn build_context(
         side: Side,
         risk_check: &str,
@@ -105,7 +206,38 @@ impl ForwardGate {
         cnn_vote: Option<(Side, f64)>,
         open_assets: Vec<String>,
     ) -> GateContext {
+        Self::build_context_with_producers(
+            side,
+            risk_check,
+            min_confidence,
+            cnn_vote,
+            open_assets,
+            Producers::default(),
+        )
+    }
+
+    /// Build a [`GateContext`] from the per-signal state plus the `indicators-ta`
+    /// engine [`Producers`].
+    ///
+    /// `risk_check` is the `RiskManager` verdict string (`"ok"` / `"rejected:…"`).
+    /// `cnn_vote` is the CNN's `(side, confidence)` when CNN gating is active.
+    /// `open_assets` are the symbols with open positions (correlation gate).
+    /// `producers` carries the engine's `ao` / `vol_pct` / `quality`; any absent
+    /// (`None`) field falls back to an inert pass-through so its gate can't fire —
+    /// notably the AO pass-through is direction-dependent, hence `side` is needed.
+    pub fn build_context_with_producers(
+        side: Side,
+        risk_check: &str,
+        min_confidence: f64,
+        cnn_vote: Option<(Side, f64)>,
+        open_assets: Vec<String>,
+        producers: Producers,
+    ) -> GateContext {
         let rejected = risk_check.starts_with("rejected");
+        let ao_passthrough = match side {
+            Side::Buy => 1.0,
+            Side::Sell => -1.0,
+        };
         GateContext {
             // Real inputs.
             can_trade: !rejected,
@@ -118,14 +250,13 @@ impl ForwardGate {
             cnn_enabled: cnn_vote.is_some(),
             cnn_result: cnn_vote.map(|(s, c)| CnnVote::new(s, c)),
             open_assets,
-            // Pass-through (inert) inputs — see module docs. quality >= qual_min,
-            // tp/fees viable, vol mid-band (Default), and AO matching the side.
-            quality: 100.0,
+            // Engine producers, with inert pass-throughs when not yet warmed:
+            // vol mid-band, quality clears qual_min, AO matches the side. The
+            // fee/TP gate stays pass-through until config-driven fees land.
+            ao: producers.ao.unwrap_or(ao_passthrough),
+            vol_pct: producers.vol_pct.unwrap_or(0.5),
+            quality: producers.quality.unwrap_or(100.0),
             tp_pct: 0.01,
-            ao: match side {
-                Side::Buy => 1.0,
-                Side::Sell => -1.0,
-            },
             ..Default::default()
         }
     }
@@ -273,5 +404,108 @@ mod tests {
             g.evaluate_entry("btc", Side::Buy, false, &ctx, NOW).verdict,
             GateVerdict::BlockCorrelation
         );
+    }
+
+    #[test]
+    fn producers_drive_vol_quality_and_ao_gates() {
+        let mut g = ForwardGate::new(false);
+        // Real vol_pct below the entry band (< 0.15) → vol filter blocks.
+        let ctx = ForwardGate::build_context_with_producers(
+            Side::Buy,
+            "ok",
+            0.6,
+            None,
+            Vec::new(),
+            Producers {
+                ao: Some(1.0),
+                vol_pct: Some(0.05),
+                quality: Some(80.0),
+            },
+        );
+        assert_eq!(
+            g.evaluate_entry("btc", Side::Buy, false, &ctx, NOW).verdict,
+            GateVerdict::BlockVolFilter
+        );
+        // Real quality below the floor (< 50) → quality blocks.
+        let ctx = ForwardGate::build_context_with_producers(
+            Side::Buy,
+            "ok",
+            0.6,
+            None,
+            Vec::new(),
+            Producers {
+                ao: Some(1.0),
+                vol_pct: Some(0.5),
+                quality: Some(20.0),
+            },
+        );
+        assert_eq!(
+            g.evaluate_entry("btc", Side::Buy, false, &ctx, NOW).verdict,
+            GateVerdict::BlockQuality
+        );
+        // Real AO opposing a Buy (ao <= 0) → AO-divergence blocks.
+        let ctx = ForwardGate::build_context_with_producers(
+            Side::Buy,
+            "ok",
+            0.6,
+            None,
+            Vec::new(),
+            Producers {
+                ao: Some(-0.5),
+                vol_pct: Some(0.5),
+                quality: Some(80.0),
+            },
+        );
+        assert_eq!(
+            g.evaluate_entry("btc", Side::Buy, false, &ctx, NOW).verdict,
+            GateVerdict::BlockAoDivergence
+        );
+    }
+
+    #[test]
+    fn gate_producers_report_once_warm() {
+        let mut p = GateProducers::new();
+        // Too few candles → engine not warm → all-None (gates stay inert).
+        for i in 0..10 {
+            let px = 100.0 + i as f64;
+            p.on_candle(
+                "btc",
+                Bar {
+                    time_ms: i as i64 * 60_000,
+                    open: px,
+                    high: px + 1.0,
+                    low: px - 1.0,
+                    close: px,
+                    volume: 10.0,
+                },
+            );
+        }
+        let cold = p.snapshot("btc");
+        assert!(cold.ao.is_none() && cold.vol_pct.is_none() && cold.quality.is_none());
+        // Unknown symbol is always inert.
+        assert!(p.snapshot("eth").ao.is_none());
+        // Enough candles → engine warms and reports producers.
+        for i in 10..150 {
+            let px = 100.0 + ((i as f64) * 0.2).sin() * 5.0;
+            p.on_candle(
+                "btc",
+                Bar {
+                    time_ms: i as i64 * 60_000,
+                    open: px,
+                    high: px + 1.0,
+                    low: px - 1.0,
+                    close: px,
+                    volume: 10.0,
+                },
+            );
+        }
+        let warm = p.snapshot("btc");
+        assert!(warm.ao.is_some(), "ao should be reported once warm");
+        assert!(
+            warm.vol_pct.is_some(),
+            "vol_pct should be reported once warm"
+        );
+        let q = warm.quality.expect("quality reported once warm");
+        assert!((0.0..=100.0).contains(&q), "quality in 0..=100, got {q}");
     }
 }
