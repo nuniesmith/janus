@@ -12,14 +12,15 @@
 //! `JANUS_GATE_ENFORCE=1` to let a block suppress the execution submit). Inputs
 //! are fed incrementally:
 //!
-//! - **Live now:** the `RiskManager` verdict (`risk`); the CNN vote
-//!   (`cnn_agreement` + `cnn_confidence`, active only when `ENABLE_CNN_INFERENCE`);
-//!   open positions + per-tick log-returns (`correlation`); and — via the
-//!   `indicators-ta` signal engine ([`GateProducers`]) — the Awesome Oscillator
-//!   (`ao`), volatility percentile (`vol_pct`), and a momentum/wave quality proxy.
-//! - **Follow-ups (janus `TODO.md`, Track C):** the fee/TP gate (config-driven
-//!   taker/slippage + the strategy `tp_pct`) and closed-trade outcomes for the
-//!   consecutive-loss breaker.
+//! - **Live now (8 of 9 gates):** the `RiskManager` verdict (`risk`); the CNN
+//!   vote (`cnn_agreement` + `cnn_confidence`, active only when
+//!   `ENABLE_CNN_INFERENCE`); open positions + per-tick log-returns
+//!   (`correlation`); and — via the `indicators-ta` signal engine
+//!   ([`GateProducers`]) — the Awesome Oscillator (`ao`), volatility percentile
+//!   (`vol_pct`), a momentum/wave quality proxy, and an ATR-derived `tp_pct` for
+//!   fee viability.
+//! - **Follow-up (janus `TODO.md`, Track C):** closed-trade outcomes for the
+//!   consecutive-loss breaker — the 9th gate (needs the position-close path).
 //!
 //! Gates without a real input yet are **inert pass-throughs** — `build_context`
 //! picks values that clear them, so the gate never emits a spurious block.
@@ -35,6 +36,11 @@ use janus_indicators::{Candle, IndicatorConfig, Indicators, VolatilityPercentile
 
 /// Rolling window (bars) for the volatility-percentile tracker.
 const VOL_PCT_WINDOW: usize = 100;
+
+/// Default TP-target ATR multiple for the fee-viability gate's `tp_pct`
+/// (`tp_pct = tp_atr_mult × ATR / close`) — ≈ a 2R target on a 2×ATR stop.
+/// Override with `JANUS_GATE_TP_ATR_MULT`.
+const DEFAULT_TP_ATR_MULT: f64 = 4.0;
 
 fn env_flag(name: &str) -> bool {
     env::var(name)
@@ -58,8 +64,8 @@ pub struct GateOutcome {
     pub enforce_block: bool,
 }
 
-/// Real producer values from the `indicators-ta` signal engine. A `None` field
-/// leaves the corresponding gate an inert pass-through.
+/// Per-signal gate inputs derived from the `indicators-ta` engine state. A
+/// `None` field leaves the corresponding gate an inert pass-through.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Producers {
     /// Awesome Oscillator (drives the AO-divergence gate).
@@ -68,6 +74,9 @@ pub struct Producers {
     pub vol_pct: Option<f64>,
     /// Signal-quality score in `[0, 100]` (drives the quality gate).
     pub quality: Option<f64>,
+    /// Take-profit target as a fraction of price (drives the fee-viability
+    /// gate). Derived as `tp_atr_mult × ATR / close` — see [`GateProducers`].
+    pub tp_pct: Option<f64>,
 }
 
 /// One closed OHLCV bar fed to [`GateProducers::on_candle`]. `time_ms` is the
@@ -89,13 +98,17 @@ pub struct Bar {
 /// `ao` comes straight from the engine; `vol_pct` from a `VolatilityPercentile`
 /// tracker fed the engine's ATR; `quality` is a proxy blending the engine's
 /// momentum + wave-ratio percentiles (a tunable stand-in for Ruby's quality
-/// score — the fuller `compute_signal` confluence score is a later refinement).
-/// A symbol reports `Producers::default()` (all `None`) until the engine warms
-/// up, so the gates stay inert during warmup rather than acting on noise.
+/// score — the fuller `compute_signal` confluence score is a later refinement);
+/// `tp_pct` is `tp_atr_mult × ATR / close`, the take-profit target the
+/// fee-viability gate measures round-trip fees against. A symbol reports
+/// `Producers::default()` (all `None`) until the engine warms up, so the gates
+/// stay inert during warmup rather than acting on noise.
 pub struct GateProducers {
     engines: HashMap<String, Indicators>,
     vol: HashMap<String, VolatilityPercentile>,
     warmed: HashSet<String>,
+    /// TP target as an ATR multiple, for the fee-viability gate's `tp_pct`.
+    tp_atr_mult: f64,
 }
 
 impl Default for GateProducers {
@@ -106,10 +119,16 @@ impl Default for GateProducers {
 
 impl GateProducers {
     pub fn new() -> Self {
+        let tp_atr_mult = std::env::var("JANUS_GATE_TP_ATR_MULT")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|m| *m > 0.0)
+            .unwrap_or(DEFAULT_TP_ATR_MULT);
         Self {
             engines: HashMap::new(),
             vol: HashMap::new(),
             warmed: HashSet::new(),
+            tp_atr_mult,
         }
     }
 
@@ -148,10 +167,17 @@ impl GateProducers {
         // Quality proxy: blend the momentum + wave-ratio percentiles (each 0–1)
         // into a 0–100 score. Tunable; see the type docs.
         let quality = ((ind.mom_pct + ind.wr_pct) * 0.5 * 100.0).clamp(0.0, 100.0);
+        // Fee-viability TP target: `tp_atr_mult × ATR` as a fraction of the last
+        // close. `None` until both ATR and a close are available.
+        let tp_pct = match (ind.closes.back().copied(), ind.atr) {
+            (Some(c), Some(a)) if c > 0.0 && a > 0.0 => Some(self.tp_atr_mult * a / c),
+            _ => None,
+        };
         Producers {
             ao: Some(ind.ao),
             vol_pct: self.vol.get(symbol).map(|v| v.vol_pct),
             quality: Some(quality),
+            tp_pct,
         }
     }
 }
@@ -251,12 +277,12 @@ impl ForwardGate {
             cnn_result: cnn_vote.map(|(s, c)| CnnVote::new(s, c)),
             open_assets,
             // Engine producers, with inert pass-throughs when not yet warmed:
-            // vol mid-band, quality clears qual_min, AO matches the side. The
-            // fee/TP gate stays pass-through until config-driven fees land.
+            // vol mid-band, quality clears qual_min, AO matches the side, TP
+            // viable. Fees keep the GateContext defaults (taker + slippage).
             ao: producers.ao.unwrap_or(ao_passthrough),
             vol_pct: producers.vol_pct.unwrap_or(0.5),
             quality: producers.quality.unwrap_or(100.0),
-            tp_pct: 0.01,
+            tp_pct: producers.tp_pct.unwrap_or(0.01),
             ..Default::default()
         }
     }
@@ -407,7 +433,7 @@ mod tests {
     }
 
     #[test]
-    fn producers_drive_vol_quality_and_ao_gates() {
+    fn producers_drive_vol_quality_ao_and_fee_gates() {
         let mut g = ForwardGate::new(false);
         // Real vol_pct below the entry band (< 0.15) → vol filter blocks.
         let ctx = ForwardGate::build_context_with_producers(
@@ -417,9 +443,8 @@ mod tests {
             None,
             Vec::new(),
             Producers {
-                ao: Some(1.0),
                 vol_pct: Some(0.05),
-                quality: Some(80.0),
+                ..Default::default()
             },
         );
         assert_eq!(
@@ -434,9 +459,8 @@ mod tests {
             None,
             Vec::new(),
             Producers {
-                ao: Some(1.0),
-                vol_pct: Some(0.5),
                 quality: Some(20.0),
+                ..Default::default()
             },
         );
         assert_eq!(
@@ -452,13 +476,28 @@ mod tests {
             Vec::new(),
             Producers {
                 ao: Some(-0.5),
-                vol_pct: Some(0.5),
-                quality: Some(80.0),
+                ..Default::default()
             },
         );
         assert_eq!(
             g.evaluate_entry("btc", Side::Buy, false, &ctx, NOW).verdict,
             GateVerdict::BlockAoDivergence
+        );
+        // Tiny TP target → round-trip fees dominate (> 30%) → fee-viability blocks.
+        let ctx = ForwardGate::build_context_with_producers(
+            Side::Buy,
+            "ok",
+            0.6,
+            None,
+            Vec::new(),
+            Producers {
+                tp_pct: Some(0.002),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            g.evaluate_entry("btc", Side::Buy, false, &ctx, NOW).verdict,
+            GateVerdict::BlockFeeViability
         );
     }
 
@@ -507,5 +546,6 @@ mod tests {
         );
         let q = warm.quality.expect("quality reported once warm");
         assert!((0.0..=100.0).contains(&q), "quality in 0..=100, got {q}");
+        assert!(warm.tp_pct.is_some(), "tp_pct should be reported once warm");
     }
 }
