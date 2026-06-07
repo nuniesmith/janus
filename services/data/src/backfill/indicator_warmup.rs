@@ -6,19 +6,21 @@
 //!
 //! ## Data source priority
 //!
-//! Candles are fetched using a three-tier fallback chain:
+//! Candles are fetched using a two-tier fallback chain. janus is the source of
+//! truth — the legacy Python "Ruby" data service was retired (RUST_MIGRATION
+//! Track A), so there is no longer a Python tier:
 //!
-//! 1. **Python data service** (`fks_ruby` — primary)
-//!    Fetches from `GET /bars/{symbol}/candles`.  This is the authoritative
-//!    store for all traded instruments (CME futures *and* crypto) — data is
-//!    sourced from Massive/yfinance and cached in Postgres + Redis.
+//! 1. **QuestDB** (primary)
+//!    Queries `candles_crypto` directly — crypto pairs already ingested via the
+//!    native WebSocket streams.
 //!
-//! 2. **QuestDB** (fallback)
-//!    Queries `candles_crypto` directly.  Only works for crypto pairs that
-//!    have already been ingested via WebSocket streams.
+//! 2. **Binance REST API** (fallback)
+//!    Direct API call for warmup history; crypto pairs only.
 //!
-//! 3. **Binance REST API** (last resort)
-//!    Direct API call — only viable for crypto pairs, never for CME futures.
+//! Note: CME futures (MGC, MES, …) have no native historical source yet — they
+//! were only ever served by the retired Python service. A native source (e.g. a
+//! Massive integration) is future Track A work; until then those symbols warm
+//! up empty and rely on live candles.
 //!
 //! ## Usage
 //!
@@ -34,9 +36,6 @@ use std::sync::OnceLock;
 use tracing::{debug, error, info, warn};
 
 use crate::actors::indicator::{CandleInput, IndicatorActor, IndicatorMessage};
-use crate::backfill::python_data_client::{
-    CandleFetchRequest, PythonDataClient, PythonDataClientConfig, to_data_service_symbol,
-};
 use crate::storage::StorageManager;
 
 /// Configuration for indicator warmup
@@ -50,9 +49,6 @@ pub struct WarmupConfig {
     pub batch_size: usize,
     /// Skip warmup entirely when indicators are already warm.
     pub skip_if_warm: bool,
-    /// Config for the Python data service HTTP client.
-    /// When `None` the client is built from environment variables.
-    pub python_client_config: Option<PythonDataClientConfig>,
 }
 
 impl Default for WarmupConfig {
@@ -61,7 +57,6 @@ impl Default for WarmupConfig {
             max_candles: 500, // Enough for EMA-200 + generous buffer
             batch_size: 50,
             skip_if_warm: true,
-            python_client_config: None, // built from env vars on first use
         }
     }
 }
@@ -86,22 +81,15 @@ pub struct IndicatorWarmup {
     storage: Arc<StorageManager>,
     indicator_actor: Arc<IndicatorActor>,
     config: WarmupConfig,
-    /// Lazily-built Python data client (built once on first warmup call).
-    python_client: Option<PythonDataClient>,
 }
 
 impl IndicatorWarmup {
     /// Create a new `IndicatorWarmup` with default configuration.
-    ///
-    /// The Python data service client will be built lazily from environment
-    /// variables (`PYTHON_DATA_SERVICE_URL`, `DATA_SERVICE_API_KEY`, etc.)
-    /// on the first call to `warmup_from_history`.
     pub fn new(storage: Arc<StorageManager>, indicator_actor: Arc<IndicatorActor>) -> Self {
         Self {
             storage,
             indicator_actor,
             config: WarmupConfig::default(),
-            python_client: None,
         }
     }
 
@@ -115,38 +103,13 @@ impl IndicatorWarmup {
             storage,
             indicator_actor,
             config,
-            python_client: None,
         }
-    }
-
-    /// Return a reference to (or lazily build) the Python data client.
-    ///
-    /// Building is cheap — it just creates an `reqwest::Client` with the
-    /// configured headers.  Errors here are non-fatal; the warmup will fall
-    /// back to QuestDB / Binance if the client cannot be constructed.
-    fn get_python_client(&mut self) -> Option<&PythonDataClient> {
-        if self.python_client.is_none() {
-            let cfg = self.config.python_client_config.clone().unwrap_or_default();
-            match PythonDataClient::new(cfg) {
-                Ok(client) => {
-                    self.python_client = Some(client);
-                }
-                Err(e) => {
-                    warn!(
-                        "IndicatorWarmup: could not build PythonDataClient — {e}. \
-                         Will fall back to QuestDB / Binance for warmup."
-                    );
-                }
-            }
-        }
-        self.python_client.as_ref()
     }
 
     /// Warm up indicators for a single symbol/timeframe pair.
     ///
-    /// Candle data is fetched using the three-tier priority chain described in
-    /// the module docs.  The method is `&mut self` because it lazily builds
-    /// the `PythonDataClient` on first call.
+    /// Candle data is fetched using the two-tier priority chain described in the
+    /// module docs (QuestDB → Binance).
     pub async fn warmup_from_history(
         &mut self,
         symbol: &str,
@@ -182,60 +145,36 @@ impl IndicatorWarmup {
             });
         }
 
-        // ── Tier 1: Python data service ────────────────────────────────────
-        let candles = self
-            .fetch_from_python_service(symbol, timeframe, candles_to_fetch)
-            .await;
-
-        // ── Tier 2: QuestDB fallback ───────────────────────────────────────
-        let candles = match candles {
-            Some(c) if !c.is_empty() => {
+        // ── Tier 1: QuestDB (crypto pairs ingested via native WebSocket) ───
+        let candles = match self
+            .fetch_historical_candles(symbol, timeframe, candles_to_fetch)
+            .await
+        {
+            Ok(c) if !c.is_empty() => {
                 info!(
-                    "IndicatorWarmup: [python-data] {} candles for {}:{}",
+                    "IndicatorWarmup: [questdb] {} candles for {}:{}",
                     c.len(),
                     symbol,
                     timeframe
                 );
                 c
             }
-            _ => {
+            Ok(_) | Err(_) => {
+                // ── Tier 2: Binance REST API (crypto only) ─────────────────
                 info!(
-                    "IndicatorWarmup: python-data service empty/unavailable for {}:{}, \
-                     falling back to QuestDB",
+                    "IndicatorWarmup: QuestDB empty for {}:{}, falling back to Binance REST",
                     symbol, timeframe
                 );
-                match self
-                    .fetch_historical_candles(symbol, timeframe, candles_to_fetch)
+                self.fetch_from_binance(symbol, timeframe, candles_to_fetch)
                     .await
-                {
-                    Ok(c) if !c.is_empty() => {
-                        info!(
-                            "IndicatorWarmup: [questdb] {} candles for {}:{}",
-                            c.len(),
-                            symbol,
-                            timeframe
-                        );
-                        c
-                    }
-                    Ok(_) | Err(_) => {
-                        // ── Tier 3: Binance REST API (crypto only) ─────────
-                        info!(
-                            "IndicatorWarmup: QuestDB empty for {}:{}, \
-                             falling back to Binance REST",
-                            symbol, timeframe
-                        );
-                        self.fetch_from_binance(symbol, timeframe, candles_to_fetch)
-                            .await
-                            .unwrap_or_default()
-                    }
-                }
+                    .unwrap_or_default()
             }
         };
 
         if candles.is_empty() {
             warn!(
                 "IndicatorWarmup: No historical candles found for {}:{} \
-                 (tried python-data, QuestDB, Binance)",
+                 (tried QuestDB, Binance)",
                 symbol, timeframe
             );
             return Ok(WarmupResult {
@@ -320,55 +259,7 @@ impl IndicatorWarmup {
     }
 
     // =========================================================================
-    // Data source tier 1 — Python data service
-    // =========================================================================
-
-    /// Attempt to fetch candles from the Python data service.
-    ///
-    /// Returns `Some(candles)` on success (which may be an empty vec if the
-    /// symbol has no data yet), or `None` if the service is unreachable or
-    /// returns an error.
-    async fn fetch_from_python_service(
-        &mut self,
-        symbol: &str,
-        timeframe: &str,
-        limit: usize,
-    ) -> Option<Vec<CandleInput>> {
-        // Build the client lazily.
-        let client = self.get_python_client()?;
-
-        let ds_symbol = to_data_service_symbol(symbol);
-
-        let request = CandleFetchRequest {
-            symbol: ds_symbol.clone(),
-            interval: timeframe.to_string(),
-            limit: limit.min(10_000) as u32,
-            days_back: 30,
-            auto_fill: true,
-        };
-
-        match client.fetch_candles(&request).await {
-            Ok(result) => {
-                debug!(
-                    "IndicatorWarmup: python-data returned {} candles for {} (requested {})",
-                    result.candles.len(),
-                    ds_symbol,
-                    limit
-                );
-                Some(result.candles)
-            }
-            Err(e) => {
-                warn!(
-                    "IndicatorWarmup: python-data fetch failed for {}:{} — {}",
-                    symbol, timeframe, e
-                );
-                None
-            }
-        }
-    }
-
-    // =========================================================================
-    // Data source tier 3 — Binance REST API
+    // Data source tier 2 — Binance REST API
     // =========================================================================
 
     /// Fetch candles from the Binance klines REST endpoint.
@@ -393,7 +284,7 @@ impl IndicatorWarmup {
     }
 
     // =========================================================================
-    // Data source tier 2 — QuestDB direct query
+    // Data source tier 1 — QuestDB direct query
     // =========================================================================
 
     /// Fetch historical candles from QuestDB (the `candles_crypto` table).

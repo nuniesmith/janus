@@ -75,20 +75,30 @@ Track E (long tail) ──────── rebuild-if-needed; Rithmic stays Py
 ```
 
 ### Track A — Data layer: make janus the sole source of truth · RUST_MIGRATION Phase 1
-The #1-leverage, lowest-ML-risk cut. Two data paths still exist: janus ingests
-natively **and** still calls Ruby via
-`services/data/src/backfill/python_data_client.rs`.
+The #1-leverage, lowest-ML-risk cut. The Python "Ruby" data service is **gone**
+from the deployment, so its client + the dead registry sync are being retired,
+leaving janus's native ingestion (exchange WS → QuestDB) as the only data path.
+- [x] **Retired `python_data_client.rs` (data service).** Deleted the ~1,095-line
+      Ruby data-API client + the dead `DataServiceProvider` wrapper, and rewired
+      indicator warmup from a 3-tier (Python → QuestDB → Binance) chain to a
+      native 2-tier (QuestDB → Binance) one. This also removes the per-call
+      timeout-to-`fks_ruby` that slowed every warmup now that Ruby is gone.
+- [ ] **Retire the registry's Python sync** — `services/registry` still polls
+      `{PYTHON_DATA_SERVICE_URL}/api/registry/*` every 5 min (now always failing).
+      Remove the sync loop; the registry is janus-native.
+- [ ] **Native historical source for non-crypto** — CME futures (MGC, MES, …)
+      were only served by the retired Python service; QuestDB/Binance can't
+      backfill them. Add a native source (e.g. a Massive integration) or scope
+      the platform to crypto. Until then those symbols warm up empty.
 - [ ] **Port the data factory** (gap-scan → backfill → reconcile) fully into
       `services/data`. Pieces exist (`crates/gap-detection` is a stub,
       `crates/data-quality` is rich, `services/data/src/backfill/`); the Ruby
       reference is `ruby/src/data/{gap_scanner,backfill_manager,dataset_generator}.py`.
-- [ ] **Retire `python_data_client.rs`** once janus is the only QuestDB/Postgres/
-      Redis writer — it's the clean cut-over seam, not permanent architecture.
 - [ ] **Asset registry in janus** (subsumes JFLOW-B's env-only list + the old
       "pull from Ruby's registry" follow-ups): port
       `ruby/src/services/asset_registry.py` → a registry the optimizer + forward
       read. (`services/registry` + `crates/registry` exist — confirm scope.)
-- [ ] **Exit:** janus is the sole data writer; `python_data_client.rs` deleted.
+- [ ] **Exit:** janus is the sole data writer; all Ruby data calls gone.
 
 ### Track B — burn-native ML parity · RUST_MIGRATION Phase 2 + 4
 Scaffolding is built in `crates/ml` (PerAssetCnn, MasterCnn, 20-ch features,
