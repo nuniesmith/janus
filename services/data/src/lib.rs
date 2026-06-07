@@ -34,7 +34,6 @@ pub mod actors;
 pub mod backfill;
 pub mod config;
 pub mod connectors;
-pub mod data_service_provider;
 pub mod logging;
 pub mod metrics;
 pub mod self_healing;
@@ -45,7 +44,6 @@ pub use backfill::{
     BackfillExecutor, BackfillLock, BackfillRequest, BackfillResult, LockConfig, LockGuard,
     LockMetrics,
 };
-pub use data_service_provider::DataServiceProvider;
 pub use logging::CorrelationId;
 pub use self_healing::{
     HealthStatus, RemediationResult, RemediationStats, RemediationType, SelfHealingConfig,

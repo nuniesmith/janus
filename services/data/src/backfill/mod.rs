@@ -8,7 +8,6 @@ pub mod gap_integration;
 pub mod historical_candles;
 pub mod indicator_warmup;
 pub mod lock;
-pub mod python_data_client;
 pub mod scheduler;
 pub mod signal_backtest;
 pub mod throttle;
@@ -20,12 +19,6 @@ pub use gap_integration::{
 pub use historical_candles::{FetchConfig, FetchResult, HistoricalCandleFetcher, deep_warmup};
 pub use indicator_warmup::{IndicatorWarmup, WarmupConfig, WarmupResult};
 pub use lock::{BackfillLock, LockConfig, LockGuard, LockMetrics};
-pub use python_data_client::{
-    AssetInfo, AssetsResponse, BarStatusEntry, BarsStatusResponse, CandleFetchRequest,
-    DataSourceResponse, FetchCandlesResult, FillJobResponse, GapEntry, GapReportResponse,
-    LiveFeedStatus, PythonDataClient, PythonDataClientConfig, SymbolsResponse,
-    to_data_service_symbol,
-};
 pub use scheduler::{BackfillScheduler, GapInfo, SchedulerConfig, SchedulerStats};
 pub use signal_backtest::{BacktestConfig, BacktestResults, SignalBacktest, SignalTypeMetrics};
 pub use throttle::{

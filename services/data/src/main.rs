@@ -263,9 +263,7 @@ impl DataFactory {
     ) {
         use crate::backfill::IndicatorWarmup;
 
-        // Build list of symbol/timeframe pairs to warm up.
-        // Pass symbols as configured — the PythonDataClient converts them to
-        // the right format for the data service (e.g. "MGC" → "MGC=F").
+        // Build list of symbol/timeframe pairs to warm up (QuestDB → Binance).
         let pairs: Vec<(String, String)> = self
             .config
             .assets
@@ -279,7 +277,7 @@ impl DataFactory {
         }
 
         info!(
-            "IndicatorWarmup: Warming up {} pairs (python-data → QuestDB → Binance fallback chain)",
+            "IndicatorWarmup: Warming up {} pairs (QuestDB → Binance fallback chain)",
             pairs.len()
         );
 
