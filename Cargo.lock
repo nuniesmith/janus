@@ -5757,6 +5757,7 @@ dependencies = [
  "jflow-cns",
  "jflow-common",
  "jflow-core",
+ "jflow-execution-gate",
  "jflow-health",
  "jflow-ml",
  "jflow-models",

@@ -62,6 +62,7 @@ janus-regime = { path = "../../crates/regime", package = "jflow-regime" }
 janus-models = { path = "../../crates/models", package = "jflow-models" }
 janus-health = { path = "../../crates/health", package = "jflow-health" }
 janus-risk = { path = "../../crates/risk", package = "jflow-risk" }
+janus-execution-gate = { path = "../../crates/execution-gate", package = "jflow-execution-gate" }
 janus-cns = { path = "../../crates/cns", package = "jflow-cns" }
 # Bybit connectivity now comes from the published exchange-apiws crate; the
 # `bybit_compat` module adapts it to the API the event loop expects.

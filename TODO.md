@@ -112,16 +112,21 @@ parity goldens. (Supersedes the P0 "run the probe" item.)
 - [x] **Port the 9-gate `ExecutionGate`** → `crates/execution-gate` (faithful
       chain + `ConsecutiveLossBreaker` + `CorrelationGuard` + `AdaptiveThreshold`;
       pure/synchronous core; 36 tests + doctest; clippy-clean). 2026-06-07.
-- [ ] **Wire into the live loop** (`services/forward/src/lib.rs`): build a
-      `GateContext` per prospective entry from the existing indicator/risk/CNN
-      state, call `ExecutionGate::evaluate`, surface the verdict as `gate` signal
-      metadata. **Advisory first**, then enforcing behind `JANUS_GATE_ENFORCE` —
-      mirror exactly how prop-firm/risk enforcement landed (#43/#44/#49).
-      Consolidates today's scattered prop-firm + risk + CNN + kill-switch checks
-      (~`lib.rs:1338–1937`) into one auditable chain.
-- [ ] **Producer plumbing** — feed the gate real `vol_pct`, `quality`, `ao`,
-      `tp_pct`/fees, and the `cnn_result` vote (`cnn_inference.rs` already returns
-      `(SignalType, conf)`); today those are scattered/absent.
+- [x] **Wire into the live loop — Stage 1 (advisory) done.** `services/forward/src/
+      gate_integration.rs` (`ForwardGate`) is instantiated in the live loop;
+      each prospective entry is evaluated and the verdict stamped as `gate`
+      signal metadata. Enforcement is behind `JANUS_GATE_ENFORCE` (default off) —
+      a blocking verdict then joins the prop-firm/risk `block_reason` chain and
+      suppresses the execution submit (signal still publishes to the bus,
+      preserving no-autonomous-execution). Stage 1 feeds the `RiskManager` verdict
+      + confidence; the remaining gate inputs are inert pass-throughs until the
+      next two items land (so the gate never emits a spurious block).
+- [ ] **Producer plumbing (Stage 2)** — feed the gate real `vol_pct`, `quality`,
+      `ao`, `tp_pct`/fees, the `cnn_result` vote (currently folded into the
+      strategy consensus — thread it out), and `open_assets` + per-tick
+      correlation log-returns. `ForwardGate::build_context` /
+      `update_correlation` already take these; today vol/quality/AO/fee/CNN/
+      correlation gates are inert pass-throughs.
 - [ ] **Close the loop** — call `ExecutionGate::record_trade_outcome` on close
       events so the breaker + adaptive threshold actually engage (pairs with the
       P1 "feed closed-trade outcomes" item below).
