@@ -201,13 +201,14 @@ pub fn train_champion(
 mod tests {
     use super::*;
 
+    #[allow(clippy::type_complexity)]
     fn synth_ohlcv(n: usize) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
         // A few clean consolidation→breakout episodes so labels aren't all flat.
         let mut close = vec![100.0f32; n];
-        for i in 0..n {
+        for (i, c) in close.iter_mut().enumerate() {
             let phase = i / 80;
             let base = 100.0 + phase as f32 * 4.0; // step up each episode → breakouts
-            close[i] = base + ((i % 80) as f32 * 0.15).sin() * 0.3;
+            *c = base + ((i % 80) as f32 * 0.15).sin() * 0.3;
         }
         let high: Vec<f32> = close.iter().map(|c| c + 0.3).collect();
         let low: Vec<f32> = close.iter().map(|c| c - 0.3).collect();
