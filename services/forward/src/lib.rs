@@ -42,6 +42,7 @@ pub mod api;
 pub mod brain_runtime;
 pub mod brain_wiring;
 pub mod bybit_compat;
+pub mod cnn_inference;
 pub mod execution;
 pub mod features;
 pub mod indicators;
