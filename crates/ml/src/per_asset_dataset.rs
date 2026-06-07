@@ -35,6 +35,9 @@ pub struct Sample {
 ///
 /// Returns one [`Sample`] per bar in `[warmup, n_bars)` (window ending at the
 /// labeled bar). Empty when the shapes disagree or there aren't enough bars.
+// `bar` drives the window-offset arithmetic, not just the `labels` index, so
+// range-indexing is intentional here.
+#[allow(clippy::needless_range_loop)]
 pub fn make_windows(
     features: &[f32],
     n_features: usize,
