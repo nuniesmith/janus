@@ -1121,6 +1121,28 @@ impl TradingPipeline {
         gate.tracker().weight_for(strategy, asset)
     }
 
+    /// Snapshot the per-asset affinity weights for a set of strategies in a
+    /// single read-lock acquisition.
+    ///
+    /// Returns a `name → weight` map for affinity-driven consensus selection in
+    /// the live loop: the loop takes one brief read-lock per evaluation tick and
+    /// then weights its votes from the snapshot, instead of re-locking once per
+    /// vote. Under-traded `(strategy, asset)` pairs map to the tracker's neutral
+    /// `0.5` (via [`weight_for`](janus_strategies::affinity::StrategyAffinityTracker::weight_for)),
+    /// so new strategies still participate.
+    pub async fn affinity_weights_for(
+        &self,
+        strategies: &[&str],
+        asset: &str,
+    ) -> std::collections::HashMap<String, f64> {
+        let gate = self.strategy_gate.read().await;
+        let tracker = gate.tracker();
+        strategies
+            .iter()
+            .map(|name| (name.to_string(), tracker.weight_for(name, asset)))
+            .collect()
+    }
+
     /// Get highly correlated pairs from the correlation tracker.
     pub async fn highly_correlated_pairs(&self) -> Vec<(String, String, f64)> {
         let tracker = self.correlation_tracker.read().await;

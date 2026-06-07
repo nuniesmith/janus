@@ -141,6 +141,176 @@ fn prop_firm_entry_inputs(
     Some((stop_loss, size))
 }
 
+/// Resolve the consensus vote into a final `(side, confidence, contributors)`
+/// decision, or `None` when no side clears the gates ("Hold").
+///
+/// This is the pure, side-effect-free core of the live consensus loop, factored
+/// out so the weighted/unweighted tally can be unit-tested without a live
+/// tracker or the market-data loop. The live loop calls it with the same
+/// `min_strategies` / `min_agreement` config it reads from `JanusState`.
+///
+/// `votes` is the list of agreeing strategy votes: `(side, confidence, name)`.
+///
+/// # Two weighting models
+///
+/// * **`weight_fn = None` (default; affinity selection OFF).** Byte-for-byte the
+///   historical behaviour: a side wins if its **count** ≥ `min_strategies` AND
+///   its count-fraction (`count / total`) ≥ `min_agreement`; buy is checked
+///   before sell; the signal confidence is the **arithmetic mean** of the
+///   winning side's vote confidences. No affinity is consulted and no extra
+///   per-vote work is done.
+///
+/// * **`weight_fn = Some(f)` (affinity selection ON).** Each vote is weighted by
+///   `w = f(strategy)` — the per-asset affinity weight ∈ (0,1), where an
+///   under-traded `(strategy, asset)` pair returns a neutral `0.5` so new
+///   strategies still participate (they are never frozen out). Per side we
+///   compute a **weighted score** `Σ(w·confidence)`. The winning side is the one
+///   with the higher weighted score (so the strategies that actually perform on
+///   this asset carry the vote). The signal confidence is the **weighted mean**
+///   of the winning side's votes, `Σ(w·c) / Σ(w)` (falling back to the arithmetic
+///   mean if the winning side's weights sum to ~0, which neutral 0.5 weights make
+///   impossible in practice). The winner must still clear **both** gates: the
+///   original **count** gate (`count ≥ min_strategies` — we still require N
+///   *distinct agreeing strategies*, affinity never manufactures consensus from
+///   a single strategy), and a **weighted agreement** gate (`winning_score /
+///   total_score ≥ min_agreement`), the natural weighted analogue of the
+///   count-fraction.
+///
+/// In both models the contributor set (`strategies_used`) is the winning side's
+/// strategy names in vote order, exactly as before.
+///
+/// Reweighting happens **only here, on signal generation**. Every resulting
+/// signal still flows through the execution gate / human decision point — this
+/// adds no autonomous execution.
+fn resolve_consensus<F: Fn(&str) -> f64>(
+    votes: &[(janus_core::SignalType, f64, String)],
+    min_strategies: usize,
+    min_agreement: f64,
+    weight_fn: Option<F>,
+) -> Option<(janus_core::SignalType, f64, Vec<String>)> {
+    if votes.is_empty() {
+        return None;
+    }
+
+    let buy_votes: Vec<&(janus_core::SignalType, f64, String)> = votes
+        .iter()
+        .filter(|(st, _, _)| *st == janus_core::SignalType::Buy)
+        .collect();
+    let sell_votes: Vec<&(janus_core::SignalType, f64, String)> = votes
+        .iter()
+        .filter(|(st, _, _)| *st == janus_core::SignalType::Sell)
+        .collect();
+
+    match weight_fn {
+        // ── Unweighted path (affinity selection OFF) ───────────────────────
+        // Preserved verbatim from the historical loop so the off-by-default
+        // behaviour is identical down to the float arithmetic.
+        None => {
+            if buy_votes.len() >= min_strategies
+                && buy_votes.len() as f64 / votes.len() as f64 >= min_agreement
+            {
+                let avg = buy_votes.iter().map(|(_, c, _)| c).sum::<f64>() / buy_votes.len() as f64;
+                let strats: Vec<String> = buy_votes.iter().map(|(_, _, s)| s.clone()).collect();
+                Some((janus_core::SignalType::Buy, avg, strats))
+            } else if sell_votes.len() >= min_strategies
+                && sell_votes.len() as f64 / votes.len() as f64 >= min_agreement
+            {
+                let avg =
+                    sell_votes.iter().map(|(_, c, _)| c).sum::<f64>() / sell_votes.len() as f64;
+                let strats: Vec<String> = sell_votes.iter().map(|(_, _, s)| s.clone()).collect();
+                Some((janus_core::SignalType::Sell, avg, strats))
+            } else {
+                None
+            }
+        }
+
+        // ── Weighted path (affinity selection ON) ──────────────────────────
+        Some(weight_fn) => {
+            // Σ(weight) and Σ(weight·confidence) per side, in one pass each.
+            let side_stats = |side: &[&(janus_core::SignalType, f64, String)]| -> (f64, f64) {
+                let mut weight_sum = 0.0;
+                let mut score = 0.0; // Σ(w·c)
+                for (_, conf, name) in side {
+                    let w = weight_fn(name);
+                    weight_sum += w;
+                    score += w * conf;
+                }
+                (weight_sum, score)
+            };
+            let (buy_weight, buy_score) = side_stats(&buy_votes);
+            let (sell_weight, sell_score) = side_stats(&sell_votes);
+            let total_score = buy_score + sell_score;
+
+            // The winning side is the one with the higher *weighted* score.
+            // Ties (within an epsilon) fall to buy, matching the unweighted
+            // path's buy-first preference.
+            const EPS: f64 = 1e-9;
+            let buy_wins = buy_score >= sell_score || (buy_score - sell_score).abs() < EPS;
+
+            let try_side = |side: &[&(janus_core::SignalType, f64, String)],
+                            weight_sum: f64,
+                            score: f64,
+                            sig: janus_core::SignalType|
+             -> Option<(janus_core::SignalType, f64, Vec<String>)> {
+                // Count gate: still require N distinct agreeing strategies.
+                if side.len() < min_strategies {
+                    return None;
+                }
+                // Weighted agreement gate. Guard the divisor; with neutral 0.5
+                // weights `total_score` is only ~0 when every winning vote also
+                // has ~0 confidence, in which case there is nothing to act on.
+                if total_score.abs() < EPS || score / total_score < min_agreement {
+                    return None;
+                }
+                // Weighted-mean confidence, with an arithmetic-mean fallback if
+                // the winning weights sum to ~0 (unreachable with 0.5 floors).
+                let confidence = if weight_sum.abs() < EPS {
+                    side.iter().map(|(_, c, _)| c).sum::<f64>() / side.len() as f64
+                } else {
+                    score / weight_sum
+                };
+                let strats: Vec<String> = side.iter().map(|(_, _, s)| s.clone()).collect();
+                Some((sig, confidence, strats))
+            };
+
+            if buy_wins {
+                try_side(
+                    &buy_votes,
+                    buy_weight,
+                    buy_score,
+                    janus_core::SignalType::Buy,
+                )
+                // If the (weighted) winner can't clear its gates, fall back to
+                // the other side rather than silently dropping a real consensus
+                // on the loser — mirrors the unweighted else-if cascade.
+                .or_else(|| {
+                    try_side(
+                        &sell_votes,
+                        sell_weight,
+                        sell_score,
+                        janus_core::SignalType::Sell,
+                    )
+                })
+            } else {
+                try_side(
+                    &sell_votes,
+                    sell_weight,
+                    sell_score,
+                    janus_core::SignalType::Sell,
+                )
+                .or_else(|| {
+                    try_side(
+                        &buy_votes,
+                        buy_weight,
+                        buy_score,
+                        janus_core::SignalType::Buy,
+                    )
+                })
+            }
+        }
+    }
+}
+
 /// Forward service version
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -875,6 +1045,34 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
         info!("🐕 Watchdog handle extracted — will wire heartbeats into live loops");
     }
 
+    // ── Affinity-driven strategy selection in the consensus vote (opt-in) ──
+    // OFF by default → the consensus tally is byte-for-byte the historical
+    // behaviour (no affinity read, no extra work). When ON, each agreeing
+    // strategy's vote is weighted by its per-asset affinity weight so the
+    // strategies that actually perform on an asset carry the vote. Signal-gen
+    // only — every signal still flows through the execution gate / human
+    // decision point. The weight source is the brain pipeline's affinity
+    // tracker; absent a booted pipeline, this degrades to flag-off.
+    let affinity_selection = std::env::var("JANUS_AFFINITY_SELECTION")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let affinity_pipeline: Option<Arc<brain_wiring::TradingPipeline>> = if affinity_selection {
+        brain_runtime.as_ref().and_then(|rt| rt.pipeline().cloned())
+    } else {
+        None
+    };
+    match (affinity_selection, affinity_pipeline.is_some()) {
+        (true, true) => info!(
+            "🧠⚖️  Affinity-driven consensus selection: ENABLED (votes weighted by per-asset affinity)"
+        ),
+        (true, false) => warn!(
+            "JANUS_AFFINITY_SELECTION set but no brain pipeline is available — falling back to unweighted consensus"
+        ),
+        (false, _) => info!(
+            "consensus selection: unweighted (default; set JANUS_AFFINITY_SELECTION=1 to weight votes by per-asset affinity)"
+        ),
+    }
+
     state
         .register_module_health("forward", true, Some("running".to_string()))
         .await;
@@ -1094,6 +1292,11 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
         // Shared RiskManager + live portfolio for the inline risk check (Track 3 Stage 4).
         let risk_manager = risk_manager_handle.clone();
         let portfolio = portfolio_handle.clone();
+        // Brain affinity tracker handle for opt-in affinity-driven consensus
+        // selection. `None` (flag off, or no booted pipeline) ⇒ the consensus
+        // tally never reads affinity and stays byte-for-byte the historical
+        // behaviour.
+        let affinity_pipeline = affinity_pipeline.clone();
 
         tokio::spawn(async move {
             use std::collections::HashMap;
@@ -1490,34 +1693,48 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                                     continue;
                                 }
 
-                                let buy_votes: Vec<&(janus_core::SignalType, f64, String)> = strategy_votes
-                                    .iter()
-                                    .filter(|(st, _, _)| *st == janus_core::SignalType::Buy)
-                                    .collect();
-                                let sell_votes: Vec<&(janus_core::SignalType, f64, String)> = strategy_votes
-                                    .iter()
-                                    .filter(|(st, _, _)| *st == janus_core::SignalType::Sell)
-                                    .collect();
-
                                 let min_strategies = state_clone.config.forward.strategies.consensus.min_strategies as usize;
                                 let min_agreement = state_clone.config.forward.strategies.consensus.min_agreement;
 
+                                // Affinity-driven selection (opt-in). With a
+                                // pipeline handle present (flag on), snapshot the
+                                // per-asset weights for *this tick's* voting
+                                // strategies in a single read-lock, then weight the
+                                // tally. With no handle (flag off) the closure is
+                                // `None` and the tally is byte-for-byte the
+                                // historical unweighted logic — no lock, no read.
                                 let (final_type, avg_confidence, strategies_used) =
-                                    if buy_votes.len() >= min_strategies
-                                        && buy_votes.len() as f64 / strategy_votes.len() as f64 >= min_agreement
-                                    {
-                                        let avg = buy_votes.iter().map(|(_, c, _)| c).sum::<f64>() / buy_votes.len() as f64;
-                                        let strats: Vec<String> = buy_votes.iter().map(|(_, _, s)| s.clone()).collect();
-                                        (janus_core::SignalType::Buy, avg, strats)
-                                    } else if sell_votes.len() >= min_strategies
-                                        && sell_votes.len() as f64 / strategy_votes.len() as f64 >= min_agreement
-                                    {
-                                        let avg = sell_votes.iter().map(|(_, c, _)| c).sum::<f64>() / sell_votes.len() as f64;
-                                        let strats: Vec<String> = sell_votes.iter().map(|(_, _, s)| s.clone()).collect();
-                                        (janus_core::SignalType::Sell, avg, strats)
+                                    if let Some(ref pipeline) = affinity_pipeline {
+                                        let names: Vec<&str> = strategy_votes
+                                            .iter()
+                                            .map(|(_, _, s)| s.as_str())
+                                            .collect();
+                                        let weights = pipeline
+                                            .affinity_weights_for(&names, &symbol_str)
+                                            .await;
+                                        match resolve_consensus(
+                                            &strategy_votes,
+                                            min_strategies,
+                                            min_agreement,
+                                            Some(|name: &str| {
+                                                // Missing ⇒ tracker neutral 0.5 (new
+                                                // strategies still participate).
+                                                weights.get(name).copied().unwrap_or(0.5)
+                                            }),
+                                        ) {
+                                            Some(decision) => decision,
+                                            None => continue, // No consensus — Hold
+                                        }
                                     } else {
-                                        // No consensus — Hold
-                                        continue;
+                                        match resolve_consensus(
+                                            &strategy_votes,
+                                            min_strategies,
+                                            min_agreement,
+                                            None::<fn(&str) -> f64>,
+                                        ) {
+                                            Some(decision) => decision,
+                                            None => continue, // No consensus — Hold
+                                        }
                                     };
 
                                 // Apply minimum confidence/strength filters
@@ -2246,5 +2463,264 @@ mod tests {
         // Verify query methods work (defaults since no params loaded)
         assert!(risk_manager.is_trading_enabled("BTC").await);
         assert!(risk_manager.get_asset_risk_config("BTC").await.is_none());
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Consensus resolution (affinity-driven selection — gap #4)
+    // ────────────────────────────────────────────────────────────────────
+    //
+    // These exercise the pure `resolve_consensus` tally so the behavioural
+    // capstone is covered without a live tracker or the market-data loop.
+    mod consensus {
+        use super::*;
+        use janus_core::SignalType;
+
+        const EPS: f64 = 1e-9;
+
+        /// Build a `(SignalType, confidence, name)` vote.
+        fn vote(side: SignalType, conf: f64, name: &str) -> (SignalType, f64, String) {
+            (side, conf, name.to_string())
+        }
+
+        /// A `None` weight fn typed for the unweighted (flag-OFF) path.
+        const OFF: Option<fn(&str) -> f64> = None::<fn(&str) -> f64>;
+
+        // ── Flag OFF: identical to the historical unweighted logic ──────────
+
+        #[test]
+        fn off_buy_consensus_wins_with_arithmetic_mean() {
+            // Two buys agree (2/2 = 100% ≥ min_agreement), one buy abstainer
+            // absent. Decision = Buy, confidence = arithmetic mean.
+            let votes = vec![
+                vote(SignalType::Buy, 0.8, "ema_flip"),
+                vote(SignalType::Buy, 0.6, "macd_momentum"),
+            ];
+            let (side, conf, used) = resolve_consensus(&votes, 2, 0.6, OFF).expect("consensus");
+            assert_eq!(side, SignalType::Buy);
+            assert!(
+                (conf - 0.7).abs() < EPS,
+                "mean of 0.8 & 0.6 = 0.7, got {conf}"
+            );
+            assert_eq!(
+                used,
+                vec!["ema_flip".to_string(), "macd_momentum".to_string()]
+            );
+        }
+
+        #[test]
+        fn off_no_consensus_returns_none() {
+            // 1 buy vs 1 sell: neither side reaches min_strategies=2.
+            let votes = vec![
+                vote(SignalType::Buy, 0.9, "ema_flip"),
+                vote(SignalType::Sell, 0.9, "mean_reversion"),
+            ];
+            assert!(resolve_consensus(&votes, 2, 0.6, OFF).is_none());
+        }
+
+        #[test]
+        fn off_below_min_agreement_returns_none() {
+            // 2 buys + 2 sells: each side is 50% < 0.6 agreement.
+            let votes = vec![
+                vote(SignalType::Buy, 0.9, "a"),
+                vote(SignalType::Buy, 0.9, "b"),
+                vote(SignalType::Sell, 0.9, "c"),
+                vote(SignalType::Sell, 0.9, "d"),
+            ];
+            assert!(resolve_consensus(&votes, 2, 0.6, OFF).is_none());
+        }
+
+        #[test]
+        fn off_empty_votes_returns_none() {
+            assert!(resolve_consensus(&[], 2, 0.6, OFF).is_none());
+        }
+
+        #[test]
+        fn off_buy_checked_before_sell_on_equal_counts() {
+            // 2 buy, 2 sell, but total 5 so each side is 40% — bump agreement
+            // low enough that both qualify; buy must win (buy-first cascade).
+            let votes = vec![
+                vote(SignalType::Buy, 0.7, "a"),
+                vote(SignalType::Buy, 0.7, "b"),
+                vote(SignalType::Sell, 0.9, "c"),
+                vote(SignalType::Sell, 0.9, "d"),
+            ];
+            // 2/4 = 0.5 ≥ 0.5 for both sides.
+            let (side, _, _) = resolve_consensus(&votes, 2, 0.5, OFF).expect("consensus");
+            assert_eq!(side, SignalType::Buy, "buy is checked first on a tie");
+        }
+
+        #[test]
+        fn off_ignores_any_affinity_state() {
+            // The OFF path takes no weight fn at all, so by construction the
+            // decision cannot depend on affinity. A case that wins today wins
+            // here regardless of what any tracker might say.
+            let votes = vec![
+                vote(SignalType::Sell, 0.55, "x"),
+                vote(SignalType::Sell, 0.65, "y"),
+            ];
+            let (side, conf, _) = resolve_consensus(&votes, 2, 0.6, OFF).expect("consensus");
+            assert_eq!(side, SignalType::Sell);
+            assert!((conf - 0.6).abs() < EPS);
+        }
+
+        // ── Flag ON: affinity tips / shapes the outcome ─────────────────────
+
+        #[test]
+        fn on_affinity_flips_an_even_race() {
+            // Even on raw count (2 v 2) AND identical confidences (all 0.7), so
+            // the unweighted tally is a dead tie that buy would win. But the
+            // SELL strategies have high affinity for this asset and the BUY
+            // strategies are poor → the weighted score favours sell, so sell
+            // must win.
+            let votes = vec![
+                vote(SignalType::Buy, 0.7, "buy_lo_1"),
+                vote(SignalType::Buy, 0.7, "buy_lo_2"),
+                vote(SignalType::Sell, 0.7, "sell_hi_1"),
+                vote(SignalType::Sell, 0.7, "sell_hi_2"),
+            ];
+            let weights = |name: &str| -> f64 {
+                if name.starts_with("sell_hi") {
+                    0.9
+                } else {
+                    0.2
+                }
+            };
+            // Sanity: unweighted (OFF) on the very same votes goes to buy.
+            let (off_side, _, _) = resolve_consensus(&votes, 2, 0.5, OFF).expect("off consensus");
+            assert_eq!(off_side, SignalType::Buy, "precondition: OFF favours buy");
+
+            // ON: affinity tips it to sell.
+            let (side, _, used) =
+                resolve_consensus(&votes, 2, 0.5, Some(weights)).expect("on consensus");
+            assert_eq!(side, SignalType::Sell, "higher-affinity side should win");
+            assert_eq!(used.len(), 2);
+            assert!(used.iter().all(|s| s.starts_with("sell_hi")));
+        }
+
+        #[test]
+        fn on_high_affinity_raises_winning_confidence() {
+            // One winning-side strategy has high confidence + high affinity; the
+            // other has lower confidence + low affinity. The weighted mean tilts
+            // the signal confidence *toward* the high-affinity vote, above the
+            // plain arithmetic mean.
+            let votes = vec![
+                vote(SignalType::Buy, 0.9, "star"), // high conf, high affinity
+                vote(SignalType::Buy, 0.5, "dud"),  // low conf, low affinity
+            ];
+            let weights = |name: &str| -> f64 { if name == "star" { 0.9 } else { 0.1 } };
+            // Arithmetic mean = 0.7.
+            let arithmetic_mean = 0.7;
+            // Weighted mean = (0.9*0.9 + 0.1*0.5) / (0.9+0.1) = 0.86.
+            let (side, conf, _) =
+                resolve_consensus(&votes, 2, 0.5, Some(weights)).expect("on consensus");
+            assert_eq!(side, SignalType::Buy);
+            assert!(
+                (conf - 0.86).abs() < EPS,
+                "weighted mean should be 0.86, got {conf}"
+            );
+            assert!(
+                conf > arithmetic_mean,
+                "high affinity should pull confidence above the arithmetic mean"
+            );
+        }
+
+        #[test]
+        fn on_neutral_weights_match_unweighted_decision_and_confidence() {
+            // Untested strategies → neutral 0.5 everywhere. When every vote
+            // carries the same confidence, equal weights make the weighted mean
+            // collapse to the arithmetic mean AND the weighted-score share
+            // collapse to the count share (Σ(w·c) with constant w,c factors out
+            // to a count ratio). So ON must give exactly the same decision,
+            // confidence, and contributor set as OFF — new strategies are never
+            // frozen out, they just vote at par.
+            let votes = vec![
+                vote(SignalType::Buy, 0.7, "new_a"),
+                vote(SignalType::Buy, 0.7, "new_b"),
+                vote(SignalType::Sell, 0.7, "new_c"),
+            ];
+            let neutral = |_: &str| 0.5_f64;
+
+            let off = resolve_consensus(&votes, 2, 0.6, OFF).expect("off consensus");
+            let on = resolve_consensus(&votes, 2, 0.6, Some(neutral)).expect("on consensus");
+
+            assert_eq!(off.0, on.0, "decision must match");
+            assert!(
+                (off.1 - on.1).abs() < EPS,
+                "confidence must match: {} vs {}",
+                off.1,
+                on.1
+            );
+            assert_eq!(off.2, on.2, "contributor set must match");
+            // And concretely: buy wins 2/3 ≥ 0.6, confidence = mean = 0.7.
+            assert_eq!(on.0, SignalType::Buy);
+            assert!((on.1 - 0.7).abs() < EPS);
+        }
+
+        #[test]
+        fn on_count_gate_still_enforced() {
+            // A single sky-high-affinity strategy must NOT manufacture consensus
+            // when min_strategies = 2. Affinity reweights; it never lowers the
+            // bar on how many distinct strategies must agree.
+            let votes = vec![
+                vote(SignalType::Buy, 0.99, "whale"),
+                vote(SignalType::Sell, 0.4, "minnow"),
+            ];
+            let weights = |name: &str| -> f64 { if name == "whale" { 0.99 } else { 0.5 } };
+            assert!(
+                resolve_consensus(&votes, 2, 0.5, Some(weights)).is_none(),
+                "count gate (need 2 agreeing strategies) must hold under ON"
+            );
+        }
+
+        #[test]
+        fn on_weighted_agreement_gate_blocks_low_share() {
+            // Buy has the count (3) and the higher weighted score, but the
+            // weighted share of the *winning* side is below min_agreement
+            // because the opposing low-affinity votes still carry neutral mass.
+            // Use a high agreement bar to force a Hold.
+            let votes = vec![
+                vote(SignalType::Buy, 0.7, "b1"),
+                vote(SignalType::Buy, 0.7, "b2"),
+                vote(SignalType::Buy, 0.7, "b3"),
+                vote(SignalType::Sell, 0.7, "s1"),
+                vote(SignalType::Sell, 0.7, "s2"),
+            ];
+            // All neutral → weighted share for buy = 3/5 = 0.6.
+            let neutral = |_: &str| 0.5_f64;
+            // Require 0.7 weighted agreement → buy's 0.6 share fails → Hold.
+            assert!(
+                resolve_consensus(&votes, 2, 0.7, Some(neutral)).is_none(),
+                "weighted agreement gate must block a sub-threshold winning share"
+            );
+            // Sanity: a 0.6 bar lets it through as Buy.
+            let (side, _, _) =
+                resolve_consensus(&votes, 2, 0.6, Some(neutral)).expect("consensus at 0.6");
+            assert_eq!(side, SignalType::Buy);
+        }
+
+        #[test]
+        fn on_winning_side_falls_back_when_weighted_leader_misses_gate() {
+            // Buy has the higher weighted score but only ONE strategy, so it
+            // fails the count gate; sell has two agreeing strategies and should
+            // be selected via the fallback cascade rather than dropping to Hold.
+            let votes = vec![
+                vote(SignalType::Buy, 0.95, "solo_star"),
+                vote(SignalType::Sell, 0.7, "pair_a"),
+                vote(SignalType::Sell, 0.7, "pair_b"),
+            ];
+            let weights = |name: &str| -> f64 { if name == "solo_star" { 0.95 } else { 0.5 } };
+            // Weighted scores: buy = 0.95*0.95 = 0.9025 (leads), sell = 0.7.
+            // Buy leads the score race but fails the count gate (1 < 2); sell
+            // clears count (2) and its weighted share 0.7/1.6025 ≈ 0.437, so a
+            // 0.4 agreement bar lets the fallback land on sell instead of Hold.
+            let (side, _, used) =
+                resolve_consensus(&votes, 2, 0.4, Some(weights)).expect("fallback consensus");
+            assert_eq!(
+                side,
+                SignalType::Sell,
+                "fall back to the gate-clearing side"
+            );
+            assert_eq!(used.len(), 2);
+        }
     }
 }
