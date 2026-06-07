@@ -40,7 +40,9 @@ pub use position_events::{
 };
 pub use session_metrics::{SessionMetrics, SessionMetricsClient};
 pub use signal::{Signal, SignalBus, SignalType};
-pub use state::{AffinityRecorder, JanusState, LogLevelController, ServiceState};
+pub use state::{
+    AffinityRecorder, GateOutcomeRecorder, JanusState, LogLevelController, ServiceState,
+};
 pub use supervisor::{
     BackoffConfig, JanusService, JanusSupervisor, RestartPolicy, ServicePhase, SupervisorConfig,
     SupervisorMetrics,

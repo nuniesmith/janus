@@ -1112,6 +1112,14 @@ async fn position_close_handler(
         None => false,
     };
 
+    // Feed every realized close into the execution gate's consecutive-loss
+    // breaker (base-asset keyed, to match the gate's evaluation key). Unlike
+    // affinity this is unconditional — the breaker counts losses per asset, not
+    // per strategy. No-op if no recorder is installed (e.g. API-only deploys).
+    let gate_recorded = state
+        .record_gate_outcome(base_asset(&outcome.symbol), outcome.is_winner())
+        .await;
+
     info!(
         symbol = %outcome.symbol,
         side = ?outcome.side,
@@ -1126,6 +1134,7 @@ async fn position_close_handler(
         position_id = outcome.position_id.as_deref().unwrap_or(""),
         persisted = store.is_outcomes_enabled(),
         affinity_recorded = recorded,
+        gate_recorded,
         "position close received"
     );
     store.record_outcome(&outcome).await;
