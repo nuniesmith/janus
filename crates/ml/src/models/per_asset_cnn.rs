@@ -183,8 +183,11 @@ impl<B: Backend> ConvBlock<B> {
 // Asset encoder: 4 residual blocks (+SE) → dual global pool → projection
 // ---------------------------------------------------------------------------
 
+/// Shared convolutional backbone. Used by both [`PerAssetCnn`] and (via the
+/// `super::master_cnn`) `MasterCnn`, mirroring the single `_AssetEncoder` class
+/// reused by both Python models.
 #[derive(Debug)]
-struct AssetEncoder<B: Backend> {
+pub(crate) struct AssetEncoder<B: Backend> {
     block1: ConvBlock<B>,
     se1: SeBlock<B>,
     block2: ConvBlock<B>,
@@ -197,7 +200,7 @@ struct AssetEncoder<B: Backend> {
 }
 
 impl<B: Backend> AssetEncoder<B> {
-    fn new(n_features: usize, embedding_dim: usize, device: &B::Device) -> Self {
+    pub(crate) fn new(n_features: usize, embedding_dim: usize, device: &B::Device) -> Self {
         let (c1, c2) = (PerAssetCnnConfig::C1, PerAssetCnnConfig::C2);
         Self {
             block1: ConvBlock::new(n_features, c1, 3, 1, device),
@@ -214,7 +217,7 @@ impl<B: Backend> AssetEncoder<B> {
         }
     }
 
-    fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 2> {
+    pub(crate) fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 2> {
         let x = self.se1.forward(self.block1.forward(x));
         let x = self.se2.forward(self.block2.forward(x));
         let x = self.se3.forward(self.block3.forward(x));
@@ -224,6 +227,112 @@ impl<B: Backend> AssetEncoder<B> {
         let max = x.max_dim(2).reshape([b, c]);
         let pooled = Tensor::cat(vec![avg, max], 1); // (b, 2c)
         activation::relu(self.pool_proj.forward(pooled)) // (b, emb)
+    }
+
+    /// Append the encoder's weights (keys prefixed `encoder.`) to `w`.
+    pub(crate) fn extract_into(&self, w: &mut WeightMap) {
+        let blocks = [
+            (&self.block1, &self.se1, 1usize),
+            (&self.block2, &self.se2, 2),
+            (&self.block3, &self.se3, 3),
+            (&self.block4, &self.se4, 4),
+        ];
+        for (block, se, i) in blocks {
+            w.push(st3(
+                &format!("encoder.block{i}.conv.weight"),
+                &block.conv.weight.val(),
+            ));
+            w.push(st1(
+                &format!("encoder.block{i}.bn.gamma"),
+                &block.bn.gamma.val(),
+            ));
+            w.push(st1(
+                &format!("encoder.block{i}.bn.beta"),
+                &block.bn.beta.val(),
+            ));
+            w.push(st1(
+                &format!("encoder.block{i}.bn.running_mean"),
+                &block.bn.running_mean.value(),
+            ));
+            w.push(st1(
+                &format!("encoder.block{i}.bn.running_var"),
+                &block.bn.running_var.value(),
+            ));
+            if let Some(skip) = &block.skip {
+                w.push(st3(
+                    &format!("encoder.block{i}.skip.weight"),
+                    &skip.weight.val(),
+                ));
+            }
+            w.push(st2(
+                &format!("encoder.se{i}.fc1.weight"),
+                &se.fc1.weight.val(),
+            ));
+            w.push(st2(
+                &format!("encoder.se{i}.fc2.weight"),
+                &se.fc2.weight.val(),
+            ));
+        }
+        w.push(st2(
+            "encoder.pool_proj.weight",
+            &self.pool_proj.weight.val(),
+        ));
+    }
+
+    /// Overwrite the encoder's weights from a name→tensor map.
+    pub(crate) fn apply(&mut self, map: &HashMap<&str, &SerializedTensor>, device: &B::Device) {
+        let mut blocks = [
+            (&mut self.block1, &mut self.se1, 1usize),
+            (&mut self.block2, &mut self.se2, 2),
+            (&mut self.block3, &mut self.se3, 3),
+            (&mut self.block4, &mut self.se4, 4),
+        ];
+        for (block, se, i) in blocks.iter_mut() {
+            let i = *i;
+            set_conv(
+                &mut block.conv,
+                map.get(format!("encoder.block{i}.conv.weight").as_str()),
+                device,
+            );
+            set_param1(
+                &mut block.bn.gamma,
+                map.get(format!("encoder.block{i}.bn.gamma").as_str()),
+                device,
+            );
+            set_param1(
+                &mut block.bn.beta,
+                map.get(format!("encoder.block{i}.bn.beta").as_str()),
+                device,
+            );
+            if let Some(st) = map.get(format!("encoder.block{i}.bn.running_mean").as_str()) {
+                block.bn.running_mean = RunningState::new(t1(st, device));
+            }
+            if let Some(st) = map.get(format!("encoder.block{i}.bn.running_var").as_str()) {
+                block.bn.running_var = RunningState::new(t1(st, device));
+            }
+            if let Some(skip) = block.skip.as_mut() {
+                set_conv(
+                    skip,
+                    map.get(format!("encoder.block{i}.skip.weight").as_str()),
+                    device,
+                );
+            }
+            set_linear_w(
+                &mut se.fc1,
+                map.get(format!("encoder.se{i}.fc1.weight").as_str()),
+                device,
+            );
+            set_linear_w(
+                &mut se.fc2,
+                map.get(format!("encoder.se{i}.fc2.weight").as_str()),
+                device,
+            );
+        }
+        set_linear_w(
+            &mut self.pool_proj,
+            map.get("encoder.pool_proj.weight"),
+            device,
+        );
     }
 }
 
@@ -277,52 +386,7 @@ impl<B: Backend> PerAssetCnn<B> {
     /// layout: Linear weights `[in, out]`, Conv weights `[out, in, k]`).
     pub fn extract_weights(&self) -> WeightMap {
         let mut w = Vec::new();
-        let blocks = [
-            (&self.encoder.block1, &self.encoder.se1, 1usize),
-            (&self.encoder.block2, &self.encoder.se2, 2),
-            (&self.encoder.block3, &self.encoder.se3, 3),
-            (&self.encoder.block4, &self.encoder.se4, 4),
-        ];
-        for (block, se, i) in blocks {
-            w.push(st3(
-                &format!("encoder.block{i}.conv.weight"),
-                &block.conv.weight.val(),
-            ));
-            w.push(st1(
-                &format!("encoder.block{i}.bn.gamma"),
-                &block.bn.gamma.val(),
-            ));
-            w.push(st1(
-                &format!("encoder.block{i}.bn.beta"),
-                &block.bn.beta.val(),
-            ));
-            w.push(st1(
-                &format!("encoder.block{i}.bn.running_mean"),
-                &block.bn.running_mean.value(),
-            ));
-            w.push(st1(
-                &format!("encoder.block{i}.bn.running_var"),
-                &block.bn.running_var.value(),
-            ));
-            if let Some(skip) = &block.skip {
-                w.push(st3(
-                    &format!("encoder.block{i}.skip.weight"),
-                    &skip.weight.val(),
-                ));
-            }
-            w.push(st2(
-                &format!("encoder.se{i}.fc1.weight"),
-                &se.fc1.weight.val(),
-            ));
-            w.push(st2(
-                &format!("encoder.se{i}.fc2.weight"),
-                &se.fc2.weight.val(),
-            ));
-        }
-        w.push(st2(
-            "encoder.pool_proj.weight",
-            &self.encoder.pool_proj.weight.val(),
-        ));
+        self.encoder.extract_into(&mut w);
         w.push(st2("head.fc1.weight", &self.head_fc1.weight.val()));
         w.push(st1(
             "head.fc1.bias",
@@ -340,59 +404,7 @@ impl<B: Backend> PerAssetCnn<B> {
     pub fn apply_weights(&mut self, weights: &WeightMap, device: &B::Device) {
         let map: HashMap<&str, &SerializedTensor> =
             weights.iter().map(|st| (st.name.as_str(), st)).collect();
-
-        let mut blocks = [
-            (&mut self.encoder.block1, &mut self.encoder.se1, 1usize),
-            (&mut self.encoder.block2, &mut self.encoder.se2, 2),
-            (&mut self.encoder.block3, &mut self.encoder.se3, 3),
-            (&mut self.encoder.block4, &mut self.encoder.se4, 4),
-        ];
-        for (block, se, i) in blocks.iter_mut() {
-            let i = *i;
-            set_conv(
-                &mut block.conv,
-                map.get(format!("encoder.block{i}.conv.weight").as_str()),
-                device,
-            );
-            set_param1(
-                &mut block.bn.gamma,
-                map.get(format!("encoder.block{i}.bn.gamma").as_str()),
-                device,
-            );
-            set_param1(
-                &mut block.bn.beta,
-                map.get(format!("encoder.block{i}.bn.beta").as_str()),
-                device,
-            );
-            if let Some(st) = map.get(format!("encoder.block{i}.bn.running_mean").as_str()) {
-                block.bn.running_mean = RunningState::new(t1(st, device));
-            }
-            if let Some(st) = map.get(format!("encoder.block{i}.bn.running_var").as_str()) {
-                block.bn.running_var = RunningState::new(t1(st, device));
-            }
-            if let Some(skip) = block.skip.as_mut() {
-                set_conv(
-                    skip,
-                    map.get(format!("encoder.block{i}.skip.weight").as_str()),
-                    device,
-                );
-            }
-            set_linear_w(
-                &mut se.fc1,
-                map.get(format!("encoder.se{i}.fc1.weight").as_str()),
-                device,
-            );
-            set_linear_w(
-                &mut se.fc2,
-                map.get(format!("encoder.se{i}.fc2.weight").as_str()),
-                device,
-            );
-        }
-        set_linear_w(
-            &mut self.encoder.pool_proj,
-            map.get("encoder.pool_proj.weight"),
-            device,
-        );
+        self.encoder.apply(&map, device);
         set_linear_w(&mut self.head_fc1, map.get("head.fc1.weight"), device);
         set_linear_b(&mut self.head_fc1, map.get("head.fc1.bias"), device);
         set_linear_w(&mut self.head_fc2, map.get("head.fc2.weight"), device);
@@ -404,14 +416,14 @@ impl<B: Backend> PerAssetCnn<B> {
 // Tensor (de)serialisation helpers
 // ---------------------------------------------------------------------------
 
-fn st1<B: Backend>(name: &str, t: &Tensor<B, 1>) -> SerializedTensor {
+pub(crate) fn st1<B: Backend>(name: &str, t: &Tensor<B, 1>) -> SerializedTensor {
     SerializedTensor {
         name: name.into(),
         shape: t.dims().to_vec(),
         data: t.to_data().to_vec().unwrap(),
     }
 }
-fn st2<B: Backend>(name: &str, t: &Tensor<B, 2>) -> SerializedTensor {
+pub(crate) fn st2<B: Backend>(name: &str, t: &Tensor<B, 2>) -> SerializedTensor {
     SerializedTensor {
         name: name.into(),
         shape: t.dims().to_vec(),
@@ -445,7 +457,7 @@ fn set_conv<B: Backend>(conv: &mut Conv1d<B>, st: Option<&&SerializedTensor>, de
         conv.weight = Param::initialized(conv.weight.id, t3(st, device));
     }
 }
-fn set_linear_w<B: Backend>(
+pub(crate) fn set_linear_w<B: Backend>(
     lin: &mut Linear<B>,
     st: Option<&&SerializedTensor>,
     device: &B::Device,
@@ -454,7 +466,7 @@ fn set_linear_w<B: Backend>(
         lin.weight = Param::initialized(lin.weight.id, t2(st, device));
     }
 }
-fn set_linear_b<B: Backend>(
+pub(crate) fn set_linear_b<B: Backend>(
     lin: &mut Linear<B>,
     st: Option<&&SerializedTensor>,
     device: &B::Device,
@@ -463,7 +475,7 @@ fn set_linear_b<B: Backend>(
         *bias = Param::initialized(bias.id, t1(st, device));
     }
 }
-fn set_param1<B: Backend>(
+pub(crate) fn set_param1<B: Backend>(
     param: &mut Param<Tensor<B, 1>>,
     st: Option<&&SerializedTensor>,
     device: &B::Device,
@@ -477,25 +489,28 @@ fn set_param1<B: Backend>(
 // Independent reference forward pass (raw f32) — the parity oracle
 // ---------------------------------------------------------------------------
 
-/// Compute logits for a **single** sample with an independent, plain-`f32`
-/// implementation of the same architecture, reading weights from a
-/// [`WeightMap`] in burn-native layout. This is deliberately written without
-/// the `burn` neural-network modules so that agreement with [`PerAssetCnn`]
-/// is a genuine cross-check, and it doubles as the executable spec a
-/// PyTorch→burn golden must satisfy.
+/// Independent, plain-`f32` reference for the shared [`AssetEncoder`]. Reads
+/// weights (keys prefixed `encoder.`) from a name→tensor map and returns the
+/// `embedding_dim`-length embedding for one `(n_features, window)` sample.
 ///
-/// * `input`: row-major `(n_features, window)` slice for one sample.
-/// * returns `n_classes` logits.
-pub fn reference_logits(weights: &WeightMap, input: &[f32], cfg: &PerAssetCnnConfig) -> Vec<f32> {
-    let map: HashMap<&str, &SerializedTensor> =
-        weights.iter().map(|st| (st.name.as_str(), st)).collect();
+/// Written without the `burn` neural-network modules so that agreement with the
+/// `burn` encoder is a genuine cross-check; reused by both [`reference_logits`]
+/// and the MasterCnn reference, and the executable spec a PyTorch golden must
+/// satisfy.
+pub(crate) fn reference_encoder(
+    map: &HashMap<&str, &SerializedTensor>,
+    input: &[f32],
+    n_features: usize,
+    window: usize,
+    embedding_dim: usize,
+) -> Vec<f32> {
     let get = |name: &str| -> &SerializedTensor {
         map.get(name)
             .unwrap_or_else(|| panic!("missing weight {name}"))
     };
 
-    let l = cfg.window;
-    let emb = cfg.embedding_dim;
+    let l = window;
+    let emb = embedding_dim;
     let (c1, c2) = (PerAssetCnnConfig::C1, PerAssetCnnConfig::C2);
 
     // conv1d (stride 1, zero pad, dilation) — w: [out,in,k]; x: (in,L) → (out,L)
@@ -603,7 +618,7 @@ pub fn reference_logits(weights: &WeightMap, input: &[f32], cfg: &PerAssetCnnCon
         main
     };
 
-    let x = block(input, cfg.n_features, c1, 1, 1);
+    let x = block(input, n_features, c1, 1, 1);
     let x = block(&x, c1, c2, 2, 2);
     let x = block(&x, c2, emb, 4, 3);
     let x = block(&x, emb, emb, 8, 4);
@@ -630,6 +645,22 @@ pub fn reference_logits(weights: &WeightMap, input: &[f32], cfg: &PerAssetCnnCon
         }
         embedding[o] = acc.max(0.0); // ReLU
     }
+
+    embedding
+}
+
+/// Independent raw-`f32` reference logits for one `(n_features, window)` sample.
+/// Cross-checks [`PerAssetCnn`]; also the executable spec a PyTorch golden must
+/// satisfy.
+pub fn reference_logits(weights: &WeightMap, input: &[f32], cfg: &PerAssetCnnConfig) -> Vec<f32> {
+    let map: HashMap<&str, &SerializedTensor> =
+        weights.iter().map(|st| (st.name.as_str(), st)).collect();
+    let embedding = reference_encoder(&map, input, cfg.n_features, cfg.window, cfg.embedding_dim);
+    let get = |name: &str| -> &SerializedTensor {
+        map.get(name)
+            .unwrap_or_else(|| panic!("missing weight {name}"))
+    };
+    let emb = cfg.embedding_dim;
 
     // head: Linear(emb→32) → relu → Linear(32→n_classes)
     let (w1, b1) = (&get("head.fc1.weight").data, &get("head.fc1.bias").data); // [emb,32]
