@@ -46,6 +46,7 @@ pub mod cnn_inference;
 pub mod execution;
 pub mod features;
 pub mod gate_integration;
+pub mod gate_recorder;
 pub mod indicators;
 pub mod inference;
 pub mod metrics;
@@ -1380,14 +1381,27 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
             // Unified execution-gate (Track C). Advisory by default; consolidates
             // the entry-filter chain ported from Ruby. Blocks the execution submit
             // only under JANUS_GATE_ENFORCE (symmetric with prop-firm / risk above).
-            let mut forward_gate = crate::gate_integration::ForwardGate::from_env();
-            if forward_gate.enforcing() {
+            // Shared (Arc<RwLock>) so the API position-close path can feed the
+            // consecutive-loss breaker via the installed GateOutcomeRecorder.
+            let forward_gate = Arc::new(tokio::sync::RwLock::new(
+                crate::gate_integration::ForwardGate::from_env(),
+            ));
+            let gate_enforcing = forward_gate.read().await.enforcing();
+            if gate_enforcing {
                 info!("execution gate: ENFORCING (gate-blocked live entries will be suppressed)");
             } else {
                 info!(
                     "execution gate: advisory (logs + `gate` metadata only; set JANUS_GATE_ENFORCE=1 to block)"
                 );
             }
+            // Install the close→breaker recorder so /api/v1/positions/close feeds
+            // the gate's consecutive-loss breaker in real time.
+            state_clone
+                .set_gate_outcome_recorder(Box::new(
+                    crate::gate_recorder::GateBreakerRecorder::new(Arc::clone(&forward_gate)),
+                ))
+                .await;
+            info!("🧠✅ Gate outcome recorder installed (live close→breaker feedback)");
             // Per-symbol previous close, for the close-to-close log returns fed to
             // the gate's correlation guard.
             let mut prev_close: HashMap<String, f64> = HashMap::new();
@@ -1461,6 +1475,10 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                                 }
 
                                 let symbol_str = format!("{}", kline.symbol);
+                                // Base-asset key for the execution gate (breaker +
+                                // correlation + metrics) so it matches the close-feed
+                                // key (`base_asset` of the close symbol).
+                                let gate_asset = janus_core::base_asset(&symbol_str).to_string();
                                 let analyzer_key = format!("{}:{}", symbol_str, kline.interval);
 
                                 // Get or create analyzer for this symbol+interval
@@ -1509,7 +1527,9 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                                     && close > 0.0
                                 {
                                     forward_gate
-                                        .update_correlation(&symbol_str, (close / pc).ln());
+                                        .write()
+                                        .await
+                                        .update_correlation(&gate_asset, (close / pc).ln());
                                 }
                                 prev_close.insert(symbol_str.clone(), close);
 
@@ -1953,10 +1973,14 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                                             .duration_since(std::time::UNIX_EPOCH)
                                             .map(|d| d.as_secs())
                                             .unwrap_or(0);
-                                        // Symbols with open positions, for the correlation gate.
+                                        // Open positions as base-asset keys, for the
+                                        // correlation gate (matches the gate's keying).
                                         let open_assets: Vec<String> = {
                                             let pf = portfolio.read().await;
-                                            pf.positions.keys().cloned().collect()
+                                            pf.positions
+                                                .keys()
+                                                .map(|s| janus_core::base_asset(s).to_string())
+                                                .collect()
                                         };
                                         // AO / volatility percentile / quality from the engine.
                                         let producers = gate_producers.snapshot(&symbol_str);
@@ -1969,8 +1993,8 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                                                 open_assets,
                                                 producers,
                                             );
-                                        Some(forward_gate.evaluate_entry(
-                                            &symbol_str,
+                                        Some(forward_gate.write().await.evaluate_entry(
+                                            &gate_asset,
                                             side,
                                             false,
                                             &ctx,

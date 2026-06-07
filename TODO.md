@@ -108,7 +108,7 @@ parity goldens. (Supersedes the P0 "run the probe" item.)
 - [ ] **Flip the gate** only once parity holds: `ENABLE_CNN_INFERENCE` →
       `ENABLE_BRAIN_RUNTIME`, on a shadow basis.
 
-### Track C — Safety: execution gate + risk · RUST_MIGRATION Phase 3 · ◀ in progress
+### Track C — Safety: execution gate + risk · RUST_MIGRATION Phase 3 · ◀ all 9 gates live (advisory)
 - [x] **Port the 9-gate `ExecutionGate`** → `crates/execution-gate` (faithful
       chain + `ConsecutiveLossBreaker` + `CorrelationGuard` + `AdaptiveThreshold`;
       pure/synchronous core; 36 tests + doctest; clippy-clean). 2026-06-07.
@@ -146,9 +146,14 @@ parity goldens. (Supersedes the P0 "run the probe" item.)
 - [ ] **Quality refinement (optional)** — replace the momentum/wave quality
       proxy with `indicators-ta`'s `compute_signal` confluence/`bull_score` once
       the `LiquidityProfile` + `ConfluenceEngine` inputs are assembled per bar.
-- [ ] **Close the loop** — call `ExecutionGate::record_trade_outcome` on close
-      events so the breaker + adaptive threshold actually engage (pairs with the
-      P1 "feed closed-trade outcomes" item below).
+- [x] **Close the loop (breaker close-feed) done — all 9 gates now act on real
+      data.** A `GateOutcomeRecorder` trait-object slot on `JanusState` (mirrors
+      `AffinityRecorder`) lets the `/api/v1/positions/close` handler feed every
+      realized close into the gate's consecutive-loss breaker; the gate is shared
+      as `Arc<RwLock<ForwardGate>>` and keyed by base-asset on both sides so the
+      close-feed matches the eval key. (The adaptive threshold rides the same
+      `record_trade_outcome` path but stays unconfigured for now — a tuning
+      follow-up.)
 - [ ] **Redis persistence adapter** — a thin layer mirroring the gate's in-memory
       breaker/threshold state + block counters to Redis
       (`gate_blocks:{asset}:{reason}`, `gate_evals:{asset}` — labels already

@@ -72,6 +72,21 @@ pub trait AffinityRecorder: Send + Sync {
     );
 }
 
+/// A type-erased interface for recording a realized trade outcome into the
+/// execution gate's consecutive-loss circuit breaker.
+///
+/// Like [`AffinityRecorder`], this lets the API's position-close handler feed
+/// the breaker (which lives in the forward service's execution gate) without
+/// `janus-core` / `janus-api` depending on the gate crate. The forward service
+/// installs an adapter via
+/// [`set_gate_outcome_recorder`](JanusState::set_gate_outcome_recorder).
+#[async_trait::async_trait]
+pub trait GateOutcomeRecorder: Send + Sync {
+    /// Record a closed trade for `asset` (base-asset keyed). `is_win` resets or
+    /// (on a loss streak) trips the breaker; `now_secs` is the current unix time.
+    async fn record_outcome(&self, asset: &str, is_win: bool, now_secs: u64);
+}
+
 /// Service lifecycle state — controls whether processing modules are active.
 ///
 /// On startup JANUS enters `Standby`: the API is live but Forward, Backward,
@@ -175,6 +190,13 @@ pub struct JanusState {
     /// deployments), in which case outcomes are persisted but not recorded
     /// live. See [`AffinityRecorder`].
     affinity_recorder: RwLock<Option<Box<dyn AffinityRecorder>>>,
+
+    /// Optional execution-gate outcome recorder.
+    ///
+    /// Installed by the forward service via [`set_gate_outcome_recorder`] so the
+    /// position-close handler can feed closed-trade outcomes into the gate's
+    /// consecutive-loss breaker. `None` until installed. See [`GateOutcomeRecorder`].
+    gate_outcome_recorder: RwLock<Option<Box<dyn GateOutcomeRecorder>>>,
 }
 
 impl JanusState {
@@ -205,6 +227,7 @@ impl JanusState {
             current_regime: RwLock::new(None),
             current_threat: RwLock::new(None),
             affinity_recorder: RwLock::new(None),
+            gate_outcome_recorder: RwLock::new(None),
         })
     }
 
@@ -280,6 +303,36 @@ impl JanusState {
                 recorder
                     .record_trade(strategy, asset, pnl, is_winner, rr_ratio)
                     .await;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Install the execution-gate outcome recorder (forward service). Replaces
+    /// any previously installed recorder.
+    pub async fn set_gate_outcome_recorder(&self, recorder: Box<dyn GateOutcomeRecorder>) {
+        let mut guard = self.gate_outcome_recorder.write().await;
+        *guard = Some(recorder);
+    }
+
+    /// Whether a gate outcome recorder is installed (for diagnostics / logging).
+    pub async fn has_gate_outcome_recorder(&self) -> bool {
+        self.gate_outcome_recorder.read().await.is_some()
+    }
+
+    /// Record a closed trade into the execution-gate breaker, if a recorder is
+    /// installed. No-op otherwise. Returns whether the outcome was recorded.
+    /// `asset` should be base-asset keyed to match the gate's evaluation key.
+    pub async fn record_gate_outcome(&self, asset: &str, is_win: bool) -> bool {
+        let guard = self.gate_outcome_recorder.read().await;
+        match guard.as_ref() {
+            Some(recorder) => {
+                let now_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                recorder.record_outcome(asset, is_win, now_secs).await;
                 true
             }
             None => false,
@@ -767,5 +820,46 @@ mod tests {
                 None
             )
         );
+    }
+
+    /// A [`GateOutcomeRecorder`] that records each call for assertions.
+    struct CountingGateRecorder {
+        calls: std::sync::Arc<std::sync::Mutex<Vec<(String, bool, u64)>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl GateOutcomeRecorder for CountingGateRecorder {
+        async fn record_outcome(&self, asset: &str, is_win: bool, now_secs: u64) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((asset.to_string(), is_win, now_secs));
+        }
+    }
+
+    #[tokio::test]
+    async fn record_gate_outcome_no_op_without_recorder() {
+        let state = JanusState::new(Config::default()).await.unwrap();
+        assert!(!state.has_gate_outcome_recorder().await);
+        // No recorder installed → returns false, doesn't panic.
+        assert!(!state.record_gate_outcome("BTC", false).await);
+    }
+
+    #[tokio::test]
+    async fn record_gate_outcome_reaches_installed_recorder() {
+        let state = JanusState::new(Config::default()).await.unwrap();
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        state
+            .set_gate_outcome_recorder(Box::new(CountingGateRecorder {
+                calls: calls.clone(),
+            }))
+            .await;
+        assert!(state.has_gate_outcome_recorder().await);
+        assert!(state.record_gate_outcome("BTC", false).await);
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "BTC");
+        assert!(!calls[0].1);
     }
 }
