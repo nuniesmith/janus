@@ -121,12 +121,18 @@ parity goldens. (Supersedes the P0 "run the probe" item.)
       preserving no-autonomous-execution). Stage 1 feeds the `RiskManager` verdict
       + confidence; the remaining gate inputs are inert pass-throughs until the
       next two items land (so the gate never emits a spurious block).
-- [ ] **Producer plumbing (Stage 2)** — feed the gate real `vol_pct`, `quality`,
-      `ao`, `tp_pct`/fees, the `cnn_result` vote (currently folded into the
-      strategy consensus — thread it out), and `open_assets` + per-tick
-      correlation log-returns. `ForwardGate::build_context` /
-      `update_correlation` already take these; today vol/quality/AO/fee/CNN/
-      correlation gates are inert pass-throughs.
+- [x] **Producer plumbing — Stage 2a (CNN + correlation) done.** The live loop
+      now captures the CNN vote (separate from its consensus contribution) and
+      feeds it to the gate's `cnn_agreement` + `cnn_confidence` checks, and feeds
+      the correlation guard per-candle close-to-close log returns + the open-
+      position symbols from `PortfolioState`. With the guard enabled in
+      `ForwardGate`, the `correlation` gate is live. (CNN gates stay inert until
+      `ENABLE_CNN_INFERENCE`.)
+- [ ] **Producer plumbing — Stage 2b (remaining producers)** — feed real
+      `vol_pct`, `quality`, `ao` (no Awesome-Oscillator indicator exists yet —
+      build one), and `tp_pct`/fees so the vol / quality / AO / fee gates leave
+      pass-through. These need new producers in the analysis path, not just
+      threading.
 - [ ] **Close the loop** — call `ExecutionGate::record_trade_outcome` on close
       events so the breaker + adaptive threshold actually engage (pairs with the
       P1 "feed closed-trade outcomes" item below).

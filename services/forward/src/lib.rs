@@ -1388,6 +1388,9 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                     "execution gate: advisory (logs + `gate` metadata only; set JANUS_GATE_ENFORCE=1 to block)"
                 );
             }
+            // Per-symbol previous close, for the close-to-close log returns fed to
+            // the gate's correlation guard.
+            let mut prev_close: HashMap<String, f64> = HashMap::new();
 
             let mut klines_processed: u64 = 0;
             let mut signals_generated: u64 = 0;
@@ -1495,6 +1498,18 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                                     );
                                 }
 
+                                // Feed the close-to-close log return to the gate's
+                                // correlation guard so the correlation gate has history
+                                // for open-position clustering (Track C).
+                                if let Some(&pc) = prev_close.get(&symbol_str)
+                                    && pc > 0.0
+                                    && close > 0.0
+                                {
+                                    forward_gate
+                                        .update_correlation(&symbol_str, (close / pc).ln());
+                                }
+                                prev_close.insert(symbol_str.clone(), close);
+
                                 klines_processed += 1;
 
                                 // Run full indicator analysis
@@ -1511,6 +1526,10 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                                 // indicator analysis and produce a consensus.
 
                                 let mut strategy_votes: Vec<(janus_core::SignalType, f64, String)> = Vec::new();
+                                // CNN vote captured for the execution gate (agreement +
+                                // confidence) — independent of its consensus contribution.
+                                let mut cnn_gate_vote: Option<(crate::gate_integration::Side, f64)> =
+                                    None;
 
                                 // Optional gated CNN vote — only when
                                 // ENABLE_CNN_INFERENCE is set and a champion loaded.
@@ -1525,6 +1544,15 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                                         buf,
                                         janus_ml::features::per_asset_cnn::LiveState::default(),
                                     ) {
+                                        cnn_gate_vote = match vote.0 {
+                                            janus_core::SignalType::Buy => {
+                                                Some((crate::gate_integration::Side::Buy, vote.1))
+                                            }
+                                            janus_core::SignalType::Sell => {
+                                                Some((crate::gate_integration::Side::Sell, vote.1))
+                                            }
+                                            _ => None,
+                                        };
                                         strategy_votes.push(vote);
                                     }
                                 }
@@ -1887,11 +1915,12 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                                 // Portfolio-aware RiskManager verdict (advisory).
                                 let signal = signal.with_metadata("risk_check", &risk_check);
 
-                                // Unified execution-gate verdict (Track C, advisory).
-                                // Stage 1 feeds the RiskManager verdict + confidence;
-                                // the CNN / vol / quality / AO / fee / correlation
-                                // inputs are follow-ups (inert pass-through for now),
-                                // so `risk` is the only gate that can act today.
+                                // Unified execution-gate verdict (Track C). Advisory
+                                // unless JANUS_GATE_ENFORCE. Feeds the RiskManager
+                                // verdict (risk), the CNN vote (agreement + confidence),
+                                // and open positions + per-tick returns (correlation).
+                                // vol / quality / AO / fee + the breaker close-feed
+                                // remain follow-ups (inert until fed).
                                 let gate_side = match final_type {
                                     janus_core::SignalType::Buy => {
                                         Some(crate::gate_integration::Side::Buy)
@@ -1907,13 +1936,18 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                                             .duration_since(std::time::UNIX_EPOCH)
                                             .map(|d| d.as_secs())
                                             .unwrap_or(0);
+                                        // Symbols with open positions, for the correlation gate.
+                                        let open_assets: Vec<String> = {
+                                            let pf = portfolio.read().await;
+                                            pf.positions.keys().cloned().collect()
+                                        };
                                         let ctx =
                                             crate::gate_integration::ForwardGate::build_context(
                                                 side,
                                                 &risk_check,
                                                 min_confidence,
-                                                None,
-                                                Vec::new(),
+                                                cnn_gate_vote,
+                                                open_assets,
                                             );
                                         Some(forward_gate.evaluate_entry(
                                             &symbol_str,
