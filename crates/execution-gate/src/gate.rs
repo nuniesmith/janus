@@ -7,6 +7,7 @@ use crate::circuit_breaker::ConsecutiveLossBreaker;
 use crate::context::{GateContext, Side};
 use crate::correlation::CorrelationGuard;
 use crate::verdict::GateVerdict;
+use serde::{Deserialize, Serialize};
 
 /// Fee/TP ratio above which an entry is rejected as fee-uneconomic (30%).
 const MAX_FEE_TP_RATIO: f64 = 0.30;
@@ -63,6 +64,31 @@ impl GateMetrics {
         stats.insert("total_evals".to_string(), self.evals(asset));
         stats
     }
+
+    /// Snapshot all counters for export (e.g. mirroring to Redis for Grafana).
+    /// Entries are sorted for deterministic output.
+    pub fn snapshot(&self) -> GateMetricsSnapshot {
+        let mut evals: Vec<(String, u64)> =
+            self.evals.iter().map(|(a, &c)| (a.clone(), c)).collect();
+        evals.sort();
+        let mut blocks: Vec<(String, String, u64)> = self
+            .blocks
+            .iter()
+            .map(|((a, r), &c)| (a.clone(), r.clone(), c))
+            .collect();
+        blocks.sort();
+        GateMetricsSnapshot { evals, blocks }
+    }
+}
+
+/// A point-in-time export of all gate counters, for mirroring to Redis /
+/// Grafana. Produced by [`GateMetrics::snapshot`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GateMetricsSnapshot {
+    /// `(asset, total_evals)`, sorted by asset.
+    pub evals: Vec<(String, u64)>,
+    /// `(asset, reason_label, count)`, sorted.
+    pub blocks: Vec<(String, String, u64)>,
 }
 
 /// Chain-of-responsibility gate for trade entries.
@@ -651,5 +677,13 @@ mod tests {
         let stats = g.metrics.block_stats("btc");
         assert_eq!(stats.get("block_risk"), Some(&2));
         assert_eq!(stats.get("total_evals"), Some(&3));
+
+        // snapshot() mirrors the same counters as sorted vecs for export.
+        let snap = g.metrics.snapshot();
+        assert_eq!(snap.evals, vec![("btc".to_string(), 3)]);
+        assert_eq!(
+            snap.blocks,
+            vec![("btc".to_string(), "block_risk".to_string(), 2)]
+        );
     }
 }

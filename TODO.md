@@ -172,11 +172,14 @@ path to *create* champions from scratch later.
       close-feed matches the eval key. (The adaptive threshold rides the same
       `record_trade_outcome` path but stays unconfigured for now — a tuning
       follow-up.)
-- [ ] **Redis persistence adapter** — a thin layer mirroring the gate's in-memory
-      breaker/threshold state + block counters to Redis
-      (`gate_blocks:{asset}:{reason}`, `gate_evals:{asset}` — labels already
-      wire-compatible) for cross-restart durability + Grafana. Keep it OUT of the
-      gate crate.
+- [x] **Redis observability for the gate counters (Grafana).** Done:
+      `GateMetrics::snapshot()` (gate crate, pure) + a best-effort exporter in
+      `services/forward/src/gate_metrics_redis.rs` that mirrors the block/eval
+      counters to Redis (`{prefix}gate_blocks:{asset}:{reason}`,
+      `{prefix}gate_evals:{asset}`) on a timer. Opt-in via
+      `JANUS_GATE_METRICS_REDIS=1`; no-ops if Redis is absent; Redis I/O stays out
+      of the gate crate. *Still open:* persisting breaker/adaptive-threshold
+      **state** across restarts (durability, vs. the metrics mirroring done here).
 - [ ] **Dedupe the correlation guard** — the gate's parity-faithful
       `CorrelationGuard` (log-returns, 0.7/50/3) vs `jflow-risk`'s
       `CorrelationTracker` (prices, 0.75/100/3). Pick one once the gate is wired.
