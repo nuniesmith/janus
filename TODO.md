@@ -83,9 +83,11 @@ leaving janus's native ingestion (exchange WS → QuestDB) as the only data path
       indicator warmup from a 3-tier (Python → QuestDB → Binance) chain to a
       native 2-tier (QuestDB → Binance) one. This also removes the per-call
       timeout-to-`fks_ruby` that slowed every warmup now that Ruby is gone.
-- [ ] **Retire the registry's Python sync** — `services/registry` still polls
-      `{PYTHON_DATA_SERVICE_URL}/api/registry/*` every 5 min (now always failing).
-      Remove the sync loop; the registry is janus-native.
+- [x] **Retired the registry's Python sync.** Removed the `sync_from_python_loop`
+      background task (+ `sync_once` / `push_annotations_to_python` /
+      `sync_python_services` / `parse_python_asset`, ~390 lines) that polled
+      `{PYTHON_DATA_SERVICE_URL}/api/registry/*` every 5 min. The registry is now
+      janus-native. **`PYTHON_DATA_SERVICE_URL` is gone from all janus code.**
 - [ ] **Native historical source for non-crypto** — CME futures (MGC, MES, …)
       were only served by the retired Python service; QuestDB/Binance can't
       backfill them. Add a native source (e.g. a Massive integration) or scope
