@@ -30,6 +30,7 @@
 //! ```
 
 pub mod normalizer;
+pub mod per_asset_cnn;
 pub mod price;
 pub mod technical;
 pub mod volume;
