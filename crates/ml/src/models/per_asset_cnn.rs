@@ -44,7 +44,9 @@ use burn_nn::conv::{Conv1d, Conv1dConfig};
 use burn_nn::{BatchNorm, BatchNormConfig, Linear, LinearConfig, PaddingConfig1d};
 use serde::{Deserialize, Serialize};
 
-use super::{SerializedTensor, WeightMap};
+use super::{ModelMetadata, ModelRecord, SerializedTensor, WeightMap};
+use crate::error::{MLError, Result};
+use std::path::Path;
 
 /// Default input feature channels (must match `ml/features.py`).
 pub const N_FEATURES: usize = 20;
@@ -410,6 +412,78 @@ impl<B: Backend> PerAssetCnn<B> {
         set_linear_w(&mut self.head_fc2, map.get("head.fc2.weight"), device);
         set_linear_b(&mut self.head_fc2, map.get("head.fc2.bias"), device);
     }
+
+    /// Persist config + weights to `path` (postcard [`ModelRecord`]). This is
+    /// how the forward service loads champions (mirrors `LstmPredictor`).
+    pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+        save_record(
+            path.as_ref(),
+            &self.config,
+            &self.extract_weights(),
+            "per_asset_cnn",
+            self.config.n_features,
+            self.config.n_classes,
+        )
+    }
+
+    /// Load a model persisted by [`save`](Self::save).
+    pub fn load<P: AsRef<Path>>(path: P, device: &B::Device) -> Result<Self> {
+        let (config, weights) = load_record::<PerAssetCnnConfig>(path.as_ref())?;
+        let mut model = Self::new(config, device);
+        if !weights.is_empty() {
+            model.apply_weights(&weights, device);
+        }
+        Ok(model)
+    }
+}
+
+/// Persist a model as a postcard [`ModelRecord`] (config JSON + JSON weight
+/// map). Shared by the burn CNN models so the forward service can load any of
+/// them uniformly.
+pub(crate) fn save_record<C: Serialize>(
+    path: &Path,
+    config: &C,
+    weights: &WeightMap,
+    name: &str,
+    input_size: usize,
+    output_size: usize,
+) -> Result<()> {
+    let weights_json = serde_json::to_vec(weights).map_err(|e| MLError::io_error(e.to_string()))?;
+    let config_json = serde_json::to_string(config)?;
+    let metadata = ModelMetadata::new(
+        name.to_string(),
+        env!("CARGO_PKG_VERSION").to_string(),
+        name.to_string(),
+        input_size,
+        output_size,
+        "cpu".to_string(),
+    );
+    let record = ModelRecord::new(metadata, config_json, weights_json);
+    let bytes = postcard::to_allocvec(&record)?;
+    std::fs::write(path, bytes)
+        .map_err(|e| MLError::io_error(format!("failed to write {path:?}: {e}")))?;
+    Ok(())
+}
+
+/// Load a `(config, weights)` pair persisted by [`save_record`].
+pub(crate) fn load_record<C: serde::de::DeserializeOwned>(path: &Path) -> Result<(C, WeightMap)> {
+    let bytes = std::fs::read(path)
+        .map_err(|e| MLError::io_error(format!("failed to read {path:?}: {e}")))?;
+    let record: ModelRecord<Vec<u8>> = postcard::from_bytes(&bytes)?;
+    if !record.is_compatible() {
+        return Err(MLError::invalid_config(format!(
+            "incompatible model format version: {}",
+            record.format_version
+        )));
+    }
+    let config: C = serde_json::from_str(&record.config)?;
+    let weights: WeightMap = if record.weights.is_empty() {
+        Vec::new()
+    } else {
+        serde_json::from_slice(&record.weights)
+            .map_err(|e| MLError::model_load(format!("failed to deserialise weights: {e}")))?
+    };
+    Ok((config, weights))
 }
 
 // ---------------------------------------------------------------------------
@@ -708,6 +782,36 @@ mod tests {
                 if v > bv { (i, v) } else { (bi, bv) }
             })
             .0
+    }
+
+    #[test]
+    fn save_load_roundtrip() {
+        let device = Default::default();
+        let cfg = PerAssetCnnConfig::default();
+        let model = PerAssetCnn::<CpuBackend>::new(cfg.clone(), &device);
+        let input = Tensor::<CpuBackend, 3>::from_data(
+            TensorData::new(
+                make_input(2, cfg.n_features, cfg.window),
+                [2, cfg.n_features, cfg.window],
+            ),
+            &device,
+        );
+        let before = model
+            .forward(input.clone())
+            .to_data()
+            .to_vec::<f32>()
+            .unwrap();
+
+        let path = std::env::temp_dir().join("per_asset_cnn_roundtrip.bin");
+        model.save(&path).unwrap();
+        let loaded = PerAssetCnn::<CpuBackend>::load(&path, &device).unwrap();
+        let after = loaded.forward(input).to_data().to_vec::<f32>().unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(loaded.config(), model.config());
+        for (a, b) in before.iter().zip(after.iter()) {
+            assert!((a - b).abs() < 1e-6, "save/load mismatch {a} vs {b}");
+        }
     }
 
     #[test]
