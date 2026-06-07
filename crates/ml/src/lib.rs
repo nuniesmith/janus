@@ -59,6 +59,7 @@ pub mod dqn;
 pub mod error;
 pub mod evaluation;
 pub mod features;
+pub mod labeler;
 pub mod models;
 pub mod optimizer;
 pub mod training;
