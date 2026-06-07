@@ -45,6 +45,7 @@ pub mod bybit_compat;
 pub mod cnn_inference;
 pub mod execution;
 pub mod features;
+pub mod gate_integration;
 pub mod indicators;
 pub mod inference;
 pub mod metrics;
@@ -1376,6 +1377,18 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                 );
             }
 
+            // Unified execution-gate (Track C). Advisory by default; consolidates
+            // the entry-filter chain ported from Ruby. Blocks the execution submit
+            // only under JANUS_GATE_ENFORCE (symmetric with prop-firm / risk above).
+            let mut forward_gate = crate::gate_integration::ForwardGate::from_env();
+            if forward_gate.enforcing() {
+                info!("execution gate: ENFORCING (gate-blocked live entries will be suppressed)");
+            } else {
+                info!(
+                    "execution gate: advisory (logs + `gate` metadata only; set JANUS_GATE_ENFORCE=1 to block)"
+                );
+            }
+
             let mut klines_processed: u64 = 0;
             let mut signals_generated: u64 = 0;
             let mut trades_skipped: u64 = 0;
@@ -1874,6 +1887,49 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                                 // Portfolio-aware RiskManager verdict (advisory).
                                 let signal = signal.with_metadata("risk_check", &risk_check);
 
+                                // Unified execution-gate verdict (Track C, advisory).
+                                // Stage 1 feeds the RiskManager verdict + confidence;
+                                // the CNN / vol / quality / AO / fee / correlation
+                                // inputs are follow-ups (inert pass-through for now),
+                                // so `risk` is the only gate that can act today.
+                                let gate_side = match final_type {
+                                    janus_core::SignalType::Buy => {
+                                        Some(crate::gate_integration::Side::Buy)
+                                    }
+                                    janus_core::SignalType::Sell => {
+                                        Some(crate::gate_integration::Side::Sell)
+                                    }
+                                    _ => None,
+                                };
+                                let gate_outcome = match gate_side {
+                                    Some(side) => {
+                                        let now_secs = std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .map(|d| d.as_secs())
+                                            .unwrap_or(0);
+                                        let ctx =
+                                            crate::gate_integration::ForwardGate::build_context(
+                                                side,
+                                                &risk_check,
+                                                min_confidence,
+                                                None,
+                                                Vec::new(),
+                                            );
+                                        Some(forward_gate.evaluate_entry(
+                                            &symbol_str,
+                                            side,
+                                            false,
+                                            &ctx,
+                                            now_secs,
+                                        ))
+                                    }
+                                    None => None,
+                                };
+                                let signal = match &gate_outcome {
+                                    Some(out) => signal.with_metadata("gate", &out.metadata),
+                                    None => signal,
+                                };
+
                                 // Publish to signal bus
                                 match state_clone.signal_bus.publish(signal.clone()) {
                                     Ok(receivers) => {
@@ -1921,6 +1977,10 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                                         Some(format!("prop-firm: {prop_firm_label}"))
                                     } else if risk_enforce && risk_check.starts_with("rejected") {
                                         Some(format!("risk: {risk_check}"))
+                                    } else if let Some(out) = gate_outcome.as_ref()
+                                        && out.enforce_block
+                                    {
+                                        Some(format!("gate: {}", out.metadata))
                                     } else {
                                         None
                                     };
