@@ -66,5 +66,5 @@ pub use adaptive_threshold::AdaptiveThreshold;
 pub use circuit_breaker::ConsecutiveLossBreaker;
 pub use context::{CnnVote, GateContext, Side};
 pub use correlation::CorrelationGuard;
-pub use gate::{ExecutionGate, GateMetrics};
+pub use gate::{ExecutionGate, GateMetrics, GateMetricsSnapshot};
 pub use verdict::GateVerdict;

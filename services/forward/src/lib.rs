@@ -46,6 +46,7 @@ pub mod cnn_inference;
 pub mod execution;
 pub mod features;
 pub mod gate_integration;
+pub mod gate_metrics_redis;
 pub mod gate_recorder;
 pub mod indicators;
 pub mod inference;
@@ -1402,6 +1403,14 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                 ))
                 .await;
             info!("🧠✅ Gate outcome recorder installed (live close→breaker feedback)");
+            // Best-effort: mirror the gate's block/eval counters to Redis for
+            // Grafana (opt-in via JANUS_GATE_METRICS_REDIS). The spawned task is
+            // detached; it never blocks trading and no-ops if Redis is absent.
+            let _gate_metrics_task = crate::gate_metrics_redis::spawn(
+                Arc::clone(&forward_gate),
+                crate::gate_metrics_redis::GateMetricsRedisConfig::from_env(),
+            )
+            .await;
             // Per-symbol previous close, for the close-to-close log returns fed to
             // the gate's correlation guard.
             let mut prev_close: HashMap<String, f64> = HashMap::new();

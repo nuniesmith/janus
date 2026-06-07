@@ -29,8 +29,8 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 
 pub use janus_execution_gate::{
-    CnnVote, ConsecutiveLossBreaker, CorrelationGuard, ExecutionGate, GateContext, GateVerdict,
-    Side,
+    CnnVote, ConsecutiveLossBreaker, CorrelationGuard, ExecutionGate, GateContext,
+    GateMetricsSnapshot, GateVerdict, Side,
 };
 use janus_indicators::{Candle, IndicatorConfig, Indicators, VolatilityPercentile};
 
@@ -220,6 +220,11 @@ impl ForwardGate {
     /// Whether a blocking verdict will suppress the execution submit.
     pub fn enforcing(&self) -> bool {
         self.enforce
+    }
+
+    /// Snapshot the gate's block/eval counters for export (Redis/Grafana).
+    pub fn metrics_snapshot(&self) -> GateMetricsSnapshot {
+        self.gate.metrics.snapshot()
     }
 
     /// Build a [`GateContext`] with no engine producers (all inert pass-throughs).
