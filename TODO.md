@@ -95,10 +95,17 @@ leaving janus's native ingestion (exchange WS → QuestDB) as the only data path
       warm up empty + fall back to live candles (already graceful, no crash). A
       native non-crypto source (Massive integration) is **deferred, gated on API
       access** — reopen this if/when CME is in scope.
-- [ ] **Port the data factory** (gap-scan → backfill → reconcile) fully into
-      `services/data`. Pieces exist (`crates/gap-detection` is a stub,
-      `crates/data-quality` is rich, `services/data/src/backfill/`); the Ruby
-      reference is `ruby/src/data/{gap_scanner,backfill_manager,dataset_generator}.py`.
+- [ ] **Finish the data factory** (gap-scan → backfill → reconcile). The pieces
+      mostly **exist** (the earlier "gap-detection is a stub" note was wrong):
+      `crates/gap-detection` is a rich, tested crate — sequence/heartbeat/
+      statistical trade-gap detectors + parameterized QuestDB gap SQL, and now a
+      pure **`detect_candle_gaps`** for candle-level holes (✅, unit-tested);
+      `crates/data-quality` is rich; `services/data/src/backfill/` has the
+      executor/scheduler/lock/throttle/gap_integration. **Remaining is wiring +
+      reconcile**: drive `detect_candle_gaps` over `candles_crypto` → enqueue
+      backfills → verify the `detected → backfilling → filled → verified`
+      lifecycle. That's I/O-heavy (live QuestDB) — verify against a running stack,
+      not unit tests. Ruby ref: `ruby/src/data/{gap_scanner,backfill_manager}.py`.
 - [ ] **Asset registry in janus** (subsumes JFLOW-B's env-only list + the old
       "pull from Ruby's registry" follow-ups): port
       `ruby/src/services/asset_registry.py` → a registry the optimizer + forward

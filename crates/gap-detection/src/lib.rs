@@ -793,6 +793,61 @@ impl SqlGapDetector {
 }
 
 // ============================================================================
+// Candle Gap Detection (pure)
+// ============================================================================
+
+/// A run of missing candle windows between two present candles.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CandleGap {
+    /// Open time (ms) of the first missing candle in the run.
+    pub start_ms: i64,
+    /// Open time (ms) of the last missing candle in the run.
+    pub end_ms: i64,
+    /// Number of missing candles in the run.
+    pub missing: u64,
+}
+
+/// Detect missing candle windows in an ascending series of candle open-times.
+///
+/// `timestamps_ms` must be sorted ascending (e.g. straight from a QuestDB
+/// `ORDER BY timestamp ASC` query) and `interval_ms` is the bar width. Returns
+/// one [`CandleGap`] per run of consecutive missing windows.
+///
+/// This is the **candle-level** counterpart to the trade-stream detectors above
+/// — the piece the indicator-warmup / backfill path needs to find holes in
+/// `candles_crypto` (e.g. left by a WebSocket disconnect). It is pure and
+/// deterministic (no I/O), so it is fully unit-testable; the QuestDB read + the
+/// backfill that consumes these gaps live in `services/data`.
+///
+/// Robustness: a non-positive `interval_ms`, fewer than two timestamps, or
+/// non-increasing pairs (duplicates / out-of-order) contribute no gaps — pass
+/// clean, sorted input. A pair less than two full intervals apart (a merely
+/// late candle) is not reported as a gap.
+pub fn detect_candle_gaps(timestamps_ms: &[i64], interval_ms: i64) -> Vec<CandleGap> {
+    if interval_ms <= 0 || timestamps_ms.len() < 2 {
+        return Vec::new();
+    }
+    let mut gaps = Vec::new();
+    for win in timestamps_ms.windows(2) {
+        let (prev, next) = (win[0], win[1]);
+        let delta = next - prev;
+        if delta <= interval_ms {
+            continue; // adjacent, duplicate, or out-of-order — no gap
+        }
+        // Count candles strictly between `prev` and `next` on the bar grid.
+        let missing = (delta / interval_ms) - 1;
+        if missing >= 1 {
+            gaps.push(CandleGap {
+                start_ms: prev + interval_ms,
+                end_ms: prev + missing * interval_ms,
+                missing: missing as u64,
+            });
+        }
+    }
+    gaps
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -1021,5 +1076,79 @@ mod tests {
 
         assert!(query.sql().contains("SAMPLE BY 1m FILL(0)"));
         assert!(query.sql().contains("dateadd('m', -5, now())"));
+    }
+
+    // ── Candle gap detection ──────────────────────────────────────────
+
+    const MIN: i64 = 60_000; // 1-minute bar interval, in ms
+
+    #[test]
+    fn candle_gaps_none_when_contiguous() {
+        let ts: Vec<i64> = (0..10).map(|i| i * MIN).collect();
+        assert!(detect_candle_gaps(&ts, MIN).is_empty());
+    }
+
+    #[test]
+    fn candle_gaps_single_missing() {
+        // 0 then a jump to 2·MIN — one missing candle at MIN.
+        let gaps = detect_candle_gaps(&[0, 2 * MIN], MIN);
+        assert_eq!(
+            gaps,
+            vec![CandleGap {
+                start_ms: MIN,
+                end_ms: MIN,
+                missing: 1
+            }]
+        );
+    }
+
+    #[test]
+    fn candle_gaps_run_of_missing() {
+        // 0 then 6·MIN — 5 missing candles (MIN..=5·MIN).
+        let gaps = detect_candle_gaps(&[0, 6 * MIN], MIN);
+        assert_eq!(
+            gaps,
+            vec![CandleGap {
+                start_ms: MIN,
+                end_ms: 5 * MIN,
+                missing: 5
+            }]
+        );
+    }
+
+    #[test]
+    fn candle_gaps_multiple_runs() {
+        // contiguous 0,1,2 · gap · 5 · gap · 8
+        let ts = [0, MIN, 2 * MIN, 5 * MIN, 8 * MIN];
+        assert_eq!(
+            detect_candle_gaps(&ts, MIN),
+            vec![
+                CandleGap {
+                    start_ms: 3 * MIN,
+                    end_ms: 4 * MIN,
+                    missing: 2
+                },
+                CandleGap {
+                    start_ms: 6 * MIN,
+                    end_ms: 7 * MIN,
+                    missing: 2
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn candle_gaps_ignores_late_candle_under_two_intervals() {
+        // 1.5 intervals apart — a late candle, not a gap.
+        assert!(detect_candle_gaps(&[0, MIN + MIN / 2], MIN).is_empty());
+    }
+
+    #[test]
+    fn candle_gaps_guards_bad_input() {
+        assert!(detect_candle_gaps(&[], MIN).is_empty());
+        assert!(detect_candle_gaps(&[0], MIN).is_empty());
+        assert!(detect_candle_gaps(&[0, 5 * MIN], 0).is_empty()); // non-positive interval
+        assert!(detect_candle_gaps(&[5 * MIN, 0], MIN).is_empty()); // out-of-order
+        assert!(detect_candle_gaps(&[MIN, MIN], MIN).is_empty()); // duplicate
     }
 }
