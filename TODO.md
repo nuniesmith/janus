@@ -96,8 +96,8 @@ leaving janus's native ingestion (exchange WS → QuestDB) as the only data path
       native non-crypto source (Massive integration) is **deferred, gated on API
       access** — reopen this if/when CME is in scope.
 - [ ] **Finish the data factory** (gap-scan → backfill → reconcile). The
-      reconcile path is now built **end-to-end through pure, tested code**; only
-      the live runtime wiring remains:
+      reconcile path is built **end-to-end through tested code** and now **wired
+      into startup** (opt-in); only live verification remains:
       - `crates/gap-detection`: sequence/heartbeat/statistical trade-gap
         detectors + parameterized QuestDB gap SQL, pure **`detect_candle_gaps`**
         for candle-level holes, and now **`plan_candle_backfill`** (✅) — chunks
@@ -109,12 +109,15 @@ leaving janus's native ingestion (exchange WS → QuestDB) as the only data path
         QuestDB read sits behind the `CandleTimestampSource` trait so the
         orchestrator (`run_scan_once`) is unit-tested with a fake;
         `QuestDbCandleSource` is the gated real impl.
-      **Remaining (live-stack gated):** the `backfill` subsystem isn't
-      constructed at service startup yet (dormant lib infra) — wire
-      `GapIntegrationManager` + scheduler + `candle_scan::spawn` into the data
-      service `main`, then verify the `detected → backfilling → filled →
-      verified` lifecycle against a running QuestDB/Redis stack (integration,
-      not unit). Ruby ref: `ruby/src/data/{gap_scanner,backfill_manager}.py`.
+      **Now wired (opt-in):** `DataFactory::start_candle_scan` constructs the
+      scheduler + `GapIntegrationManager` + `QuestDbCandleSource` and spawns the
+      reconciler in the data-service `main`, **entirely behind
+      `JANUS_CANDLE_SCAN=1`** — inert by default (no resources acquired when off).
+      Set `JANUS_CANDLE_SCAN_SYMBOLS` to the exact `candles_crypto` symbols.
+      **Remaining (live-stack only):** flip the flag against a running
+      QuestDB/Redis stack and verify the `detected → backfilling → filled →
+      verified` lifecycle (integration, not unit). Ruby ref:
+      `ruby/src/data/{gap_scanner,backfill_manager}.py`.
 - [ ] **Asset registry in janus** (subsumes JFLOW-B's env-only list + the old
       "pull from Ruby's registry" follow-ups): port
       `ruby/src/services/asset_registry.py` → a registry the optimizer + forward
