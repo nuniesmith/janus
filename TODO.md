@@ -5,7 +5,7 @@
 > The workspace is standalone — its own `Dockerfile` + `docker-compose.yml`
 > live here. Unrelated rustcode / claw / RC-CRATES items are **not** tracked
 > here (see "Out of scope" below).
-> **Last synced:** 2026-06-07
+> **Last synced:** 2026-06-08
 >
 > ⭐ **2026-06-07 — janus is now the platform.** `src/ruby/` was deleted from
 > `fks-full`; the Python data/engine/trainer service is gone. janus no longer
@@ -21,7 +21,7 @@
 
 ---
 
-## Status snapshot (2026-06-07)
+## Status snapshot (2026-06-08)
 
 - **Platform shift (2026-06-07):** `src/ruby/` was deleted from fks-full —
   **janus is the platform now**, not just the brain. The remaining roadmap is
@@ -34,12 +34,20 @@
   (`cargo test -p jflow-execution-gate`).
 - **CI/CD:** PR checks (`ci.yml`: fmt + check + `--lib` tests + Docker build) and
   Docker Hub publish on merge to `main` (`docker-publish.yml`) are both live.
-- **Execution gate (NEW, 2026-06-07):** Ruby's 9-gate `ExecutionGate` ported to
+- **Execution gate (2026-06-08):** Ruby's 9-gate `ExecutionGate` ported to
   `crates/execution-gate` — a faithful, pure/synchronous chain (circuit-breaker
   → risk → vol → quality → AO → fee → CNN-agree → CNN-conf → correlation) plus
   the `ConsecutiveLossBreaker`, `CorrelationGuard`, and `AdaptiveThreshold` it
-  needs. 36 unit tests + doctest, clippy-clean. **Not yet wired** into the live
-  loop — see Track C below.
+  needs (37 unit tests + doctest, clippy-clean). **Now wired into the live loop,
+  advisory by default** — all 9 gates act on real data, with Redis observability
+  + breaker-state persistence; enforcement is one flag away (`JANUS_GATE_ENFORCE`).
+  See Track C.
+- **Data factory (2026-06-08):** the gap-scan → reconcile → backfill loop is
+  complete in Rust — `plan_candle_backfill` (bounded, newest-first windows),
+  `GapIntegrationManager::handle_candle_scan`, and an opt-in periodic
+  `candle_scan` reconciler wired into the data-service `main` behind
+  `JANUS_CANDLE_SCAN` (inert by default). Live lifecycle verification against a
+  running QuestDB/Redis stack is the only step left. See Track A.
 - **Signal flow:** JFLOW-A/B/C/D landed on the Janus side. Position guidance
   blends regime + per-asset optimizer thresholds + ATR volatility + amygdala
   fear. NB: the "producer-side" JFLOW work the old notes pushed to "the fks
@@ -154,7 +162,7 @@ path to *create* champions from scratch later.
 ### Track C — Safety: execution gate + risk · RUST_MIGRATION Phase 3 · ◀ all 9 gates live (advisory)
 - [x] **Port the 9-gate `ExecutionGate`** → `crates/execution-gate` (faithful
       chain + `ConsecutiveLossBreaker` + `CorrelationGuard` + `AdaptiveThreshold`;
-      pure/synchronous core; 36 tests + doctest; clippy-clean). 2026-06-07.
+      pure/synchronous core; 37 tests + doctest; clippy-clean). 2026-06-07.
 - [x] **Wire into the live loop — Stage 1 (advisory) done.** `services/forward/src/
       gate_integration.rs` (`ForwardGate`) is instantiated in the live loop;
       each prospective entry is evaluated and the verdict stamped as `gate`
@@ -182,10 +190,10 @@ path to *create* champions from scratch later.
       derives a `tp_pct` (`tp_atr_mult × ATR / close`, default 4.0 ≈ 2R on a
       2×ATR stop, override `JANUS_GATE_TP_ATR_MULT`) and feeds it to the
       fee-viability gate, which measures the round-trip taker + slippage fees
-      (GateContext defaults) against it. **All 8 entry gates now act on real
-      data** — only the consecutive-loss breaker (close-driven) remains. (Wiring
-      a config-driven taker/slippage schedule to replace the GateContext fee
-      defaults is a minor follow-up.)
+      against it — config-driven via `JANUS_GATE_FEE_TAKER` / `JANUS_GATE_FEE_SLIP`
+      (applied by `ForwardGate::apply_fees`; defaults match `GateContext`).
+      **All 8 entry gates now act on real data** — only the consecutive-loss
+      breaker (close-driven) remains.
 - [ ] **Quality refinement (optional)** — replace the momentum/wave quality
       proxy with `indicators-ta`'s `compute_signal` confluence/`bull_score` once
       the `LiquidityProfile` + `ConfluenceEngine` inputs are assembled per bar.
@@ -393,7 +401,7 @@ dedupe.
 - [x] **JFLOW-D** — direct-Postgres affinity bootstrap (`bootstrap_affinity_from_postgres`) with Redis ring-buffer fallback; `persistence` feature on by default.
 
 ### Remaining
-- [ ] **JFLOW-B:** Optimizer reads its asset list from Ruby's asset registry (gRPC or Redis) instead of env-only.
+- [ ] **JFLOW-B:** Optimizer reads its asset list from janus's native asset registry (`crates/registry`) instead of env-only. (Ruby is gone — this feeds off the janus-native registry now; same thread as Track A's "Asset registry in janus".)
 - [ ] **JFLOW-C — `ParamManager` dedupe.** `services/forward` and `janus-api` each subscribe to `fks:{instance}:param_updates` and keep separate caches. Promote `ParamManager` onto `JanusState` so both share one. Touches forward's `ParamReloadManager` (which also owns appliers) — that's why it's deferred.
 - [ ] **JFLOW-C — producer emission (fks/forward pipeline).** Guidance reads `signal.metadata["regime"]` and `["fear"]` opportunistically; today nothing emits them, so `current_regime`/`current_threat` stay `None` and guidance is P&L-only. Wire the real regime detector and amygdala fear network to populate them. *(See "Position-guidance hardening" for the rest of this thread.)*
 - [ ] **JFLOW-C — memory compaction (JanusAI side, fks repo).** Compact the `janus_position_events` raw log into closed-trade rows in `janus_memories`.
@@ -463,7 +471,7 @@ gaps are below.
 ## P3 — Neural architecture & research
 
 - [ ] **30-day live-trading validation** of the neuromorphic stack (~250K LOC across 10 brain regions) → document the public API → stabilize the `janus-neuromorphic` crate for production use. This is the gate before treating brain output as authoritative.
-- [ ] **Optimizer ↔ asset registry** (JFLOW-B follow-up): pull the asset universe from Ruby's registry rather than env.
+- [ ] **Optimizer ↔ asset registry** (JFLOW-B follow-up): pull the asset universe from janus's native registry rather than env. (Ruby's registry is gone; same thread as Track A's "Asset registry in janus".)
 - [ ] Sweep the 107 neuromorphic `#[allow(dead_code)]` annotations once the regions stabilize (currently churning too fast to audit usefully).
 
 ---

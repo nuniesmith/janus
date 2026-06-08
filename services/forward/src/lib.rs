@@ -1993,7 +1993,7 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                                         };
                                         // AO / volatility percentile / quality from the engine.
                                         let producers = gate_producers.snapshot(&symbol_str);
-                                        let ctx =
+                                        let mut ctx =
                                             crate::gate_integration::ForwardGate::build_context_with_producers(
                                                 side,
                                                 &risk_check,
@@ -2002,7 +2002,11 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                                                 open_assets,
                                                 producers,
                                             );
-                                        Some(forward_gate.write().await.evaluate_entry(
+                                        // Overlay the gate's configured round-trip
+                                        // fees (JANUS_GATE_FEE_*) before evaluating.
+                                        let mut gate_guard = forward_gate.write().await;
+                                        gate_guard.apply_fees(&mut ctx);
+                                        Some(gate_guard.evaluate_entry(
                                             &gate_asset,
                                             side,
                                             false,

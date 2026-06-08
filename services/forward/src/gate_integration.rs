@@ -48,6 +48,14 @@ fn env_flag(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Parse a non-negative, finite `f64` from the environment (else `None`).
+fn env_f64(name: &str) -> Option<f64> {
+    env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+}
+
 /// Outcome of evaluating one prospective entry through the gate.
 #[derive(Debug, Clone)]
 pub struct GateOutcome {
@@ -187,6 +195,9 @@ impl GateProducers {
 pub struct ForwardGate {
     gate: ExecutionGate,
     enforce: bool,
+    /// Round-trip fee inputs (per-side fractions) for the fee-viability gate.
+    fee_taker: f64,
+    fee_slip: f64,
 }
 
 impl Default for ForwardGate {
@@ -208,18 +219,48 @@ impl ForwardGate {
             Some(CorrelationGuard::default()),
             None,
         );
-        Self { gate, enforce }
+        // Fee inputs default to the GateContext defaults (no drift) until
+        // overridden via `with_fees` or the `JANUS_GATE_FEE_*` env vars.
+        let defaults = GateContext::default();
+        Self {
+            gate,
+            enforce,
+            fee_taker: defaults.fee_taker,
+            fee_slip: defaults.fee_slip,
+        }
     }
 
     /// Build from the environment. `JANUS_GATE_ENFORCE=1` makes a blocking
     /// verdict suppress the execution submit; otherwise the gate is advisory.
     pub fn from_env() -> Self {
-        Self::new(env_flag("JANUS_GATE_ENFORCE"))
+        let gate = Self::new(env_flag("JANUS_GATE_ENFORCE"));
+        let fee_taker = env_f64("JANUS_GATE_FEE_TAKER").unwrap_or(gate.fee_taker);
+        let fee_slip = env_f64("JANUS_GATE_FEE_SLIP").unwrap_or(gate.fee_slip);
+        gate.with_fees(fee_taker, fee_slip)
     }
 
     /// Whether a blocking verdict will suppress the execution submit.
     pub fn enforcing(&self) -> bool {
         self.enforce
+    }
+
+    /// Override the round-trip fee inputs (taker + slippage, per-side fractions)
+    /// the fee-viability gate measures against `tp_pct`. Used by [`from_env`]
+    /// and callers that resolved config elsewhere.
+    ///
+    /// [`from_env`]: Self::from_env
+    pub fn with_fees(mut self, fee_taker: f64, fee_slip: f64) -> Self {
+        self.fee_taker = fee_taker;
+        self.fee_slip = fee_slip;
+        self
+    }
+
+    /// Stamp the configured fee inputs onto a context before evaluation.
+    /// Defaults match `GateContext` (taker 6 bps, slippage 1 bp per side);
+    /// override via `JANUS_GATE_FEE_TAKER` / `JANUS_GATE_FEE_SLIP`.
+    pub fn apply_fees(&self, ctx: &mut GateContext) {
+        ctx.fee_taker = self.fee_taker;
+        ctx.fee_slip = self.fee_slip;
     }
 
     /// Snapshot the gate's block/eval counters for export (Redis/Grafana).
@@ -293,7 +334,8 @@ impl ForwardGate {
             open_assets,
             // Engine producers, with inert pass-throughs when not yet warmed:
             // vol mid-band, quality clears qual_min, AO matches the side, TP
-            // viable. Fees keep the GateContext defaults (taker + slippage).
+            // viable. Fees stay at the GateContext defaults here; the live loop
+            // overlays the configured fees via `apply_fees` before evaluating.
             ao: producers.ao.unwrap_or(ao_passthrough),
             vol_pct: producers.vol_pct.unwrap_or(0.5),
             quality: producers.quality.unwrap_or(100.0),
@@ -562,5 +604,27 @@ mod tests {
         let q = warm.quality.expect("quality reported once warm");
         assert!((0.0..=100.0).contains(&q), "quality in 0..=100, got {q}");
         assert!(warm.tp_pct.is_some(), "tp_pct should be reported once warm");
+    }
+
+    #[test]
+    fn apply_fees_uses_context_defaults_by_default() {
+        let gate = ForwardGate::new(false);
+        let mut ctx = GateContext::default();
+        // Clobber the fields, then prove apply_fees restores the defaults.
+        ctx.fee_taker = 9.9;
+        ctx.fee_slip = 9.9;
+        gate.apply_fees(&mut ctx);
+        let defaults = GateContext::default();
+        assert_eq!(ctx.fee_taker, defaults.fee_taker);
+        assert_eq!(ctx.fee_slip, defaults.fee_slip);
+    }
+
+    #[test]
+    fn with_fees_overrides_applied_fees() {
+        let gate = ForwardGate::new(false).with_fees(0.001, 0.0005);
+        let mut ctx = GateContext::default();
+        gate.apply_fees(&mut ctx);
+        assert_eq!(ctx.fee_taker, 0.001);
+        assert_eq!(ctx.fee_slip, 0.0005);
     }
 }
