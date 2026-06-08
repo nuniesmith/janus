@@ -140,6 +140,10 @@ impl DataFactory {
         self.warmup_indicators(storage.clone(), indicator_actor)
             .await;
 
+        // Start the opt-in candle-scan reconciler (Track A).
+        // Inert unless JANUS_CANDLE_SCAN=1 — default startup is unchanged.
+        self.start_candle_scan();
+
         info!("╔═══════════════════════════════════════════════════════════╗");
         info!("║           DATA FACTORY RUNNING                           ║");
         info!("║                                                          ║");
@@ -251,11 +255,11 @@ impl DataFactory {
 
     /// Warm up indicators from historical candle data.
     ///
-    /// Symbols are passed as-is from the config (e.g. "MGC", "BTC").  The
-    /// three-tier source chain in `IndicatorWarmup` handles normalisation:
-    ///   1. Python data service  — authoritative for CME futures + crypto
-    ///   2. QuestDB              — crypto already ingested via WebSocket
-    ///   3. Binance REST         — crypto last resort
+    /// Symbols are passed as-is from the config (e.g. "MGC", "BTC"). The
+    /// two-tier source chain in `IndicatorWarmup` handles normalisation
+    /// (the Python data tier was removed — janus is the source of truth):
+    ///   1. QuestDB      — crypto already ingested via WebSocket
+    ///   2. Binance REST — crypto last resort
     async fn warmup_indicators(
         &self,
         storage: Arc<storage::StorageManager>,
@@ -312,6 +316,68 @@ impl DataFactory {
             ready_count,
             results.len()
         );
+    }
+
+    /// Start the opt-in candle-scan reconciler (Track A data factory).
+    ///
+    /// **Inert unless `JANUS_CANDLE_SCAN=1`** — when disabled we build nothing
+    /// and acquire no resources, so default startup is unchanged. When enabled
+    /// it wires the (otherwise dormant) backfill scheduler + gap-integration
+    /// manager to a [`QuestDbCandleSource`] and spawns the periodic reconciler,
+    /// which scans `candles_crypto` for holes and enqueues bounded backfills.
+    ///
+    /// Requires `JANUS_CANDLE_SCAN_SYMBOLS` set to the exact symbols stored in
+    /// `candles_crypto` (the loop no-ops with a warning if none are given). The
+    /// QuestDB endpoint comes from `QUESTDB_HTTP_URL`, Redis from config. This
+    /// path is verified against a live QuestDB/Redis stack — see TODO.md.
+    fn start_candle_scan(&self) {
+        use crate::backfill::lock::LockMetrics;
+        use crate::backfill::{
+            BackfillLock, BackfillScheduler, BackfillThrottle, CandleScanConfig,
+            GapIntegrationConfig, GapIntegrationManager, QuestDbCandleSource, candle_scan,
+        };
+
+        let scan_config = CandleScanConfig::from_env();
+        if !scan_config.enabled {
+            info!("candle-scan reconciler: disabled (set JANUS_CANDLE_SCAN=1 to enable)");
+            return;
+        }
+
+        // Build the backfill machinery only when enabled — no connect happens
+        // here (the Redis client/QuestDB source are lazy), so this is cheap.
+        let redis_client = match redis::Client::open(self.config.redis.url.as_str()) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("candle-scan: invalid Redis URL ({e}); reconciler not started");
+                return;
+            }
+        };
+        // Lock metrics live on a dedicated registry (not the main /metrics
+        // scrape) — acceptable for this opt-in path; the gate's own counters
+        // mirror to Redis separately.
+        let lock_metrics = match LockMetrics::new(&prometheus::Registry::new()) {
+            Ok(m) => Arc::new(m),
+            Err(e) => {
+                warn!("candle-scan: failed to init lock metrics ({e}); reconciler not started");
+                return;
+            }
+        };
+        let throttle = Arc::new(BackfillThrottle::new(Default::default()));
+        let lock = Arc::new(BackfillLock::new(
+            redis_client,
+            Default::default(),
+            lock_metrics,
+        ));
+        let scheduler = Arc::new(BackfillScheduler::new(Default::default(), throttle, lock));
+        let manager = Arc::new(GapIntegrationManager::new(
+            GapIntegrationConfig::default(),
+            scheduler,
+        ));
+        let source = Arc::new(QuestDbCandleSource::from_env());
+
+        // Fire-and-forget: dropping the JoinHandle detaches the task, which
+        // keeps running for the lifetime of the process.
+        let _handle = candle_scan::spawn(source, manager, scan_config);
     }
 
     async fn start_websockets(
