@@ -29,8 +29,8 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 
 pub use janus_execution_gate::{
-    CnnVote, ConsecutiveLossBreaker, CorrelationGuard, ExecutionGate, GateContext,
-    GateMetricsSnapshot, GateVerdict, Side,
+    BreakerSnapshotEntry, CnnVote, ConsecutiveLossBreaker, CorrelationGuard, ExecutionGate,
+    GateContext, GateMetricsSnapshot, GateVerdict, Side,
 };
 use janus_indicators::{Candle, IndicatorConfig, Indicators, VolatilityPercentile};
 
@@ -225,6 +225,16 @@ impl ForwardGate {
     /// Snapshot the gate's block/eval counters for export (Redis/Grafana).
     pub fn metrics_snapshot(&self) -> GateMetricsSnapshot {
         self.gate.metrics.snapshot()
+    }
+
+    /// Export the consecutive-loss breaker state for cross-restart persistence.
+    pub fn export_breaker(&self) -> Vec<BreakerSnapshotEntry> {
+        self.gate.breaker.export()
+    }
+
+    /// Restore the consecutive-loss breaker state (e.g. on startup from Redis).
+    pub fn import_breaker(&mut self, entries: Vec<BreakerSnapshotEntry>) {
+        self.gate.breaker.import(entries);
     }
 
     /// Build a [`GateContext`] with no engine producers (all inert pass-throughs).

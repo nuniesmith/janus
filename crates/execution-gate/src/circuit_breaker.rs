@@ -7,15 +7,27 @@
 //! The Python version persists state in Redis with a TTL key for the cooldown;
 //! this port keeps the state in-memory and takes the current unix time
 //! (`now_secs`) as an explicit argument, which makes the cooldown logic fully
-//! deterministic for tests. A Redis-backed adapter for cross-restart durability
-//! is a follow-up (see the janus TODO).
+//! deterministic for tests. For cross-restart durability the state can be
+//! [`export`](ConsecutiveLossBreaker::export)ed /
+//! [`import`](ConsecutiveLossBreaker::import)ed (e.g. mirrored to Redis by the
+//! forward service) — the gate crate itself stays I/O-free.
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Default number of consecutive losses before the breaker trips.
 pub const DEFAULT_LOSS_LIMIT: u32 = 3;
 /// Default cooldown after the breaker trips, in seconds (15 minutes).
 pub const DEFAULT_COOLDOWN_SECS: u64 = 900;
+
+/// A serializable snapshot of one asset's breaker state, for cross-restart
+/// persistence (e.g. mirrored to Redis by the forward service).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BreakerSnapshotEntry {
+    pub asset: String,
+    pub consecutive_losses: u32,
+    pub cooldown_until_secs: Option<u64>,
+}
 
 #[derive(Debug, Clone, Default)]
 struct BreakerState {
@@ -100,6 +112,41 @@ impl ConsecutiveLossBreaker {
             .map(|s| s.consecutive_losses)
             .unwrap_or(0)
     }
+
+    /// Export the per-asset breaker state for persistence (sorted by asset).
+    /// `loss_limit` / `cooldown_secs` config is not exported — it's set on
+    /// construction. Cooldowns are absolute unix seconds, so they remain valid
+    /// across a restart.
+    pub fn export(&self) -> Vec<BreakerSnapshotEntry> {
+        let mut out: Vec<BreakerSnapshotEntry> = self
+            .state
+            .iter()
+            .map(|(asset, s)| BreakerSnapshotEntry {
+                asset: asset.clone(),
+                consecutive_losses: s.consecutive_losses,
+                cooldown_until_secs: s.cooldown_until_secs,
+            })
+            .collect();
+        out.sort_by(|a, b| a.asset.cmp(&b.asset));
+        out
+    }
+
+    /// Restore per-asset breaker state (e.g. on startup from Redis), replacing
+    /// any existing state.
+    pub fn import(&mut self, entries: Vec<BreakerSnapshotEntry>) {
+        self.state = entries
+            .into_iter()
+            .map(|e| {
+                (
+                    e.asset,
+                    BreakerState {
+                        consecutive_losses: e.consecutive_losses,
+                        cooldown_until_secs: e.cooldown_until_secs,
+                    },
+                )
+            })
+            .collect();
+    }
 }
 
 #[cfg(test)]
@@ -166,5 +213,29 @@ mod tests {
         cb.record_outcome("btc", false, T0);
         assert!(cb.is_open("btc", T0));
         assert!(!cb.is_open("eth", T0));
+    }
+
+    #[test]
+    fn export_import_round_trips_a_tripped_breaker() {
+        let mut cb = ConsecutiveLossBreaker::new(3, 900);
+        cb.record_outcome("btc", false, T0);
+        cb.record_outcome("btc", false, T0);
+        cb.record_outcome("btc", false, T0); // tripped → cooldown until T0+900
+        cb.record_outcome("eth", false, T0); // 1 loss, not tripped
+
+        // Round-trip through export/import (e.g. a process restart).
+        let snap = cb.export();
+        let mut restored = ConsecutiveLossBreaker::new(3, 900);
+        restored.import(snap);
+
+        assert!(
+            restored.is_open("btc", T0),
+            "a tripped breaker must survive export/import"
+        );
+        assert_eq!(restored.cooldown_remaining("btc", T0), 900);
+        assert_eq!(restored.loss_count("eth"), 1);
+        assert!(!restored.is_open("eth", T0));
+        // Absolute cooldown still expires on schedule post-restore.
+        assert!(!restored.is_open("btc", T0 + 900));
     }
 }

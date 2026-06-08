@@ -88,14 +88,24 @@ leaving janus's native ingestion (exchange WS → QuestDB) as the only data path
       `sync_python_services` / `parse_python_asset`, ~390 lines) that polled
       `{PYTHON_DATA_SERVICE_URL}/api/registry/*` every 5 min. The registry is now
       janus-native. **`PYTHON_DATA_SERVICE_URL` is gone from all janus code.**
-- [ ] **Native historical source for non-crypto** — CME futures (MGC, MES, …)
-      were only served by the retired Python service; QuestDB/Binance can't
-      backfill them. Add a native source (e.g. a Massive integration) or scope
-      the platform to crypto. Until then those symbols warm up empty.
-- [ ] **Port the data factory** (gap-scan → backfill → reconcile) fully into
-      `services/data`. Pieces exist (`crates/gap-detection` is a stub,
-      `crates/data-quality` is rich, `services/data/src/backfill/`); the Ruby
-      reference is `ruby/src/data/{gap_scanner,backfill_manager,dataset_generator}.py`.
+- [~] **Non-crypto data source: scoped to crypto-only (decided).** CME futures
+      (MGC, MES, …) were only served by the retired Python service; QuestDB/Binance
+      can't backfill them, and there's no Massive API access here to build a native
+      source. **Decision: the platform is crypto-only** for now — non-crypto symbols
+      warm up empty + fall back to live candles (already graceful, no crash). A
+      native non-crypto source (Massive integration) is **deferred, gated on API
+      access** — reopen this if/when CME is in scope.
+- [ ] **Finish the data factory** (gap-scan → backfill → reconcile). The pieces
+      mostly **exist** (the earlier "gap-detection is a stub" note was wrong):
+      `crates/gap-detection` is a rich, tested crate — sequence/heartbeat/
+      statistical trade-gap detectors + parameterized QuestDB gap SQL, and now a
+      pure **`detect_candle_gaps`** for candle-level holes (✅, unit-tested);
+      `crates/data-quality` is rich; `services/data/src/backfill/` has the
+      executor/scheduler/lock/throttle/gap_integration. **Remaining is wiring +
+      reconcile**: drive `detect_candle_gaps` over `candles_crypto` → enqueue
+      backfills → verify the `detected → backfilling → filled → verified`
+      lifecycle. That's I/O-heavy (live QuestDB) — verify against a running stack,
+      not unit tests. Ruby ref: `ruby/src/data/{gap_scanner,backfill_manager}.py`.
 - [ ] **Asset registry in janus** (subsumes JFLOW-B's env-only list + the old
       "pull from Ruby's registry" follow-ups): port
       `ruby/src/services/asset_registry.py` → a registry the optimizer + forward
@@ -115,9 +125,12 @@ path to *create* champions from scratch later.
 - [x] **Sane defaults / graceful-disable verified.** No champion ⇒ CNN inactive
       ⇒ rule-based path; `CnnConfig::default()` is off-by-default. "Run without
       weights" already works — nothing to do.
-- [ ] **Resolve the CNN feature contract** — the Ruby `models/` README says 15
-      features / 3 classes / window 60; janus's pipeline is 20-channel. Pick the
-      ground-truth shape for `crates/ml` before training from scratch.
+- [x] **CNN feature contract: 20-channel (decided).** The Ruby `models/` README's
+      15-feature / window-60 shape described the *PyTorch* champions — which don't
+      exist as weights. Since janus trains from scratch in burn, ground truth is
+      janus's own 20-channel `crates/ml` pipeline; the 15-feature contract is
+      historical. (Exact window/classes confirmed from `crates/ml` when training
+      lands — but the channel count is settled: 20.)
 - [ ] **Train champions from scratch in burn** (when data + GPU available):
       `train_champion(ohlcv)` → features → labels → train → save the `.bin` +
       `.json` sidecar. Then cosine LR / train-val split / temperature calibration
@@ -178,11 +191,17 @@ path to *create* champions from scratch later.
       counters to Redis (`{prefix}gate_blocks:{asset}:{reason}`,
       `{prefix}gate_evals:{asset}`) on a timer. Opt-in via
       `JANUS_GATE_METRICS_REDIS=1`; no-ops if Redis is absent; Redis I/O stays out
-      of the gate crate. *Still open:* persisting breaker/adaptive-threshold
-      **state** across restarts (durability, vs. the metrics mirroring done here).
-- [ ] **Dedupe the correlation guard** — the gate's parity-faithful
-      `CorrelationGuard` (log-returns, 0.7/50/3) vs `jflow-risk`'s
-      `CorrelationTracker` (prices, 0.75/100/3). Pick one once the gate is wired.
+      of the gate crate. The same exporter now also **persists the consecutive-loss
+      breaker state** (`{prefix}gate_breaker_state`, JSON) and restores it on
+      startup — a tripped breaker survives a restart instead of silently resetting
+      (`ConsecutiveLossBreaker::export`/`import`). (Adaptive-threshold-state
+      persistence is the only remaining bit.)
+- [x] **Correlation guard: keep both (decided).** The gate's `CorrelationGuard`
+      (log-returns, externally fed, parity-faithful to Ruby) and `jflow-risk`'s
+      `CorrelationTracker` (price-fed, different defaults) serve different layers;
+      the gate crate is intentionally dependency-free, so it keeps its own rather
+      than depending on `jflow-risk`. Not merging — the rationale is documented in
+      `crates/execution-gate/src/correlation.rs`.
 - [ ] **Enforcement flip (runbook).** The gate is **advisory by default** — it
       stamps `gate` metadata on every signal but never blocks. To enforce, set
       `JANUS_GATE_ENFORCE=1`: a blocking verdict then joins the prop-firm/risk
