@@ -848,6 +848,107 @@ pub fn detect_candle_gaps(timestamps_ms: &[i64], interval_ms: i64) -> Vec<Candle
 }
 
 // ============================================================================
+// Candle Backfill Planning (pure)
+// ============================================================================
+
+/// A bounded, ready-to-enqueue candle range produced by [`plan_candle_backfill`].
+///
+/// Unlike a raw [`CandleGap`] — which can describe an arbitrarily large hole — a
+/// plan window is guaranteed to span at most `max_candles_per_window` candles,
+/// so one long outage becomes several right-sized backfill jobs rather than a
+/// single request that could overwhelm the fetcher.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CandleBackfillWindow {
+    /// Open time (ms) of the first missing candle in the window.
+    pub start_ms: i64,
+    /// Open time (ms) of the last missing candle in the window.
+    pub end_ms: i64,
+    /// Number of missing candles in the window.
+    pub missing: u64,
+}
+
+/// Tuning for [`plan_candle_backfill`].
+#[derive(Debug, Clone)]
+pub struct ReconcilePlan {
+    /// Drop gaps with fewer than this many missing candles — a lone missing bar
+    /// on an illiquid pair is often a genuine no-trade interval, not data loss.
+    /// `0` or `1` keeps every gap.
+    pub min_missing: u64,
+    /// Split any gap longer than this into consecutive windows so each backfill
+    /// job stays bounded. `0` disables chunking (one window per gap).
+    pub max_candles_per_window: u64,
+    /// Cap the number of windows returned per scan, keeping the newest. `0`
+    /// means unlimited.
+    pub max_windows: usize,
+}
+
+impl Default for ReconcilePlan {
+    fn default() -> Self {
+        Self {
+            min_missing: 1,
+            max_candles_per_window: 1_000,
+            max_windows: 0,
+        }
+    }
+}
+
+/// Turn raw [`CandleGap`]s into an ordered, bounded backfill plan.
+///
+/// The reconciliation step between a candle scan ([`detect_candle_gaps`]) and the
+/// backfill scheduler: it drops sub-`min_missing` noise, chunks oversized gaps
+/// into windows of at most `max_candles_per_window` candles, orders the result
+/// newest-first (recent data matters most for live trading), and caps the batch
+/// to `max_windows`. Pure and deterministic — no I/O.
+///
+/// `interval_ms` is the bar width and must match the one passed to
+/// [`detect_candle_gaps`]; a non-positive value yields an empty plan.
+pub fn plan_candle_backfill(
+    gaps: &[CandleGap],
+    interval_ms: i64,
+    plan: &ReconcilePlan,
+) -> Vec<CandleBackfillWindow> {
+    if interval_ms <= 0 {
+        return Vec::new();
+    }
+    let min_missing = plan.min_missing.max(1);
+    let mut windows = Vec::new();
+    for gap in gaps {
+        if gap.missing < min_missing {
+            continue;
+        }
+        if plan.max_candles_per_window == 0 || gap.missing <= plan.max_candles_per_window {
+            windows.push(CandleBackfillWindow {
+                start_ms: gap.start_ms,
+                end_ms: gap.end_ms,
+                missing: gap.missing,
+            });
+            continue;
+        }
+        // Chunk a gap larger than the window cap into consecutive windows.
+        // Candles sit on the bar grid at start_ms + k·interval_ms.
+        let chunk = plan.max_candles_per_window;
+        let mut produced = 0u64;
+        while produced < gap.missing {
+            let take = chunk.min(gap.missing - produced);
+            let start_ms = gap.start_ms + (produced as i64) * interval_ms;
+            let end_ms = start_ms + ((take - 1) as i64) * interval_ms;
+            windows.push(CandleBackfillWindow {
+                start_ms,
+                end_ms,
+                missing: take,
+            });
+            produced += take;
+        }
+    }
+    // Newest-first: the most recent holes are the ones a live trader needs back.
+    windows.sort_by(|a, b| b.start_ms.cmp(&a.start_ms));
+    if plan.max_windows > 0 && windows.len() > plan.max_windows {
+        windows.truncate(plan.max_windows);
+    }
+    windows
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -1150,5 +1251,136 @@ mod tests {
         assert!(detect_candle_gaps(&[0, 5 * MIN], 0).is_empty()); // non-positive interval
         assert!(detect_candle_gaps(&[5 * MIN, 0], MIN).is_empty()); // out-of-order
         assert!(detect_candle_gaps(&[MIN, MIN], MIN).is_empty()); // duplicate
+    }
+
+    // ── Candle backfill planning ──────────────────────────────────────
+
+    #[test]
+    fn plan_passes_small_gaps_through_unchanged() {
+        // 3 missing candles, well under the default 1000-candle window cap.
+        let gaps = detect_candle_gaps(&[0, 4 * MIN], MIN);
+        let windows = plan_candle_backfill(&gaps, MIN, &ReconcilePlan::default());
+        assert_eq!(
+            windows,
+            vec![CandleBackfillWindow {
+                start_ms: MIN,
+                end_ms: 3 * MIN,
+                missing: 3
+            }]
+        );
+    }
+
+    #[test]
+    fn plan_chunks_oversized_gap_newest_first() {
+        // One 5-candle hole, cap of 2 ⇒ windows of [2, 2, 1], newest-first.
+        let gaps = vec![CandleGap {
+            start_ms: MIN,
+            end_ms: 5 * MIN,
+            missing: 5,
+        }];
+        let plan = ReconcilePlan {
+            min_missing: 1,
+            max_candles_per_window: 2,
+            max_windows: 0,
+        };
+        let windows = plan_candle_backfill(&gaps, MIN, &plan);
+        assert_eq!(
+            windows,
+            vec![
+                CandleBackfillWindow {
+                    start_ms: 5 * MIN,
+                    end_ms: 5 * MIN,
+                    missing: 1
+                },
+                CandleBackfillWindow {
+                    start_ms: 3 * MIN,
+                    end_ms: 4 * MIN,
+                    missing: 2
+                },
+                CandleBackfillWindow {
+                    start_ms: MIN,
+                    end_ms: 2 * MIN,
+                    missing: 2
+                },
+            ]
+        );
+        // Chunking preserves the total candle count.
+        let total: u64 = windows.iter().map(|w| w.missing).sum();
+        assert_eq!(total, 5);
+    }
+
+    #[test]
+    fn plan_filters_below_min_missing() {
+        let gaps = vec![
+            CandleGap {
+                start_ms: MIN,
+                end_ms: MIN,
+                missing: 1,
+            },
+            CandleGap {
+                start_ms: 5 * MIN,
+                end_ms: 6 * MIN,
+                missing: 2,
+            },
+        ];
+        let plan = ReconcilePlan {
+            min_missing: 2,
+            max_candles_per_window: 0,
+            max_windows: 0,
+        };
+        let windows = plan_candle_backfill(&gaps, MIN, &plan);
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].missing, 2);
+    }
+
+    #[test]
+    fn plan_orders_newest_first_and_caps() {
+        let gaps = vec![
+            CandleGap {
+                start_ms: MIN,
+                end_ms: MIN,
+                missing: 1,
+            },
+            CandleGap {
+                start_ms: 10 * MIN,
+                end_ms: 10 * MIN,
+                missing: 1,
+            },
+        ];
+        let unbounded = plan_candle_backfill(
+            &gaps,
+            MIN,
+            &ReconcilePlan {
+                min_missing: 1,
+                max_candles_per_window: 0,
+                max_windows: 0,
+            },
+        );
+        assert_eq!(unbounded[0].start_ms, 10 * MIN);
+        assert_eq!(unbounded[1].start_ms, MIN);
+
+        // max_windows keeps only the newest.
+        let capped = plan_candle_backfill(
+            &gaps,
+            MIN,
+            &ReconcilePlan {
+                min_missing: 1,
+                max_candles_per_window: 0,
+                max_windows: 1,
+            },
+        );
+        assert_eq!(capped.len(), 1);
+        assert_eq!(capped[0].start_ms, 10 * MIN);
+    }
+
+    #[test]
+    fn plan_guards_bad_interval() {
+        let gaps = vec![CandleGap {
+            start_ms: MIN,
+            end_ms: MIN,
+            missing: 1,
+        }];
+        assert!(plan_candle_backfill(&gaps, 0, &ReconcilePlan::default()).is_empty());
+        assert!(plan_candle_backfill(&[], MIN, &ReconcilePlan::default()).is_empty());
     }
 }

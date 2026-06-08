@@ -67,6 +67,9 @@
 use crate::backfill::scheduler::{BackfillScheduler, GapInfo};
 use crate::metrics::prometheus_exporter::GAPS_DETECTED;
 use chrono::{DateTime, Utc};
+use janus_gap_detection::{
+    CandleBackfillWindow, ReconcilePlan, detect_candle_gaps, plan_candle_backfill,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -206,6 +209,53 @@ impl GapIntegrationManager {
             );
             self.stats.write().await.logged_only += 1;
         }
+    }
+
+    /// Reconcile a candle scan against the backfill scheduler.
+    ///
+    /// Given the ascending candle open-times present in storage (e.g. a QuestDB
+    /// `SELECT timestamp ... ORDER BY timestamp ASC` over `candles_crypto`) and
+    /// the bar `interval_ms`, this finds the holes ([`detect_candle_gaps`]),
+    /// turns them into a bounded, newest-first backfill plan
+    /// ([`plan_candle_backfill`]), and submits each window through the existing
+    /// [`handle_gap`](Self::handle_gap) path — so the candle-level reconciler
+    /// reuses the same filtering, deduplication, metrics, and scheduler queue as
+    /// the trade-stream detectors. Returns the number of windows planned.
+    ///
+    /// The caller owns the QuestDB read; this method is pure orchestration over
+    /// the supplied timestamps, so it stays unit-testable without a live store.
+    pub async fn handle_candle_scan(
+        &self,
+        exchange: &str,
+        symbol: &str,
+        timestamps_ms: &[i64],
+        interval_ms: i64,
+        plan: &ReconcilePlan,
+    ) -> usize {
+        let gaps = detect_candle_gaps(timestamps_ms, interval_ms);
+        let windows = plan_candle_backfill(&gaps, interval_ms, plan);
+        for window in &windows {
+            let Some((start_time, end_time)) = candle_window_range(window, interval_ms) else {
+                warn!(
+                    exchange = %exchange,
+                    symbol = %symbol,
+                    start_ms = window.start_ms,
+                    "Candle window timestamp out of range, skipping"
+                );
+                continue;
+            };
+            let duration_secs = (end_time - start_time).num_seconds();
+            let estimated_trades = estimate_gap_trades(duration_secs, exchange, symbol);
+            self.handle_gap(
+                exchange.to_string(),
+                symbol.to_string(),
+                start_time,
+                end_time,
+                estimated_trades,
+            )
+            .await;
+        }
+        windows.len()
     }
 
     /// Check if a gap should be processed
@@ -348,6 +398,19 @@ impl IntegrationStats {
 // ============================================================================
 // Helper Functions
 // ============================================================================
+
+/// Map a planned candle window to the `(start, end)` UTC range that covers every
+/// missing bar — `end` is the *close* of the last missing candle (`end_ms +
+/// interval_ms`), so the backfill range spans the whole window. Returns `None`
+/// if a timestamp falls outside the representable range.
+fn candle_window_range(
+    window: &CandleBackfillWindow,
+    interval_ms: i64,
+) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+    let start = DateTime::<Utc>::from_timestamp_millis(window.start_ms)?;
+    let end = DateTime::<Utc>::from_timestamp_millis(window.end_ms + interval_ms)?;
+    Some((start, end))
+}
 
 /// Estimate number of trades in a gap based on duration and typical rate
 ///
@@ -576,5 +639,44 @@ mod tests {
 
         assert_eq!(stats.total_processed(), 100);
         assert_eq!(stats.submission_rate(), 0.6);
+    }
+
+    #[test]
+    fn test_candle_window_range() {
+        // 3 missing 1m candles starting at 1·MIN; range ends at the close of the
+        // last missing bar (4·MIN), not its open (3·MIN).
+        let window = CandleBackfillWindow {
+            start_ms: 60_000,
+            end_ms: 180_000,
+            missing: 3,
+        };
+        let (start, end) = candle_window_range(&window, 60_000).unwrap();
+        assert_eq!(start.timestamp_millis(), 60_000);
+        assert_eq!(end.timestamp_millis(), 240_000);
+    }
+
+    #[tokio::test]
+    async fn test_handle_candle_scan_submits_windows() {
+        let scheduler = create_test_scheduler();
+        let manager =
+            GapIntegrationManager::new(GapIntegrationConfig::default(), scheduler.clone());
+
+        // 1-minute candles with a 3-candle hole between 1·MIN and 5·MIN.
+        let min_ms = 60_000i64;
+        let timestamps = [0, min_ms, 5 * min_ms, 6 * min_ms];
+        let planned = manager
+            .handle_candle_scan(
+                "binance",
+                "BTCUSD",
+                &timestamps,
+                min_ms,
+                &ReconcilePlan::default(),
+            )
+            .await;
+
+        assert_eq!(planned, 1);
+        let stats = manager.get_stats().await;
+        assert_eq!(stats.submitted, 1);
+        assert_eq!(scheduler.queue_size().await, 1);
     }
 }
