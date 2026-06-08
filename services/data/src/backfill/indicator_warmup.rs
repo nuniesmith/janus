@@ -429,7 +429,7 @@ const VALID_TIMEFRAMES: &[&str] = &[
 /// - Optional underscores, hyphens, or forward slashes for pairs
 /// - Max length of 20 characters
 /// - Examples: BTCUSD, BTC_USDT, BTC/USDT, ETH-PERP
-fn validate_symbol(symbol: &str) -> Result<String> {
+pub(crate) fn validate_symbol(symbol: &str) -> Result<String> {
     // Check length
     if symbol.is_empty() || symbol.len() > 20 {
         return Err(anyhow!("Symbol must be 1-20 characters"));
@@ -453,7 +453,7 @@ fn validate_symbol(symbol: &str) -> Result<String> {
 /// Validate timeframe input against known valid values
 ///
 /// Only allows specific timeframe strings to prevent injection
-fn validate_timeframe(timeframe: &str) -> Result<String> {
+pub(crate) fn validate_timeframe(timeframe: &str) -> Result<String> {
     // Check against whitelist of valid timeframes
     if VALID_TIMEFRAMES.contains(&timeframe) {
         return Ok(timeframe.to_string());
@@ -474,7 +474,7 @@ fn validate_timeframe(timeframe: &str) -> Result<String> {
 }
 
 /// Parse timestamp from QuestDB response (can be string or number)
-fn parse_timestamp(value: &serde_json::Value) -> Result<i64> {
+pub(crate) fn parse_timestamp(value: &serde_json::Value) -> Result<i64> {
     match value {
         serde_json::Value::Number(n) => n.as_i64().context("Timestamp not an i64"),
         serde_json::Value::String(s) => {
