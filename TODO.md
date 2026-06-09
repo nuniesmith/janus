@@ -244,9 +244,11 @@ janus half of the work.
       SvelteKit dashboard + nginx call (`/api/bars` / `/bars/{symbol}`, asset
       list, health, the signals/SSE feed). Either version janus's axum API to
       cover them or agree a trimmed janus-native set.
-- [ ] **Document the public surface** (also a P2 doc item): `/api/v1/brain/*`,
-      `/api/v1/risk/evaluate`, `/api/v1/positions/event`, the session-metrics
-      contract, env-var reference.
+- [x] **Documented the public surface** → [`docs/PUBLIC_API.md`](docs/PUBLIC_API.md):
+      the brain / data / forward / execution HTTP+WS routes (`/api/v1/brain/*`,
+      `/api/v1/risk/*` incl. `/risk/validate`, `/api/v1/positions/*`, the data
+      gaps/indicators/signals endpoints, the WS streams) and the full env-var
+      reference. (Serving the contract — above — is still the open half.)
 
 ### Track E — Long tail: rebuild only what's needed · RUST_MIGRATION Phase 5
 - [ ] News/sentiment, on-chain — port from `ruby/src/data/{news,chain}` *only if
@@ -463,7 +465,11 @@ gaps are below.
       validator) and `fks-proto`, dropped `indicators` (now the crates.io
       `indicators-ta` dep) and `bybit-client` (removed). Stats block corrected
       `50+ crate` → `39-crate`.
-- [ ] **Document the public surface.** Brain REST API (`/api/v1/brain/*`, `/api/v1/risk/evaluate`, `/api/v1/positions/event`), the JanusAI session-metrics contract, and the env-var reference.
+- [x] **Documented the public surface** → [`docs/PUBLIC_API.md`](docs/PUBLIC_API.md).
+      Brain / data / forward / execution HTTP+WS routes + the env-var reference
+      (core, execution/safety incl. `EXECUTION_MODE`, the gate `JANUS_GATE_*`,
+      the candle-scan `JANUS_CANDLE_SCAN_*`, and JanusAI). Path/method/purpose
+      level, grounded in the actual routers; payload shapes link to source.
 - [ ] **Surface prop-firm support.** `crates/models/src/prop_firm.rs` (`PropFirmValidator`, `ChallengeType`) is undocumented — note where/whether it's wired into execution.
 
 ---
