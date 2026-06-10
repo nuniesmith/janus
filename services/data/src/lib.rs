@@ -32,6 +32,7 @@
 
 pub mod actors;
 pub mod backfill;
+pub mod candle_sink;
 pub mod config;
 pub mod connectors;
 pub mod logging;
@@ -386,6 +387,21 @@ async fn run_live_mode(state: Arc<janus_core::JanusState>) -> janus_core::Result
     // Shared stats across all per-asset tasks
     let stats = Arc::new(IngestionStats::default());
 
+    // ── QuestDB candle persistence ────────────────────────────────────
+    // Closed klines published to the MarketDataBus are also written to the
+    // QuestDB `candles_crypto` table (the WebUI chart history source).
+    // Disable with DATA_PERSIST_CANDLES=false.
+    let candle_sink_handle = if candle_sink::persist_enabled() {
+        info!(
+            "  Candle persistence: enabled → {}:{} (candles_crypto)",
+            state.config.questdb.host, state.config.questdb.ilp_port
+        );
+        Some(tokio::spawn(candle_sink::run(state.clone())))
+    } else {
+        warn!("  Candle persistence: DISABLED (DATA_PERSIST_CANDLES=false)");
+        None
+    };
+
     // ── Spawn one WebSocket task per asset ────────────────────────────
     let mut task_handles = Vec::new();
 
@@ -478,6 +494,9 @@ async fn run_live_mode(state: Arc<janus_core::JanusState>) -> janus_core::Result
 
     // Cancel all tasks
     health_handle.abort();
+    if let Some(handle) = candle_sink_handle {
+        handle.abort();
+    }
     for handle in task_handles {
         handle.abort();
     }

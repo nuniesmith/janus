@@ -9,6 +9,7 @@
 
 mod param_updates;
 pub mod position_store;
+pub mod sse_bars;
 
 use axum::{
     Extension, Json, Router,
@@ -178,6 +179,8 @@ fn create_router(
         // Position event ingress (JFLOW-C foundation: receive + log, no guidance yet)
         .route("/api/v1/positions/event", post(position_event_handler))
         .route("/api/v1/positions/close", post(position_close_handler))
+        // Live closed-candle stream for the FKS WebUI chart (D1 bridge)
+        .route("/sse/bars/{symbol}", get(sse_bars::sse_bars_handler))
         .layer(Extension(position_store))
         .layer(Extension(param_manager))
         .layer(Extension(position_tracker))
@@ -1973,6 +1976,79 @@ mod tests {
         assert!(
             calls.lock().unwrap().is_empty(),
             "no strategy ⇒ no affinity call"
+        );
+    }
+
+    // ── /sse/bars/{symbol} ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn sse_bars_streams_matching_closed_klines() {
+        use futures_util::StreamExt;
+        use janus_core::{Exchange, KlineEvent, MarketDataEvent, Symbol};
+        use rust_decimal::Decimal;
+
+        let state = test_state().await;
+        let router = test_router(state.clone());
+
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("/sse/bars/BTC-USDT") // separator form must match BTCUSDT
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "text/event-stream"
+        );
+
+        let kline = |symbol: Symbol, interval: &str, close: i64| {
+            MarketDataEvent::Kline(KlineEvent {
+                exchange: Exchange::Binance,
+                symbol,
+                interval: interval.to_string(),
+                open_time: 1_700_000_000_000_000,
+                close_time: 1_700_000_059_999_000,
+                open: Decimal::from(50_000),
+                high: Decimal::from(50_100),
+                low: Decimal::from(49_900),
+                close: Decimal::from(close),
+                volume: Decimal::from(10),
+                quote_volume: None,
+                trades: None,
+                is_closed: true,
+            })
+        };
+
+        // Non-matching events first: wrong symbol, then wrong interval.
+        state
+            .market_data_bus
+            .publish(kline(Symbol::new("ETH", "USDT"), "1m", 1))
+            .unwrap();
+        state
+            .market_data_bus
+            .publish(kline(Symbol::new("BTC", "USDT"), "5m", 2))
+            .unwrap();
+        // The one frame the stream should emit.
+        state
+            .market_data_bus
+            .publish(kline(Symbol::new("BTC", "USDT"), "1m", 50_050))
+            .unwrap();
+
+        let mut body = resp.into_body().into_data_stream();
+        let chunk = tokio::time::timeout(std::time::Duration::from_secs(2), body.next())
+            .await
+            .expect("timed out waiting for SSE frame")
+            .expect("stream ended unexpectedly")
+            .expect("body error");
+        let frame = String::from_utf8(chunk.to_vec()).unwrap();
+
+        assert!(frame.contains("event: bar"), "got frame: {frame}");
+        assert!(frame.contains("\"close\":50050"), "got frame: {frame}");
+        assert!(frame.contains("\"time\":1700000000"), "got frame: {frame}");
+        assert!(
+            !frame.contains("\"close\":1") && !frame.contains("\"close\":2"),
+            "non-matching klines must be filtered out: {frame}"
         );
     }
 }
