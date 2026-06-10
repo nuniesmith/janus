@@ -5903,6 +5903,7 @@ dependencies = [
  "jflow-core",
  "prometheus",
  "redis",
+ "rust_decimal",
  "serde",
  "serde_json",
  "sqlx",
