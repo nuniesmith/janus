@@ -27,6 +27,7 @@ uuid.workspace = true
 prometheus.workspace = true
 redis.workspace = true
 rust_decimal.workspace = true
+reqwest.workspace = true
 futures-util = { workspace = true }
 sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "postgres", "chrono"], optional = true }
 
