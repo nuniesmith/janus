@@ -173,15 +173,26 @@ fn parse_exec_response(body: &Value) -> Vec<BarRow> {
         let Some((ts_iso, ts_ms)) = parse_ts(&cells[0]) else {
             continue;
         };
-        let f = |v: &Value| v.as_f64().unwrap_or(0.0);
+        // Every OHLCV cell must be numeric; a null/string cell means the row is
+        // malformed — skip it (like a bad timestamp) rather than render a
+        // misleading 0.0 candle that would draw a wick crashing to zero.
+        let (Some(open), Some(high), Some(low), Some(close), Some(volume)) = (
+            cells[1].as_f64(),
+            cells[2].as_f64(),
+            cells[3].as_f64(),
+            cells[4].as_f64(),
+            cells[5].as_f64(),
+        ) else {
+            continue;
+        };
         rows.push(BarRow {
             ts_iso,
             ts_ms,
-            open: f(&cells[1]),
-            high: f(&cells[2]),
-            low: f(&cells[3]),
-            close: f(&cells[4]),
-            volume: f(&cells[5]),
+            open,
+            high,
+            low,
+            close,
+            volume,
         });
     }
     rows
@@ -383,14 +394,17 @@ mod tests {
                 ["2026-06-11T00:00:00.000000Z", 100.0, 110.0, 95.0, 105.0, 12.5],
                 ["2026-06-11T00:01:00.000000Z", 105.0, 106.0, 99.0, 100.0, 8.0],
                 ["bad-ts", 1.0, 1.0, 1.0, 1.0, 1.0],
+                ["2026-06-11T00:02:00.000000Z", 1.0, null, 1.0, 1.0, 1.0],
                 [12345]
             ],
-            "count": 4
+            "count": 5
         })
     }
 
     #[test]
     fn parse_exec_response_skips_malformed_rows() {
+        // Fixture has 5 rows: 2 valid, plus a bad timestamp, a null OHLCV cell,
+        // and a too-short row — all three malformed rows must be dropped.
         let rows = parse_exec_response(&sample_body());
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].open, 100.0);
