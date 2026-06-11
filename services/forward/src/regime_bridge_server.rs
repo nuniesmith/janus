@@ -55,8 +55,8 @@
 //! use janus_forward::regime_bridge_server::RegimeBridgeServer;
 //! use janus_forward::regime_bridge_proto::regime_bridge_service_server::RegimeBridgeServiceServer;
 //!
-//! // In the forward service — share the event loop's broadcast sender
-//! let server = RegimeBridgeServer::new(event_loop_bridge_tx.clone());
+//! // In the forward service — share the live loop's broadcast sender
+//! let server = RegimeBridgeServer::new(live_loop_bridge_tx.clone());
 //!
 //! // Start the gRPC server
 //! tonic::transport::Server::builder()
@@ -272,7 +272,7 @@ impl RegimeBridgeServer {
     /// into the event loop's broadcast channel — no Redis hop required.
     ///
     /// ```rust,ignore
-    /// let bridge_tx = event_loop.regime_bridge_tx.clone();
+    /// let bridge_tx = live_loop.regime_bridge_tx.clone();
     /// let server = RegimeBridgeServer::new(bridge_tx);
     /// ```
     pub fn new(bridge_tx: broadcast::Sender<BridgedRegimeState>) -> Self {
@@ -915,7 +915,7 @@ impl Stream for GuardedStream {
 /// # Example
 ///
 /// ```rust,ignore
-/// let bridge_tx = event_loop.subscribe_regime_bridge_sender();
+/// let bridge_tx = live_loop.subscribe_regime_bridge_sender();
 /// let server = RegimeBridgeServer::new(bridge_tx);
 /// let handle = start_regime_bridge_grpc(server, 50052).await?;
 /// ```
@@ -975,7 +975,7 @@ pub async fn start_regime_bridge_grpc(
 /// use janus_forward::regime_bridge_auth::AuthConfig;
 ///
 /// let auth = AuthConfig::from_env(); // reads REGIME_GRPC_AUTH_TOKEN etc.
-/// let bridge_tx = event_loop.regime_bridge_sender();
+/// let bridge_tx = live_loop.regime_bridge_sender();
 /// let server = RegimeBridgeServer::new(bridge_tx);
 /// let handle = start_authenticated_regime_bridge_grpc(server, 50052, auth).await?;
 /// ```

@@ -1522,9 +1522,9 @@ pub fn spawn_regime_config_watcher<P: AsRef<Path> + Send + 'static>(
 
 /// Trait for types that contain a mutable `RegimeManager`.
 ///
-/// Implemented by `StrategyState` (in `event_loop.rs`) so the file watcher
-/// can access the regime manager through the shared state lock without
-/// knowing the full `StrategyState` type.
+/// Implemented by the live loop's per-symbol strategy state so the config
+/// file-watcher can reach the `RegimeManager` through the shared state lock
+/// without depending on the concrete state type.
 pub trait RegimeConfigHolder {
     /// Get a mutable reference to the `RegimeManager`.
     fn regime_manager_mut(&mut self) -> &mut RegimeManager;
