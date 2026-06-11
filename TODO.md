@@ -240,10 +240,17 @@ fks-full's removal of Ruby left its WebUI + nginx pointing at `fks_ruby` (still
 74 refs in nginx, 9 in `vite.config.ts`, 10 `ruby_signal` refs in the WebUI).
 janus must serve the contract before fks-full can repoint cleanly — that's the
 janus half of the work.
-- [ ] **Serve the WebUI/data contract from `lib/janus-api`** — the routes the
-      SvelteKit dashboard + nginx call (`/api/bars` / `/bars/{symbol}`, asset
-      list, health, the signals/SSE feed). Either version janus's axum API to
-      cover them or agree a trimmed janus-native set.
+- [~] **Serve the WebUI/data contract from `lib/janus-api`** — the routes the
+      SvelteKit dashboard + nginx call. **Chart path done:** `/sse/bars/{symbol}`
+      live tail (#106) + REST history `GET /bars/{symbol}` (columnar) and
+      `GET /bars/{symbol}/candles` (flat, ms timestamps), both reading
+      `candles_crypto` over `QUESTDB_HTTP_URL` with separator-insensitive
+      symbol matching — wire-shapes mirror what the UI parses (trading page /
+      MiniChart / charts page). **Remaining:** the front-page trio
+      `/api/pipeline/scores/json`, `/api/trades/open`, `/factory/status`
+      (+ `/factory/coverage/{symbol}`, asset list) — serve truthfully from
+      janus state (latest signals + QuestDB closes; PositionTracker; module
+      health) or agree a trimmed set; then fks-full's nginx/WebUI repoint.
 - [x] **Documented the public surface** → [`docs/PUBLIC_API.md`](docs/PUBLIC_API.md):
       the brain / data / forward / execution HTTP+WS routes (`/api/v1/brain/*`,
       `/api/v1/risk/*` incl. `/risk/validate`, `/api/v1/positions/*`, the data

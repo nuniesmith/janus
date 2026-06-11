@@ -7,6 +7,7 @@
 //! - Signal query endpoints
 //! - WebSocket streaming (optional)
 
+pub mod bars;
 mod param_updates;
 pub mod position_store;
 pub mod sse_bars;
@@ -181,6 +182,10 @@ fn create_router(
         .route("/api/v1/positions/close", post(position_close_handler))
         // Live closed-candle stream for the FKS WebUI chart (D1 bridge)
         .route("/sse/bars/{symbol}", get(sse_bars::sse_bars_handler))
+        // REST candle history for the chart's initial load (Track D contract):
+        // columnar for the trading page, flat ms-timestamps for MiniChart/charts.
+        .route("/bars/{symbol}", get(bars::bars_history_handler))
+        .route("/bars/{symbol}/candles", get(bars::bars_candles_handler))
         .layer(Extension(position_store))
         .layer(Extension(param_manager))
         .layer(Extension(position_tracker))

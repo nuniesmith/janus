@@ -57,6 +57,12 @@ dashboard/control API (and the closest successor to Ruby's API surface).
 | GET·POST | `/api/log-level` | read / set runtime log level |
 | POST | `/api/v1/positions/event` | **position guidance** — advisory `hold`/`reduce`/`exit` (JFLOW-C) |
 | POST | `/api/v1/positions/close` | finalize a position; returns/persists the realized outcome + feeds the gate breaker & affinity |
+| GET | `/bars/{symbol}` | **WebUI chart history** (columnar `{columns, data}`; `?interval=&days_back=&limit=`) from `candles_crypto` |
+| GET | `/bars/{symbol}/candles` | chart history, flat shape (`{candles: [{timestamp(ms), o,h,l,c,v}]}`) |
+| GET (SSE) | `/sse/bars/{symbol}` | live closed-candle stream (`event: bar`; `?interval=`, default `1m`) |
+
+Bars read QuestDB over `QUESTDB_HTTP_URL`; symbol matching is
+separator-insensitive (`BTCUSDT` ≡ `BTC-USDT`).
 
 Metrics router (separate, `JANUS_METRICS_PORT`): `GET /metrics`, `GET /health`.
 
