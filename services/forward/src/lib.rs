@@ -1100,8 +1100,25 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
             }
         }
         Err(e) => {
+            if execution_enabled {
+                // Fail closed: the brain is the autonomous executor, so it must
+                // not run the order path without an emergency stop. Refuse to
+                // start rather than place orders with no kill switch — the
+                // supervisor restarts forward with backoff. Recover by restoring
+                // Redis, or set ENABLE_EXECUTION=false to run signal-only.
+                tracing::error!(
+                    "🛑 Redis kill-switch unavailable ({e}) but ENABLE_EXECUTION=true — \
+                     refusing to start the live-execution path without an emergency stop. \
+                     Restore Redis, or set ENABLE_EXECUTION=false for signal-only mode."
+                );
+                return Err(janus_core::Error::module(
+                    "forward",
+                    format!("kill-switch required for live execution but unavailable: {e}"),
+                ));
+            }
             warn!(
-                "⚠️  Redis kill-switch unavailable ({e}); execution proceeds without kill-switch protection"
+                "⚠️  Redis kill-switch unavailable ({e}); ENABLE_EXECUTION=false so this is \
+                 non-fatal — running signal-only without kill-switch wiring"
             );
         }
     }
