@@ -572,7 +572,7 @@ impl ForwardService {
         // reconciled account every 5s to (a) publish live-account gauges and
         // (b) feed real USDT equity into the risk limits + portfolio total.
         // This updates risk *limits* only — it never touches the order-submit
-        // path or the `JANUS_RISK_ENFORCE` gate (enforcement stays advisory).
+        // path or the `JANUS_RISK_ENFORCE` gate (which now defaults to enforcing).
         if self.config.bybit_private_config.is_some() {
             let live_account = self.live_account();
             let risk_manager = self.risk_manager();
@@ -1361,21 +1361,21 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                     "prop-firm validation: advisory (logs + metadata only; set JANUS_PROP_FIRM_ENFORCE=1 to block)"
                 );
             }
-            // Portfolio-aware RiskManager enforcement (Track 3 Stage 5). Symmetric
-            // with prop-firm enforcement above and default-off: when set, a
+            // Portfolio-aware RiskManager enforcement (Track 3 Stage 5).
+            // Defaults ON: the brain is the autonomous executor, so the
+            // RiskManager is the hard safety net on the order path — a
             // RiskManager rejection blocks the execution submit (the signal is
-            // still published to the bus for observability). Preserves today's
-            // advisory behaviour unless explicitly enabled.
-            let risk_enforce = std::env::var("JANUS_RISK_ENFORCE")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false);
+            // still published to the bus for observability). Fail-safe: an
+            // unset or unrecognised value enforces; opt out explicitly with
+            // JANUS_RISK_ENFORCE=0/false. See `risk_enforce_enabled`.
+            let risk_enforce = risk_enforce_enabled(std::env::var("JANUS_RISK_ENFORCE").ok());
             if risk_enforce {
                 info!(
-                    "portfolio risk check: ENFORCING (RiskManager-rejected live entries will be blocked)"
+                    "portfolio risk check: ENFORCING (RiskManager-rejected live entries are blocked; set JANUS_RISK_ENFORCE=0 to disable)"
                 );
             } else {
-                info!(
-                    "portfolio risk check: advisory (logs + metadata only; set JANUS_RISK_ENFORCE=1 to block)"
+                warn!(
+                    "portfolio risk check: DISABLED via JANUS_RISK_ENFORCE — RiskManager rejections are advisory only (not recommended with live execution)"
                 );
             }
 
@@ -2476,9 +2476,45 @@ impl ParamReloadHandle {
     }
 }
 
+/// Whether portfolio risk enforcement is active (`JANUS_RISK_ENFORCE`).
+///
+/// Defaults **on** — under autonomous execution the RiskManager is the hard
+/// safety net, so a rejection must block the order submit. Fail-safe: only an
+/// explicit off-value (`0`/`false`/`no`/`off`) disables it, so an unset var or
+/// a typo enforces rather than silently opening the gate.
+fn risk_enforce_enabled(value: Option<String>) -> bool {
+    match value {
+        Some(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        ),
+        None => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn risk_enforce_defaults_on_and_fails_safe() {
+        // Unset ⇒ enforcing (the RiskManager is the hard safety net).
+        assert!(risk_enforce_enabled(None));
+        // Explicit opt-out values disable.
+        for off in ["0", "false", "FALSE", "no", "off", " off "] {
+            assert!(
+                !risk_enforce_enabled(Some(off.to_string())),
+                "{off:?} should disable enforcement"
+            );
+        }
+        // Enabling values + anything unrecognised (e.g. a typo) enforce.
+        for on in ["1", "true", "TRUE", "yes", "enforce", "ture"] {
+            assert!(
+                risk_enforce_enabled(Some(on.to_string())),
+                "{on:?} should enforce"
+            );
+        }
+    }
 
     #[test]
     fn prop_firm_inputs_atr_stop_and_risk_size() {

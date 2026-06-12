@@ -136,21 +136,10 @@ impl OrderManager {
     /// Submit a new order
     pub async fn submit_order(&self, mut order: Order) -> Result<String> {
         // ── Kill switch guard (defense-in-depth) ───────────────────────
-        // This check runs BEFORE validation, BEFORE any exchange I/O.
-        // It is a single atomic load — negligible latency on the hot path.
-        if let Some(gate) = &self.order_gate {
-            if gate.is_blocked() {
-                error!(
-                    order_id = %order.id,
-                    symbol = %order.symbol,
-                    side = ?order.side,
-                    "🚨 ORDER BLOCKED BY KILL SWITCH"
-                );
-                return Err(ExecutionError::KillSwitchActive(
-                    gate.block_reason().to_string(),
-                ));
-            }
-        }
+        // Runs BEFORE validation, BEFORE any exchange I/O — a single atomic
+        // load, negligible latency. Extracted to `evaluate_order_gate` so the
+        // invariant is unit-tested without QuestDB/Redis.
+        evaluate_order_gate(self.order_gate.as_ref(), &order)?;
 
         info!(
             order_id = %order.id,
@@ -638,6 +627,30 @@ pub struct OrderStatistics {
     pub total_orders_tracked: usize,
 }
 
+/// Evaluate the kill-switch order gate for an order.
+///
+/// Returns `Err(ExecutionError::KillSwitchActive)` when a gate is configured
+/// and reports blocked. This is the execution service's defense-in-depth
+/// guard — [`OrderManager::submit_order`] calls it before validation and any
+/// exchange I/O, so a blocked gate rejects the order outright. Kept as a pure
+/// fn (no I/O) so the safety invariant is unit-testable without QuestDB/Redis.
+fn evaluate_order_gate(gate: Option<&Arc<dyn OrderGate>>, order: &Order) -> Result<()> {
+    if let Some(gate) = gate {
+        if gate.is_blocked() {
+            error!(
+                order_id = %order.id,
+                symbol = %order.symbol,
+                side = ?order.side,
+                "🚨 ORDER BLOCKED BY KILL SWITCH"
+            );
+            return Err(ExecutionError::KillSwitchActive(
+                gate.block_reason().to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -654,5 +667,58 @@ mod tests {
     async fn test_order_lifecycle() {
         // This would require a running QuestDB instance
         // For now, we test the in-memory parts
+    }
+
+    fn gate_test_order() -> Order {
+        Order {
+            id: "gate-test-1".to_string(),
+            exchange_order_id: None,
+            client_order_id: None,
+            signal_id: "sig-1".to_string(),
+            symbol: "BTCUSD".to_string(),
+            exchange: "bybit".to_string(),
+            side: crate::types::OrderSide::Buy,
+            order_type: crate::types::OrderTypeEnum::Limit,
+            quantity: Decimal::from(1),
+            filled_quantity: Decimal::ZERO,
+            remaining_quantity: Decimal::from(1),
+            price: Some(Decimal::from(50000)),
+            stop_price: None,
+            average_fill_price: None,
+            time_in_force: crate::types::TimeInForceEnum::Gtc,
+            strategy: crate::types::ExecutionStrategyEnum::Immediate,
+            status: OrderStatusEnum::New,
+            fills: Vec::new(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            metadata: HashMap::new(),
+        }
+    }
+
+    // The single most safety-critical invariant in the execution service: a
+    // blocked kill-switch gate must reject an order outright, before any
+    // validation or exchange I/O. Exercised with the in-memory AtomicOrderGate
+    // (no Redis / QuestDB needed).
+    #[test]
+    fn blocked_gate_rejects_order() {
+        let gate: Arc<dyn OrderGate> =
+            Arc::new(crate::kill_switch_guard::AtomicOrderGate::new(true));
+        let err = evaluate_order_gate(Some(&gate), &gate_test_order())
+            .expect_err("a blocked gate must reject the order");
+        assert!(matches!(err, ExecutionError::KillSwitchActive(_)));
+    }
+
+    #[test]
+    fn open_gate_allows_order() {
+        let gate: Arc<dyn OrderGate> =
+            Arc::new(crate::kill_switch_guard::AtomicOrderGate::new(false));
+        assert!(evaluate_order_gate(Some(&gate), &gate_test_order()).is_ok());
+    }
+
+    #[test]
+    fn absent_gate_allows_order() {
+        // No gate configured ⇒ no block. The gate is defense-in-depth, so its
+        // absence must not itself reject orders.
+        assert!(evaluate_order_gate(None, &gate_test_order()).is_ok());
     }
 }
