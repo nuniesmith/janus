@@ -121,7 +121,7 @@ pub use trend_pullback::{
 pub use vwap_scalper::{VwapScalperConfig, VwapScalperResult, VwapScalperStrategy, VwapSignal};
 
 // ============================================================================
-// Backward-compatible simple EMA Flip (used by forward service event_loop.rs)
+// Backward-compatible simple EMA Flip (used by the forward service's live signal loop)
 // ============================================================================
 
 /// Signal types from EMA crossover.
