@@ -103,3 +103,35 @@ jobs:
           tags: fks-janus:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-clippy
+
+      # Non-blocking for now: janus carries a pre-existing clippy-warning
+      # backlog, so this runs WITHOUT `-D warnings` — clippy exits 0 and the job
+      # stays green while surfacing every lint as a PR annotation. The library
+      # repos (indicators-ta, exchange-apiws, spawner) already gate on
+      # `clippy -D warnings`; append `-- -D warnings` here to make it a required
+      # gate once the backlog is burned down.
+      # (jflow-neuromorphic excluded for the same cost reason as rust-check.)
+      - name: cargo clippy --workspace
+        run: cargo clippy --workspace --all-targets --exclude jflow-neuromorphic
