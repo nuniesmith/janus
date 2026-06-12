@@ -504,6 +504,32 @@ pub struct PositionState {
     pub peak_pnl_ratio: f64,
     /// Most recent guidance action issued for this position.
     pub last_action: GuidanceAction,
+    /// Latest economic snapshot from the most recent observed event. The
+    /// guidance fields above are *history*; these are the *current book*, so the
+    /// dashboard can list open positions truthfully (`/api/trades/open`).
+    pub symbol: String,
+    pub side: Side,
+    pub qty: f64,
+    pub entry_price: f64,
+    pub current_price: f64,
+    pub pnl_unrealized: f64,
+}
+
+/// A currently-tracked open position, as surfaced to the dashboard. Built from
+/// [`PositionState`], which can't derive `Serialize` (it holds `Instant`s).
+#[derive(Debug, Clone, Serialize)]
+pub struct OpenPosition {
+    pub position_id: String,
+    pub symbol: String,
+    pub side: Side,
+    pub qty: f64,
+    pub entry_price: f64,
+    pub current_price: f64,
+    pub pnl_unrealized: f64,
+    pub peak_pnl_ratio: f64,
+    pub samples: u64,
+    pub last_action: GuidanceAction,
+    pub seconds_in_position: u64,
 }
 
 impl PositionState {
@@ -587,6 +613,31 @@ impl PositionTracker {
         self.states.read().await.len()
     }
 
+    /// Snapshot of the currently-tracked open positions for the dashboard
+    /// (`/api/trades/open`). Prunes TTL-expired entries first, then returns the
+    /// latest economics + guidance state per position (order unspecified).
+    pub async fn open_positions(&self) -> Vec<OpenPosition> {
+        let now = Instant::now();
+        let mut states = self.states.write().await;
+        states.retain(|_, s| now.duration_since(s.last_seen) <= self.config.ttl);
+        states
+            .iter()
+            .map(|(id, s)| OpenPosition {
+                position_id: id.clone(),
+                symbol: s.symbol.clone(),
+                side: s.side,
+                qty: s.qty,
+                entry_price: s.entry_price,
+                current_price: s.current_price,
+                pnl_unrealized: s.pnl_unrealized,
+                peak_pnl_ratio: s.peak_pnl_ratio,
+                samples: s.samples,
+                last_action: s.last_action,
+                seconds_in_position: s.time_in_position().as_secs(),
+            })
+            .collect()
+    }
+
     /// Remove and return a position's accumulated state. Call this when the
     /// position closes so its guidance history can be joined with the realized
     /// outcome (see [`PositionOutcome::from_close`]). Returns `None` if the
@@ -629,11 +680,22 @@ impl PositionTracker {
             samples: 0,
             peak_pnl_ratio: ratio,
             last_action: GuidanceAction::Hold,
+            symbol: event.symbol.clone(),
+            side: event.side,
+            qty: event.qty,
+            entry_price: event.entry_price,
+            current_price: event.current_price,
+            pnl_unrealized: event.pnl_unrealized,
         });
         let prior_action = entry.last_action;
         entry.last_seen = now;
         entry.samples += 1;
         entry.peak_pnl_ratio = entry.peak_pnl_ratio.max(ratio);
+        // Refresh the latest economics (qty/price/pnl move; symbol/side/entry
+        // are fixed for the life of the position, set on insert above).
+        entry.qty = event.qty;
+        entry.current_price = event.current_price;
+        entry.pnl_unrealized = event.pnl_unrealized;
         let peak = entry.peak_pnl_ratio;
 
         let mut action = base.action;
@@ -1222,6 +1284,34 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn open_positions_lists_latest_economics() {
+        let tracker = PositionTracker::new();
+        // First snapshot opens the position.
+        tracker
+            .observe(&ev(Some("p1"), 200.0), Guidance::hold("ok"))
+            .await;
+        // A later snapshot moves price + pnl; open_positions must reflect it.
+        let mut later = ev(Some("p1"), 1_000.0);
+        later.current_price = 62_000.0;
+        tracker.observe(&later, Guidance::hold("ok")).await;
+
+        let open = tracker.open_positions().await;
+        assert_eq!(open.len(), 1);
+        let p = &open[0];
+        assert_eq!(p.position_id, "p1");
+        assert_eq!(p.symbol, "BTC-USD");
+        assert_eq!(p.side, Side::Buy);
+        assert_eq!(p.entry_price, 60_000.0);
+        assert_eq!(p.current_price, 62_000.0);
+        assert_eq!(p.pnl_unrealized, 1_000.0);
+        assert_eq!(p.samples, 2);
+
+        // An id-less snapshot is not tracked, so it never appears here.
+        tracker.observe(&ev(None, 50.0), Guidance::hold("ok")).await;
+        assert_eq!(tracker.open_positions().await.len(), 1);
+    }
+
     #[test]
     fn outcome_from_close_joins_tracker_state() {
         let now = Instant::now();
@@ -1231,6 +1321,12 @@ mod tests {
             samples: 3,
             peak_pnl_ratio: 0.08,
             last_action: GuidanceAction::Reduce,
+            symbol: "BTC-USD".to_string(),
+            side: Side::Buy,
+            qty: 0.5,
+            entry_price: 60_000.0,
+            current_price: 60_300.0,
+            pnl_unrealized: 150.0,
         };
         let o = PositionOutcome::from_close(&close_ev(Some("p"), 300.0), Some(&state));
         assert_eq!(o.samples, 3);

@@ -60,9 +60,14 @@ dashboard/control API (and the closest successor to Ruby's API surface).
 | GET | `/bars/{symbol}` | **WebUI chart history** (columnar `{columns, data}`; `?interval=&days_back=&limit=`) from `candles_crypto` |
 | GET | `/bars/{symbol}/candles` | chart history, flat shape (`{candles: [{timestamp(ms), o,h,l,c,v}]}`) |
 | GET (SSE) | `/sse/bars/{symbol}` | live closed-candle stream (`event: bar`; `?interval=`, default `1m`) |
+| GET | `/api/pipeline/scores/json` | `{assets:[…]}` — per-asset signal scores (latest signal per symbol: confidence→`score`, type→`cnn_signal`) |
+| GET | `/api/trades/open` | `{trades:[…]}` — currently-tracked open positions (from the `PositionTracker`) |
+| GET | `/factory/status` | data/runtime module health: per-module worker map + uptime |
 
 Bars read QuestDB over `QUESTDB_HTTP_URL`; symbol matching is
-separator-insensitive (`BTCUSDT` ≡ `BTC-USDT`).
+separator-insensitive (`BTCUSDT` ≡ `BTC-USDT`). The three front-page routes are
+served from janus state (signals / `PositionTracker` / module health) and
+degrade to empty-but-valid payloads when a backing store is unavailable.
 
 Metrics router (separate, `JANUS_METRICS_PORT`): `GET /metrics`, `GET /health`.
 

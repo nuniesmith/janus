@@ -11,6 +11,7 @@ pub mod bars;
 mod param_updates;
 pub mod position_store;
 pub mod sse_bars;
+pub mod webui_contract;
 
 use axum::{
     Extension, Json, Router,
@@ -186,6 +187,17 @@ fn create_router(
         // columnar for the trading page, flat ms-timestamps for MiniChart/charts.
         .route("/bars/{symbol}", get(bars::bars_history_handler))
         .route("/bars/{symbol}/candles", get(bars::bars_candles_handler))
+        // FKS WebUI front-page contract (Track D): per-asset scores, open
+        // trades, and data/runtime health — served truthfully from janus state.
+        .route(
+            "/api/pipeline/scores/json",
+            get(webui_contract::scores_handler),
+        )
+        .route("/api/trades/open", get(webui_contract::open_trades_handler))
+        .route(
+            "/factory/status",
+            get(webui_contract::factory_status_handler),
+        )
         .layer(Extension(position_store))
         .layer(Extension(param_manager))
         .layer(Extension(position_tracker))
@@ -508,7 +520,7 @@ async fn latest_signals_handler(
 }
 
 /// Fetch latest signals from Redis
-async fn fetch_latest_signals_from_redis(
+pub(crate) async fn fetch_latest_signals_from_redis(
     state: &Arc<JanusState>,
     limit: usize,
 ) -> Result<Vec<serde_json::Value>, ApiError> {
