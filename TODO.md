@@ -245,12 +245,15 @@ janus half of the work.
       live tail (#106) + REST history `GET /bars/{symbol}` (columnar) and
       `GET /bars/{symbol}/candles` (flat, ms timestamps), both reading
       `candles_crypto` over `QUESTDB_HTTP_URL` with separator-insensitive
-      symbol matching — wire-shapes mirror what the UI parses (trading page /
-      MiniChart / charts page). **Remaining:** the front-page trio
-      `/api/pipeline/scores/json`, `/api/trades/open`, `/factory/status`
-      (+ `/factory/coverage/{symbol}`, asset list) — serve truthfully from
-      janus state (latest signals + QuestDB closes; PositionTracker; module
-      health) or agree a trimmed set; then fks-full's nginx/WebUI repoint.
+      symbol matching. **Front-page trio done:** `/api/pipeline/scores/json`
+      (latest signal per symbol → score/`cnn_signal`), `/api/trades/open` (the
+      `PositionTracker`'s open positions — `PositionState` now retains the
+      latest economics), `/factory/status` (per-module health + uptime). All in
+      `lib/janus-api/src/webui_contract.rs`, served truthfully from janus state,
+      empty-safe. **Remaining:** the **fks-full side** — repoint nginx +
+      `vite.config.ts` off `fks_ruby` onto janus (74 nginx refs / 9 vite refs);
+      optional `/factory/coverage/{symbol}` + asset-list endpoints if the UI
+      still needs them (the `ruby_signal` field is retired). Tracked in fks-full.
 - [x] **Documented the public surface** → [`docs/PUBLIC_API.md`](docs/PUBLIC_API.md):
       the brain / data / forward / execution HTTP+WS routes (`/api/v1/brain/*`,
       `/api/v1/risk/*` incl. `/risk/validate`, `/api/v1/positions/*`, the data
