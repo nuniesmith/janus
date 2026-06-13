@@ -71,10 +71,27 @@ use janus_gap_detection::{
     CandleBackfillWindow, ReconcilePlan, detect_candle_gaps, plan_candle_backfill,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
+
+// Soft cap on the dedup cache before `mark_seen` triggers an eviction sweep.
+const DEDUP_SOFT_CAP: usize = 10_000;
+
+/// Whether `id` is present in `map` and newer than `window_secs` (the dedup
+/// window). Expired entries are treated as not-seen, so a gap that recurs after
+/// the window is re-submitted.
+fn is_recent(map: &HashMap<String, Instant>, id: &str, window_secs: u64) -> bool {
+    map.get(id)
+        .is_some_and(|t| t.elapsed().as_secs() < window_secs)
+}
+
+/// Drop entries older than `window_secs`, keeping the dedup cache bounded.
+fn prune_expired(map: &mut HashMap<String, Instant>, window_secs: u64) {
+    map.retain(|_, t| t.elapsed().as_secs() < window_secs);
+}
 
 // ============================================================================
 // Configuration
@@ -124,8 +141,9 @@ pub struct GapIntegrationManager {
     /// Reference to backfill scheduler
     scheduler: Arc<BackfillScheduler>,
 
-    /// Deduplication set (gap IDs we've recently seen)
-    seen_gaps: Arc<RwLock<HashSet<String>>>,
+    /// Deduplication cache: gap ID → first-seen time. Time-keyed so entries
+    /// expire after `dedup_window_secs` and the cache can't grow unbounded.
+    seen_gaps: Arc<RwLock<HashMap<String, Instant>>>,
 
     /// Statistics
     stats: Arc<RwLock<IntegrationStats>>,
@@ -137,7 +155,7 @@ impl GapIntegrationManager {
         Self {
             config,
             scheduler,
-            seen_gaps: Arc::new(RwLock::new(HashSet::new())),
+            seen_gaps: Arc::new(RwLock::new(HashMap::new())),
             stats: Arc::new(RwLock::new(IntegrationStats::default())),
         }
     }
@@ -304,36 +322,44 @@ impl GapIntegrationManager {
         true
     }
 
-    /// Check if a gap has been seen recently (deduplication)
+    /// Check if a gap has been seen within the dedup window.
     async fn is_duplicate(&self, gap: &GapInfo) -> bool {
         let gap_id = gap.gap_id();
+        let window = self.config.dedup_window_secs.max(0) as u64;
         let seen = self.seen_gaps.read().await;
-        seen.contains(&gap_id)
+        is_recent(&seen, &gap_id, window)
     }
 
-    /// Mark a gap as seen for deduplication
+    /// Mark a gap as seen (records the time so it expires after the window).
     async fn mark_seen(&self, gap: &GapInfo) {
         let gap_id = gap.gap_id();
+        let window = self.config.dedup_window_secs.max(0) as u64;
         let mut seen = self.seen_gaps.write().await;
-        seen.insert(gap_id);
+        seen.insert(gap_id, Instant::now());
 
-        // Note: In production, you'd want a cleanup task to remove old entries
-        // after dedup_window_secs to prevent unbounded growth
+        // Opportunistically evict expired entries once the cache crosses a soft
+        // cap, so it stays bounded by the dedup window even with no periodic
+        // cleanup task running.
+        if seen.len() > DEDUP_SOFT_CAP {
+            prune_expired(&mut seen, window);
+        }
     }
 
-    /// Cleanup old deduplication entries (should be called periodically)
+    /// Cleanup expired deduplication entries (honors `dedup_window_secs`). Safe
+    /// to call periodically; `mark_seen` also evicts opportunistically, so the
+    /// cache is bounded even if this is never scheduled.
     pub async fn cleanup_dedup_cache(&self) {
+        let window = self.config.dedup_window_secs.max(0) as u64;
         let mut seen = self.seen_gaps.write().await;
-        let initial_size = seen.len();
-
-        // In a real implementation, you'd track timestamps and remove old entries
-        // For now, if the set gets too large, clear it
-        if initial_size > 10000 {
-            warn!(
-                size = initial_size,
-                "Deduplication cache too large, clearing"
+        let before = seen.len();
+        prune_expired(&mut seen, window);
+        let removed = before - seen.len();
+        if removed > 0 {
+            debug!(
+                removed,
+                remaining = seen.len(),
+                "Pruned expired gap-dedup entries"
             );
-            seen.clear();
         }
     }
 
@@ -439,6 +465,26 @@ mod tests {
     use crate::backfill::BackfillLock;
     use crate::backfill::throttle::{BackfillThrottle, ThrottleConfig};
     use chrono::Duration;
+
+    #[test]
+    fn dedup_cache_recency_and_pruning() {
+        let mut m: HashMap<String, Instant> = HashMap::new();
+        m.insert("g1".to_string(), Instant::now());
+
+        // Present + within the window ⇒ recent; absent ⇒ not.
+        assert!(is_recent(&m, "g1", 3600));
+        assert!(!is_recent(&m, "g2", 3600));
+        // A zero-second window means everything is already expired.
+        assert!(!is_recent(&m, "g1", 0));
+
+        // prune_expired with a 0s window drops every entry (bounds the cache);
+        // a large window keeps fresh ones.
+        prune_expired(&mut m, 0);
+        assert!(m.is_empty());
+        m.insert("g3".to_string(), Instant::now());
+        prune_expired(&mut m, 3600);
+        assert_eq!(m.len(), 1);
+    }
 
     fn create_test_scheduler() -> Arc<BackfillScheduler> {
         let throttle = Arc::new(BackfillThrottle::new(ThrottleConfig::default()));
