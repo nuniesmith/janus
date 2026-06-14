@@ -1937,6 +1937,12 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                                         janus_core::SignalType::Sell => crate::signal::SignalType::Sell,
                                         _ => crate::signal::SignalType::Hold,
                                     };
+                                    // Stamp the entry price (= current close) so the RiskManager
+                                    // can size the position. Without it, calculate_position_size
+                                    // rejects every prospective entry with "Missing required data:
+                                    // entry_price" — which silently disabled the entire live
+                                    // execution path. Stop-loss + take-profit are auto-derived from
+                                    // ATR inside apply_risk_management.
                                     let ts = crate::signal::TradingSignal::new(
                                         symbol_str.clone(),
                                         fwd_type,
@@ -1945,7 +1951,8 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                                         crate::signal::SignalSource::TechnicalIndicator {
                                             name: strategies_used.join("+"),
                                         },
-                                    );
+                                    )
+                                    .with_entry_price(close);
                                     let mut md = crate::risk::MarketData::new(close);
                                     md.atr = analysis.atr;
                                     let rm = risk_manager.read().await;
