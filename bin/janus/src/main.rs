@@ -42,6 +42,14 @@ use tracing::{info, warn};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // ── 0. TLS crypto provider ───────────────────────────────────────
+    // tokio-tungstenite's wss:// path builds a rustls ClientConfig via
+    // ClientConfig::builder(), which needs a process-default CryptoProvider.
+    // This tree compiles both ring and aws-lc-rs, so the default is ambiguous;
+    // pin it to ring (matches reqwest/sqlx) to avoid a runtime panic. Pairs with
+    // the tokio-tungstenite `rustls-tls-webpki-roots` feature in Cargo.toml.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     // ── 1. Environment & Logging ─────────────────────────────────────
     let _ = dotenvy::dotenv();
 
