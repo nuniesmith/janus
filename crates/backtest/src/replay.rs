@@ -658,8 +658,7 @@ mod tests {
 
             // indicators-ta 0.2: IncrementalEma::update returns None during
             // warm-up; hold off on any crossover signal until both are ready.
-            let (Some(fast), Some(slow)) = (ema_fast.update(price), ema_slow.update(price))
-            else {
+            let (Some(fast), Some(slow)) = (ema_fast.update(price), ema_slow.update(price)) else {
                 return Ok(Signal::None);
             };
 
