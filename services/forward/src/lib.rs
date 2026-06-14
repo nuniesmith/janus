@@ -794,7 +794,8 @@ async fn fetch_warmup_klines(
     }
     let rows: Vec<Vec<serde_json::Value>> = resp.json().await.map_err(|e| e.to_string())?;
     let parse = |v: Option<&serde_json::Value>| -> Option<f64> {
-        v.and_then(serde_json::Value::as_str).and_then(|s| s.parse().ok())
+        v.and_then(serde_json::Value::as_str)
+            .and_then(|s| s.parse().ok())
     };
     let mut out = Vec::with_capacity(rows.len());
     for r in &rows {
