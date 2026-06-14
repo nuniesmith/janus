@@ -195,32 +195,43 @@ impl Router {
                     candle.symbol, candle.interval, candle.open, candle.close, candle.exchange
                 );
 
-                // Store to QuestDB
-                storage.store_candle(candle.clone()).await?;
+                // Forward to the indicator actor FIRST so real-time indicator /
+                // signal generation never depends on QuestDB being reachable: a
+                // persistence outage must not silently stall the analytics path.
+                {
+                    let indicator_sender = indicator_tx.read().await;
+                    if let Some(ref sender) = *indicator_sender {
+                        let candle_input = CandleInput {
+                            symbol: candle.symbol.clone(),
+                            exchange: candle.exchange.clone(),
+                            timeframe: candle.interval.clone(),
+                            timestamp: candle.open_time,
+                            open: candle.open,
+                            high: candle.high,
+                            low: candle.low,
+                            close: candle.close,
+                            volume: candle.volume,
+                        };
 
-                // Forward to indicator actor if connected
-                let indicator_sender = indicator_tx.read().await;
-                if let Some(ref sender) = *indicator_sender {
-                    let candle_input = CandleInput {
-                        symbol: candle.symbol.clone(),
-                        exchange: candle.exchange.clone(),
-                        timeframe: candle.interval.clone(),
-                        timestamp: candle.open_time,
-                        open: candle.open,
-                        high: candle.high,
-                        low: candle.low,
-                        close: candle.close,
-                        volume: candle.volume,
-                    };
-
-                    match sender.send(IndicatorMessage::Candle(candle_input)) {
-                        Err(e) => {
-                            warn!("Router: Failed to forward candle to indicator actor: {}", e);
-                        }
-                        _ => {
-                            *candles_forwarded += 1;
+                        match sender.send(IndicatorMessage::Candle(candle_input)) {
+                            Err(e) => {
+                                warn!("Router: Failed to forward candle to indicator actor: {}", e);
+                            }
+                            _ => {
+                                *candles_forwarded += 1;
+                            }
                         }
                     }
+                }
+
+                // Persist to QuestDB. Non-fatal: the candle already reached the
+                // indicators, and gap detection + backfill own historical
+                // completeness, so a write failure is logged, not propagated.
+                if let Err(e) = storage.store_candle(candle).await {
+                    warn!(
+                        "Router: Failed to persist candle to QuestDB (non-fatal): {}",
+                        e
+                    );
                 }
             }
 
