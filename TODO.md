@@ -386,13 +386,29 @@ janus half of the work.
   - `services/execution/tests/integration/scenarios.rs` (7) — test scaffolding, low priority.
   - **Next:** the 107 neuromorphic annotations have never been swept — that's the biggest untouched cluster.
 - [ ] **Panic-safety sweep.** ~8K `.unwrap()`/`.expect()` repo-wide — but a 2026-06 survey of the **live hot paths found them already panic-safe**, so this is *not* the urgent fire the raw count implies. forward's per-tick loop (`lib.rs`, `signal/`, `regime.rs`, `risk/`) and the `services/data` ingestion path have **zero unguarded non-test unwraps**: the genuine ones are guarded (peek-then-pop, `is_empty` checks), safe-by-construction (static `Regex::new`, Prometheus metric registration), or set-before-use invariants. The high per-file counts are **test modules + startup boilerplate**, not hot-path risk. Remaining genuine spots are sparse + low-priority: `bybit_compat::BybitClient::new`'s `.expect` (a pub exchange-client ctor, no callers today) and the un-surveyed crates (`persistence/`, `crates/*`, exchange clients). Keep as a rolling cleanup re-scoped to those, not a blanket ~8K sweep.
-- [ ] **Triage `cargo audit` advisories, then make the gate blocking.** First run (2026-05-31) found **10 vulnerabilities + 11 warnings**. The gate is non-blocking until these are cleared. Notable:
-  - ~~`rustls-webpki 0.103.10` (×3: RUSTSEC-2026-0098/0099/0104 — name-constraint bypass + CRL-parse panic)~~ **bumped to 0.103.13** (2026-06-11) — these three are cleared.
-  - `rsa 0.9.10` (RUSTSEC-2023-0071 Marvin timing sidechannel) — no upstream fix yet; transitive via a TLS/DB driver. Assess RSA-signing exposure.
-  - `astral-tokio-tar 0.5.6` (×4: PAX/symlink extraction) — only relevant if untrusted tars are extracted; confirm it's build/ML-only, not a request path.
-  - `pyo3 0.21.2`, `fast-float 0.2.0` — buffer/segfault in specific APIs; transitive, ML-adjacent.
-  - Warnings: unmaintained (`paste`, `bincode`, `rustls-pemfile`, `atomic-polyfill`, `core2`-yanked) + unsound (`rand` ×3 custom-logger edge, `rkyv`). Consider a `deny.toml` to triage/allowlist deliberately.
-  - Context: Janus generates signals and **never executes orders / isn't a public web service**, so exploitability of most of these is low — but the webpki bump and `rsa` assessment are worth doing.
+- [ ] **Triage `cargo audit` advisories, then make the gate blocking.** Re-audited
+      2026-06-13 (`cargo-audit 0.22.2`, 1184 deps): **5 vulnerabilities** + unmaintained/
+      unsound warnings, down from 10. Cleared:
+  - ~~`rustls-webpki 0.103.10` (×3: RUSTSEC-2026-0098/0099/0104)~~ → 0.103.13 (#109).
+  - ~~`postgres-protocol 0.6.10` (×2: RUSTSEC-2026-0179/0180 — SCRAM CPU-exhaustion +
+    `hstore` panic) · `tokio-postgres 0.7.16` (RUSTSEC-2026-0178 — `DataRow` panic)~~ →
+    0.6.12 / 0.7.18 (2026-06-13) — three DoS advisories cleared by a patch-level bump.
+  - ~~`pyo3 0.21.2`, `fast-float 0.2.0`~~ — no longer in the lock (dropped by transitive updates).
+  Remaining (both already assessed as accept-for-now):
+  - `astral-tokio-tar 0.5.6` (×4: RUSTSEC-2026-0066/0112/0113/0145 — PAX/symlink
+    extraction) — **dev-only**: pulled solely by `testcontainers 0.26.3` (a dev-dependency
+    pinned `^0.5.6`), so it's never in the shipped binary and only touches test-time
+    container-image extraction. Clearing it needs a `testcontainers` major bump (to a
+    release on tar ≥0.6.2) + adapting the integration tests — deferred, low real risk.
+  - `rsa 0.9.10` (RUSTSEC-2023-0071 Marvin timing sidechannel) — no upstream fix;
+    transitive via the DB/TLS stack, no RSA signing on a janus hot path.
+  - Warnings (no fix; candidates for a `deny.toml` allowlist): unmaintained `paste`,
+    `bincode`, `rustls-pemfile`, `atomic-polyfill`, yanked `core2`; unsound `rand`
+    (custom-logger edge) / `rkyv`.
+  - Context: janus generates signals, **never executes orders / isn't a public web
+    service**, so exploitability is low. **To flip the gate blocking:** add a `deny.toml`
+    allowlisting the 5 remaining (rsa + the 4 dev-only tar) with rationale, then drop the
+    `exit 0` in `security.yml` so *new* advisories red-line `main`.
 - [x] **Reconciled `services/data/docs/TODO_IMPLEMENTATION_PLAN.md` (2026-05-31).** Added a "SUPERSEDED" banner mapping its stale "NOT IMPLEMENTED" P0/P1 items to the code that actually implements them (backfill lock/throttle, circuit breaker, Prometheus export, dedup, Docker secrets, rate limiter, QuestDB writer), and pointing at this file as the single source of truth. Kept non-destructively — ~9 sibling docs in that dir cross-link it, and the code templates remain useful for the genuinely-open items.
 - [ ] **Tonic version split.** Workspace declares `0.14.2` but some crates resolve `0.10.2` transitively via `apalis`. Track and resolve when `apalis` hits 1.0 stable.
 - [ ] **STRUCT-C: proto consolidation.** Fold the stray `services/forward/proto/janus/v1/janus.proto` into `proto/fks/janus/v1/signal_service.proto` once `GrpcServer` ownership is decided (`services/forward/build.rs:14-19`). Also resolves the dual `ForwardService` (`fks.janus.v1` 4 RPCs vs `fks.forward.v1` 7 RPCs).
