@@ -767,6 +767,44 @@ impl ForwardService {
     }
 }
 
+/// Historical bars used to seed a fresh per-symbol analyzer on first sight, so
+/// indicators are warm immediately instead of after this many live closes.
+const WARMUP_BARS: u32 = 200;
+
+/// Fetch the last `limit` closed klines for warmup from Binance's public REST
+/// (no auth). Returns `(high, low, close)` tuples oldest-first. Best-effort: any
+/// error just means the analyzer warms from live klines as before.
+async fn fetch_warmup_klines(
+    symbol: &str,
+    interval: &str,
+    limit: u32,
+) -> std::result::Result<Vec<(f64, f64, f64)>, String> {
+    // Binance kline row: [openTime, open, high, low, close, volume, ...]
+    let url = format!(
+        "https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
+    );
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("binance klines HTTP {}", resp.status()));
+    }
+    let rows: Vec<Vec<serde_json::Value>> = resp.json().await.map_err(|e| e.to_string())?;
+    let parse = |v: Option<&serde_json::Value>| -> Option<f64> {
+        v.and_then(serde_json::Value::as_str).and_then(|s| s.parse().ok())
+    };
+    let mut out = Vec::with_capacity(rows.len());
+    for r in &rows {
+        if let (Some(h), Some(l), Some(c)) = (parse(r.get(2)), parse(r.get(3)), parse(r.get(4))) {
+            out.push((h, l, c));
+        }
+    }
+    Ok(out)
+}
+
 /// Start the forward module as part of the unified JANUS system
 ///
 /// This function is called by the unified JANUS binary to start the forward signal generation module.
@@ -1526,10 +1564,42 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                                 let gate_asset = janus_core::base_asset(&symbol_str).to_string();
                                 let analyzer_key = format!("{}:{}", symbol_str, kline.interval);
 
-                                // Get or create analyzer for this symbol+interval
+                                // Get or create analyzer for this symbol+interval. On first
+                                // sight, seed the analyzer (and the regime detector) from
+                                // historical bars so indicators are warm immediately — avoids
+                                // the long cold-start blackout where, until ~WARMUP_BARS live
+                                // closes accrued, the brain produced no usable signals and the
+                                // execution path sat idle after every restart. Best-effort:
+                                // on any fetch error the analyzer just warms from live klines.
+                                if !analyzers.contains_key(&analyzer_key) {
+                                    let mut fresh = IndicatorAnalyzer::new(ind_config.clone());
+                                    let bsym = symbol_str.replace('/', "");
+                                    match fetch_warmup_klines(&bsym, &kline.interval, WARMUP_BARS).await {
+                                        Ok(bars) if !bars.is_empty() => {
+                                            for (h, l, c) in &bars {
+                                                let _ = fresh.update_hlc(*h, *l, *c);
+                                                let _ = regime_manager.on_candle(&symbol_str, *h, *l, *c);
+                                            }
+                                            info!(
+                                                "[{}] warmed analyzer from {} historical bars",
+                                                analyzer_key,
+                                                bars.len()
+                                            );
+                                        }
+                                        Ok(_) => tracing::debug!(
+                                            "[{}] no historical bars returned; warming from live",
+                                            analyzer_key
+                                        ),
+                                        Err(e) => warn!(
+                                            "[{}] warmup fetch failed ({e}); warming from live",
+                                            analyzer_key
+                                        ),
+                                    }
+                                    analyzers.insert(analyzer_key.clone(), fresh);
+                                }
                                 let analyzer = analyzers
-                                    .entry(analyzer_key.clone())
-                                    .or_insert_with(|| IndicatorAnalyzer::new(ind_config.clone()));
+                                    .get_mut(&analyzer_key)
+                                    .expect("analyzer present (just inserted or pre-existing)");
 
                                 // Convert Decimal to f64 for indicator calculation
                                 use rust_decimal::prelude::ToPrimitive;
