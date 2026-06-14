@@ -27,6 +27,10 @@ tokio-util.workspace = true
 async-trait.workspace = true
 futures.workspace = true
 
+# TLS — install ring as the rustls process-default CryptoProvider (see main.rs).
+# default-features=false avoids pulling aws-lc-rs; ring matches reqwest/sqlx.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+
 # Logging
 tracing.workspace = true
 tracing-subscriber.workspace = true

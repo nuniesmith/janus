@@ -129,7 +129,10 @@ janus-registry-lib = { path = "crates/registry", package = "jflow-registry-lib",
 # Async Runtime
 tokio = { version = "1.48.0", features = ["full"] }
 tokio-util = { version = "0.7.17", features = ["rt"] }
-tokio-tungstenite = "0.28.0"
+# rustls-tls-webpki-roots: enable TLS so wss:// feeds connect (without a TLS
+# feature, connect_async fails with "TLS support not compiled in"). rustls to
+# match reqwest/sqlx; provider pinned to ring via install_default() in bin/janus.
+tokio-tungstenite = { version = "0.28.0", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3.31"
 futures = "0.3.31"
 async-trait = "0.1.83"

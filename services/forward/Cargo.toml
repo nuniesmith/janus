@@ -126,8 +126,8 @@ rust_decimal = { version = "1.39.0", features = ["serde-float"] }
 # Database (for signal caching, minimal use)
 sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid", "json"], optional = true }
 
-# WebSocket
-tokio-tungstenite = "0.28.0"
+# WebSocket — rustls TLS so wss:// connects (see workspace Cargo.toml note)
+tokio-tungstenite = { version = "0.28.0", features = ["rustls-tls-webpki-roots"] }
 async-trait = { workspace = true }
 
 # Redis (for real-time state)
