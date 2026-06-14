@@ -5426,14 +5426,12 @@ dependencies = [
 
 [[package]]
 name = "indicators-ta"
-version = "0.1.5"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f33d74c7f3541938f1e3f1b9d57d7d93d7129272697958614fbdd397dbeebf9"
+checksum = "093a52a2d6bc6614a58b81a98279c974f1ebba568c77a7c8bd0b3d95ffb5da63"
 dependencies = [
- "anyhow",
  "chrono",
  "indexmap 2.13.0",
- "polars",
  "serde",
  "serde_json",
 ]

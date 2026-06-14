@@ -656,8 +656,12 @@ mod tests {
             }
             let price = ticks[0].price;
 
-            let fast = ema_fast.update(price);
-            let slow = ema_slow.update(price);
+            // indicators-ta 0.2: IncrementalEma::update returns None during
+            // warm-up; hold off on any crossover signal until both are ready.
+            let (Some(fast), Some(slow)) = (ema_fast.update(price), ema_slow.update(price))
+            else {
+                return Ok(Signal::None);
+            };
 
             let signal = if let (Some(pf), Some(ps)) = (prev_fast, prev_slow) {
                 if pf <= ps && fast > slow {

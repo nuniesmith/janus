@@ -104,7 +104,7 @@ janus-gap-detection = { path = "crates/gap-detection", package = "jflow-gap-dete
 # and `janus-indicators.workspace = true` keeps working unchanged — Cargo's
 # package rename maps the key to the published crate (whose own lib is
 # `indicators`). The internal `crates/indicators` (jflow-indicators) is retired.
-janus-indicators = { package = "indicators-ta", version = "0.1.5" }
+janus-indicators = { package = "indicators-ta", version = "0.2" }
 janus-strategies = { path = "crates/strategies", package = "jflow-strategies", version = "0.1.0" }
 janus-risk = { path = "crates/risk", package = "jflow-risk", version = "0.1.0" }
 janus-execution-gate = { path = "crates/execution-gate", package = "jflow-execution-gate", version = "0.1.0" }
