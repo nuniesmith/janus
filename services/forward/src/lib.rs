@@ -1219,22 +1219,41 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
     // Externally accessible once docker-compose maps 127.0.0.1:7001:8180.
     if let Some(brain_state) = brain_rest_state {
         let brain_port = forward_config.rest_port; // http_port + 100 = 8180
+        // Mount the FULL forward REST router (signals + risk + brain health) on
+        // 8180 — not just brain health. This is the unified-binary REST surface
+        // external bots call: crypto-demo's JanusBrain POSTs /api/v1/signals/generate
+        // and /api/v1/risk/* here. No port conflict — janus_api owns 8080, this
+        // owns http_port + 100 (8180). Reuses the in-process signal generator,
+        // risk manager, and portfolio so it stays consistent with the live loop.
+        // The REST API wants an Arc<RwLock<SignalGenerator>>; the live loop shares
+        // an Arc<SignalGenerator>. Wrap a fresh generator from the same config for
+        // the on-demand /signals/generate endpoint, exactly as the standalone
+        // start() does. Risk manager + portfolio ARE the live shared handles, so
+        // /risk/* and /portfolio reflect real state.
+        let rest_state = crate::api::server::RestServerState::with_brain_health(
+            Arc::new(RwLock::new(SignalGenerator::new(
+                forward_config.signal_config.clone(),
+            ))),
+            Arc::clone(&risk_manager_handle),
+            Arc::clone(&portfolio_handle),
+            brain_state,
+        );
         tokio::spawn(async move {
-            let router = crate::api::brain_rest::router(brain_state);
+            let router = crate::api::server::RestServer::router(rest_state);
             let addr = format!("0.0.0.0:{}", brain_port);
             match tokio::net::TcpListener::bind(&addr).await {
                 Ok(listener) => {
                     info!(
-                        "🧠 Brain REST server listening on port {} (forward REST, unified mode)",
+                        "🧠 Forward REST server (signals + risk + brain) listening on port {} (unified mode)",
                         brain_port
                     );
                     if let Err(e) = axum::serve(listener, router).await {
-                        tracing::warn!("⚠️  Brain REST server exited unexpectedly: {}", e);
+                        tracing::warn!("⚠️  Forward REST server exited unexpectedly: {}", e);
                     }
                 }
                 Err(e) => {
                     tracing::warn!(
-                        "⚠️  Failed to bind brain REST server on port {}: {}",
+                        "⚠️  Failed to bind forward REST server on port {}: {}",
                         brain_port,
                         e
                     );
