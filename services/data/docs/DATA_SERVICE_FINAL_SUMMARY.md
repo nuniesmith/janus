@@ -489,7 +489,7 @@ All tests pass when Docker environment is running:
 - **Slack**: #data-service-alerts
 - **PagerDuty**: Data Infrastructure rotation
 - **Email**: data-sre@company.com
-- **Wiki**: https://wiki.internal/data-service
+- **Wiki**: https://wiki.example.com/data-service
 
 ### Key Commands
 
