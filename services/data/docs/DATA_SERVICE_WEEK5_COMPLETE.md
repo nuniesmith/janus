@@ -651,7 +651,7 @@ Ready for K8s deployment with:
 **On-Call**: See PagerDuty rotation  
 **Slack**: #data-service-alerts  
 **Runbooks**: `/docs/runbooks/` (in progress)  
-**Dashboards**: http://grafana.internal/dashboards/data-service  
+**Dashboards**: http://grafana.example.com/dashboards/data-service  
 
 ---
 

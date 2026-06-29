@@ -27,8 +27,8 @@ global:
 
   # Global SMTP settings (uncomment and configure for email alerts)
   # smtp_smarthost: 'smtp.example.com:587'
-  # smtp_from: 'alertmanager@janus.internal'
-  # smtp_auth_username: 'alertmanager@janus.internal'
+  # smtp_from: 'alertmanager@example.com'
+  # smtp_auth_username: 'alertmanager@example.com'
   # smtp_auth_password: '{{ SMTP_PASSWORD }}'
   # smtp_require_tls: true
 

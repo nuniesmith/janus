@@ -38,8 +38,8 @@ groups:
             All new position entries are blocked. This may be intentional (operator action)
             or triggered automatically by the watchdog.
             Check: curl -s http://{{ $labels.instance }}/api/v1/brain/health | jq .
-          runbook_url: "https://docs.internal/janus/runbook#kill-switch"
-          dashboard_url: "https://grafana.internal/d/janus-brain/brain-pipeline"
+          runbook_url: "https://docs.example.com/janus/runbook#kill-switch"
+          dashboard_url: "https://grafana.example.com/d/janus-brain/brain-pipeline"
 
       - alert: BrainKillSwitchActivatedRecently
         expr: changes(janus_brain_kill_switch_active[5m]) > 0 and janus_brain_kill_switch_active == 1
@@ -79,7 +79,7 @@ groups:
             Current block rate: {{ $value | humanizePercentage }}.
             This may indicate overly aggressive gating, a regime detection issue,
             or stale market data driving low confidence.
-          runbook_url: "https://docs.internal/janus/runbook#high-block-rate"
+          runbook_url: "https://docs.example.com/janus/runbook#high-block-rate"
 
       - alert: BrainVeryHighBlockRate
         expr: >-
@@ -125,7 +125,7 @@ groups:
             The brain runtime pre-flight checks did not pass. The pipeline may be running
             in degraded mode or completely non-functional. Check service logs and the
             health endpoint for details.
-          runbook_url: "https://docs.internal/janus/runbook#boot-failure"
+          runbook_url: "https://docs.example.com/janus/runbook#boot-failure"
 
   # ──────────────────────────────────────────────────────────────────
   # Pipeline Latency
@@ -191,7 +191,7 @@ groups:
             The CNS watchdog has detected {{ $value }} component(s) with no heartbeat.
             Dead components may trigger an automatic kill switch if configured.
             Check the health endpoint: curl -s http://{{ $labels.instance }}/api/v1/brain/health | jq .watchdog
-          runbook_url: "https://docs.internal/janus/runbook#watchdog-dead"
+          runbook_url: "https://docs.example.com/janus/runbook#watchdog-dead"
 
       - alert: BrainWatchdogDegradedComponents
         expr: janus_brain_watchdog_degraded_count > 0
