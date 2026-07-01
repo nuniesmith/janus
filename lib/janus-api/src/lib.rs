@@ -298,6 +298,10 @@ pub struct DashboardPerformanceResponse {
     pub win_rate: f64,
     pub profit_factor: f64,
     pub sharpe_ratio: f64,
+    /// Marks `win_rate` / `profit_factor` / `sharpe_ratio` as not-yet-computed
+    /// placeholders (no realised-PnL tracking is wired) so callers don't render
+    /// the zeros as real performance. Drop this once backed by trade history.
+    pub pnl_metrics_status: &'static str,
 }
 
 #[derive(Debug, Deserialize)]
@@ -418,6 +422,7 @@ async fn dashboard_performance_handler(
         win_rate: 0.0,
         profit_factor: 0.0,
         sharpe_ratio: 0.0,
+        pnl_metrics_status: "unimplemented_placeholder",
     };
 
     Ok(Json(response))
@@ -612,17 +617,48 @@ async fn signal_summary_handler(
         })
         .unwrap_or_default();
 
-    let mut by_type = HashMap::new();
-    by_type.insert("buy".to_string(), state.signals_generated() / 3);
-    by_type.insert("sell".to_string(), state.signals_generated() / 3);
-    by_type.insert("hold".to_string(), state.signals_generated() / 3);
+    // Aggregate over the recently-persisted signals (written by the forward
+    // signal→Redis persistence subscriber) instead of fabricating from a
+    // counter. An empty window yields honest zeros rather than invented
+    // buy/sell/hold thirds and a constant 0.65 confidence.
+    let recent = fetch_latest_signals_from_redis(&state, 500)
+        .await
+        .unwrap_or_default();
+
+    let mut by_type: HashMap<String, u64> = HashMap::new();
+    for t in ["buy", "sell", "hold", "close"] {
+        by_type.insert(t.to_string(), 0);
+    }
+    let mut confidence_sum = 0.0_f64;
+    let mut confidence_n = 0_u64;
+    let mut strong_signals = 0_u64;
+    for sig in &recent {
+        if let Some(t) = sig.get("signal_type").and_then(|v| v.as_str()) {
+            *by_type.entry(t.to_lowercase()).or_insert(0) += 1;
+        }
+        if let Some(c) = sig.get("confidence").and_then(|v| v.as_f64()) {
+            confidence_sum += c;
+            confidence_n += 1;
+            if c >= 0.7 {
+                strong_signals += 1;
+            }
+        }
+    }
+    let average_confidence = if confidence_n > 0 {
+        confidence_sum / confidence_n as f64
+    } else {
+        0.0
+    };
 
     let response = SignalSummaryResponse {
         category: query.category,
         symbols,
+        // Lifetime count of signals generated on the bus (a real counter);
+        // the per-type / strength / confidence breakdown below reflects the
+        // recent persisted window.
         total_signals: state.signals_generated(),
-        strong_signals: state.signals_generated() / 5, // ~20% are strong
-        average_confidence: 0.65,
+        strong_signals,
+        average_confidence,
         by_type,
     };
 

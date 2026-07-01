@@ -38,6 +38,7 @@
 
 pub mod affinity_redis;
 pub mod kill_switch_redis;
+pub mod signal_redis;
 
 pub use affinity_redis::{
     AffinityRedisConfig, AffinityRedisStore, load_pipeline_affinity, save_pipeline_affinity,
@@ -48,3 +49,5 @@ pub use kill_switch_redis::{
     KillSwitchEvent, KillSwitchState, RedisKillSwitch, RedisKillSwitchConfig,
     wire_and_spawn_redis_kill_switch, wire_redis_kill_switch,
 };
+
+pub use signal_redis::spawn_signal_persistence;
