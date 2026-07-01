@@ -2412,6 +2412,13 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
         info!("Forward signal receiver loop exited");
     });
 
+    // Persist every published signal to Redis so the janus-api read path
+    // (/api/signals/latest, /api/signals/by-symbol, /api/pipeline/scores/json)
+    // and the WebUI dashboard's recent_signals populate. SignalBus::publish is
+    // an in-process broadcast only; without this subscriber the janus:signals:*
+    // keys are never written and those endpoints always return empty.
+    let _signal_persist_task = persistence::spawn_signal_persistence(state.clone());
+
     // Wait for shutdown
     while !state.is_shutdown_requested() {
         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
