@@ -178,9 +178,59 @@ impl LiveDataConfig {
 struct IngestionStats {
     trades_received: std::sync::atomic::AtomicU64,
     klines_received: std::sync::atomic::AtomicU64,
+    /// CLOSED klines seen, independent of whether the bus publish succeeded
+    /// (publishing fails with zero subscribers, e.g. forward not started).
+    /// This is the numerator of the data-completeness SLI.
+    klines_closed: std::sync::atomic::AtomicU64,
     klines_published: std::sync::atomic::AtomicU64,
     errors: std::sync::atomic::AtomicU64,
     reconnects: std::sync::atomic::AtomicU64,
+}
+
+/// Parse a kline interval string ("1m", "5m", "1h", "1d", …) into seconds.
+/// Returns `None` for unrecognised units (e.g. Binance's "1M" month).
+fn interval_secs(interval: &str) -> Option<u64> {
+    let (num, unit) = interval.split_at(interval.len().checked_sub(1)?);
+    let n: u64 = num.parse().ok()?;
+    if n == 0 {
+        return None;
+    }
+    let mult = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3_600,
+        "d" => 86_400,
+        "w" => 604_800,
+        _ => return None,
+    };
+    Some(n * mult)
+}
+
+/// Closed klines expected on ONE symbol × ONE interval between two instants:
+/// the number of whole interval boundaries crossed, minus a grace period so
+/// the most recent boundary's kline (typically in flight for a second or two)
+/// is never counted as missing.
+fn expected_closed_klines(
+    anchor_epoch: u64,
+    now_epoch: u64,
+    grace_secs: u64,
+    interval_secs: u64,
+) -> u64 {
+    let effective_now = now_epoch.saturating_sub(grace_secs);
+    if effective_now <= anchor_epoch || interval_secs == 0 {
+        return 0;
+    }
+    (effective_now / interval_secs).saturating_sub(anchor_epoch / interval_secs)
+}
+
+/// Data-completeness percentage over a window: closed klines received vs
+/// expected across all assets/intervals, capped at 100 (reconnect replays can
+/// briefly over-deliver).
+fn completeness_pct(received: u64, expected: u64) -> f64 {
+    if expected == 0 {
+        return 0.0;
+    }
+    (100.0 * received as f64 / expected as f64).min(100.0)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -426,10 +476,36 @@ async fn run_live_mode(state: Arc<janus_core::JanusState>) -> janus_core::Result
     let health_poll_secs = config.health_poll_secs;
     let asset_count = config.assets.len();
 
+    // Completeness SLI inputs: parsed kline interval durations. Unparseable
+    // intervals are excluded from the expectation (warned once here).
+    let kline_interval_secs: Vec<u64> = config
+        .kline_intervals
+        .iter()
+        .filter_map(|s| {
+            let parsed = interval_secs(s);
+            if parsed.is_none() {
+                warn!("completeness SLI: unrecognised kline interval '{s}' — excluded");
+            }
+            parsed
+        })
+        .collect();
+
     let health_handle = tokio::spawn(async move {
         let mut interval =
             tokio::time::interval(tokio::time::Duration::from_secs(health_poll_secs));
         let mut tick_count: u64 = 0;
+
+        // ── data_completeness_percent (rolling window) ────────────────
+        // Snapshots of (epoch secs, cumulative closed klines). Each tick the
+        // window's oldest entry anchors the expectation: completeness =
+        // closed-klines-received / boundary-aligned-expected over the window.
+        // The gauge stays 0 (and the DataCompletenessLow alert stays gated)
+        // until the window spans two of the longest interval, so cold starts
+        // never report a bogus low completeness.
+        const COMPLETENESS_WINDOW_SECS: u64 = 1800;
+        const COMPLETENESS_GRACE_SECS: u64 = 15;
+        let mut window: std::collections::VecDeque<(u64, u64)> = std::collections::VecDeque::new();
+        let max_interval = kline_interval_secs.iter().copied().max().unwrap_or(0);
 
         loop {
             tokio::select! {
@@ -438,6 +514,7 @@ async fn run_live_mode(state: Arc<janus_core::JanusState>) -> janus_core::Result
 
                     let trades = stats_health.trades_received.load(std::sync::atomic::Ordering::Relaxed);
                     let klines = stats_health.klines_received.load(std::sync::atomic::Ordering::Relaxed);
+                    let closed = stats_health.klines_closed.load(std::sync::atomic::Ordering::Relaxed);
                     let published = stats_health.klines_published.load(std::sync::atomic::Ordering::Relaxed);
                     let errors = stats_health.errors.load(std::sync::atomic::Ordering::Relaxed);
                     let reconnects = stats_health.reconnects.load(std::sync::atomic::Ordering::Relaxed);
@@ -448,6 +525,36 @@ async fn run_live_mode(state: Arc<janus_core::JanusState>) -> janus_core::Result
                     // Update Prometheus trade counters from atomic stats so
                     // dashboards see cumulative values even between scrapes.
                     BACKFILL_QUEUE_SIZE.set(0); // keep metric alive; real value set by scheduler
+
+                    // ── data_completeness_percent ─────────────────────
+                    if let Ok(d) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+                        let now_epoch = d.as_secs();
+                        window.push_back((now_epoch, closed));
+                        while window.len() > 1
+                            && window[1].0 + COMPLETENESS_WINDOW_SECS <= now_epoch
+                        {
+                            window.pop_front();
+                        }
+                        if let Some(&(anchor_ts, anchor_closed)) = window.front()
+                            && max_interval > 0
+                            && now_epoch.saturating_sub(anchor_ts) >= 2 * max_interval
+                        {
+                            let expected: u64 = kline_interval_secs
+                                .iter()
+                                .map(|&i| expected_closed_klines(
+                                    anchor_ts,
+                                    now_epoch,
+                                    COMPLETENESS_GRACE_SECS,
+                                    i,
+                                ))
+                                .sum::<u64>()
+                                * asset_count as u64;
+                            if expected > 0 {
+                                let received = closed.saturating_sub(anchor_closed);
+                                DATA_COMPLETENESS.set(completeness_pct(received, expected));
+                            }
+                        }
+                    }
 
                     let status = format!(
                         "live: {} assets, {} trades, {} klines ({} published), {} errors, {} reconnects",
@@ -891,6 +998,12 @@ async fn process_kline_data(
         return Ok(());
     }
 
+    // Count every closed kline for the completeness SLI, regardless of
+    // whether the bus publish below succeeds (it errors with 0 subscribers).
+    stats
+        .klines_closed
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
     let open = Decimal::from_str(&k.o).map_err(|e| format!("open: {}", e))?;
     let high = Decimal::from_str(&k.h).map_err(|e| format!("high: {}", e))?;
     let low = Decimal::from_str(&k.l).map_err(|e| format!("low: {}", e))?;
@@ -1009,4 +1122,51 @@ async fn process_trade_data(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod completeness_tests {
+    use super::{completeness_pct, expected_closed_klines, interval_secs};
+
+    #[test]
+    fn interval_parsing() {
+        assert_eq!(interval_secs("1m"), Some(60));
+        assert_eq!(interval_secs("5m"), Some(300));
+        assert_eq!(interval_secs("1h"), Some(3_600));
+        assert_eq!(interval_secs("4h"), Some(14_400));
+        assert_eq!(interval_secs("1d"), Some(86_400));
+        assert_eq!(interval_secs("30s"), Some(30));
+        assert_eq!(interval_secs("1w"), Some(604_800));
+        // Unsupported / malformed → None (excluded from the expectation).
+        assert_eq!(interval_secs("1M"), None); // month — unit not supported
+        assert_eq!(interval_secs("0m"), None);
+        assert_eq!(interval_secs("m"), None);
+        assert_eq!(interval_secs(""), None);
+        assert_eq!(interval_secs("abc"), None);
+    }
+
+    #[test]
+    fn expected_counts_whole_boundaries() {
+        // Anchor at t=0, now=600s, no grace: ten 1m closes, two 5m closes.
+        assert_eq!(expected_closed_klines(0, 600, 0, 60), 10);
+        assert_eq!(expected_closed_klines(0, 600, 0, 300), 2);
+        // Grace shields the most recent boundary: at now=605 with 15s grace,
+        // effective now=590 → boundary at 600 not yet expected.
+        assert_eq!(expected_closed_klines(0, 605, 15, 60), 9);
+        // Unaligned anchor: boundaries at 120..=580 → floor(590/60)-floor(70/60) = 9-1 = 8.
+        assert_eq!(expected_closed_klines(70, 605, 15, 60), 8);
+        // Degenerate ranges never underflow or divide by zero.
+        assert_eq!(expected_closed_klines(600, 600, 0, 60), 0);
+        assert_eq!(expected_closed_klines(600, 605, 15, 60), 0);
+        assert_eq!(expected_closed_klines(0, 600, 0, 0), 0);
+    }
+
+    #[test]
+    fn completeness_is_capped_and_zero_safe() {
+        assert_eq!(completeness_pct(10, 10), 100.0);
+        assert_eq!(completeness_pct(999, 10), 100.0); // reconnect replay burst
+        assert_eq!(completeness_pct(0, 0), 0.0); // no expectation → stay gated
+        let pct = completeness_pct(999, 1000);
+        assert!((pct - 99.9).abs() < 1e-9);
+    }
 }
