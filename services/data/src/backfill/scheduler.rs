@@ -514,9 +514,17 @@ impl BackfillScheduler {
                     "Backfill completed successfully"
                 );
 
-                // Update metrics
+                // Update metrics. NOTE: the vec declares three labels
+                // (exchange, symbol, status) — passing two panics inside
+                // prometheus-rs's with_label_values on first use, which would
+                // have killed the scheduler task on the first completed
+                // backfill.
                 BACKFILLS_COMPLETED
-                    .with_label_values(&[&gap.gap.exchange, &gap.gap.symbol])
+                    .with_label_values(&[
+                        gap.gap.exchange.as_str(),
+                        gap.gap.symbol.as_str(),
+                        "success",
+                    ])
                     .inc();
             }
             Err(e) => {
@@ -528,6 +536,17 @@ impl BackfillScheduler {
                     retry_count = gap.retry_count,
                     "Backfill failed"
                 );
+
+                // Count the failure so BackfillFailureRateHigh
+                // (failed / total over a window) can actually evaluate. A
+                // retried-then-successful gap counts one failed + one success.
+                BACKFILLS_COMPLETED
+                    .with_label_values(&[
+                        gap.gap.exchange.as_str(),
+                        gap.gap.symbol.as_str(),
+                        "failed",
+                    ])
+                    .inc();
 
                 self.schedule_retry(&mut gap).await;
             }
