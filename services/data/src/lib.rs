@@ -434,6 +434,24 @@ async fn run_live_mode(state: Arc<janus_core::JanusState>) -> janus_core::Result
         return run_standby_mode(state).await;
     }
 
+    // ── Arm lazy per-label alert series ───────────────────────────────
+    // CounterVecs register no series until their first increment, so
+    // rate()-based alerts (BackfillFailureRateHigh, GapDetectionRateAnomaly,
+    // BackfillMaxRetriesExceeded) could never evaluate before a first event
+    // ever occurred. Touch the known label combinations so the series exist
+    // at 0 and the alerts arm immediately.
+    {
+        let ex = config.exchange.as_str();
+        for asset in &config.assets {
+            let symbol = format!("{}{}", asset.to_uppercase(), config.quote.to_uppercase());
+            let _ = GAPS_DETECTED.with_label_values(&[ex, &symbol]);
+            let _ = BACKFILL_MAX_RETRIES_EXCEEDED.with_label_values(&[ex, &symbol]);
+            for status in ["success", "failed"] {
+                let _ = BACKFILLS_COMPLETED.with_label_values(&[ex, &symbol, status]);
+            }
+        }
+    }
+
     // Shared stats across all per-asset tasks
     let stats = Arc::new(IngestionStats::default());
 
