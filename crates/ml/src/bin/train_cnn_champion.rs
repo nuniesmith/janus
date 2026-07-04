@@ -18,23 +18,30 @@
 //!   train_cnn_champion --csv <ohlcv.csv> --out <model.bin> [--window 60] [--epochs 60]
 
 use janus_ml::CpuBackend;
+use janus_ml::backend::AutodiffCpuBackend;
 use janus_ml::models::PerAssetCnn;
 use janus_ml::train_per_asset::{
-    CLASS_NAMES, TrainChampionConfig, TrainReport, ValMetrics, train_champion,
-    train_champion_with_holdout,
+    CLASS_NAMES, TrainChampionConfig, TrainReport, ValMetrics, WalkForwardReport, train_champion,
+    train_champion_with_holdout, train_walk_forward,
 };
 
 const HELP: &str = "train_cnn_champion --csv <ohlcv.csv> --out <model.bin> \
-[--window 60] [--epochs 60] [--val-frac 0.2]";
+[--window 60] [--epochs 60] [--val-frac 0.2] [--walk-forward N] [--gpu]";
 
 struct Args {
     csv: String,
     out: String,
     window: usize,
     epochs: usize,
-    /// Fraction of the series held out (by time) for out-of-sample validation.
-    /// 0 = train on all bars (no validation, the default).
+    /// Fraction of the series held out (by time) for a single out-of-sample
+    /// split. 0 = train on all bars (no validation, the default).
     val_frac: f64,
+    /// Walk-forward folds. >0 runs anchored walk-forward validation across N
+    /// rolling out-of-sample segments (no artifact saved) and overrides
+    /// --val-frac.
+    walk_forward: usize,
+    /// Train on the GPU (requires building with `--features gpu`).
+    gpu: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -43,6 +50,8 @@ fn parse_args() -> Result<Args, String> {
     let mut window = 60usize;
     let mut epochs = 60usize;
     let mut val_frac = 0.0f64;
+    let mut walk_forward = 0usize;
+    let mut gpu = false;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -66,6 +75,13 @@ fn parse_args() -> Result<Args, String> {
                     .and_then(|s| s.parse().ok())
                     .ok_or_else(|| "--val-frac needs a float in (0, 0.9)".to_string())?
             }
+            "--walk-forward" => {
+                walk_forward = it
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .ok_or_else(|| "--walk-forward needs a positive integer".to_string())?
+            }
+            "--gpu" => gpu = true,
             "-h" | "--help" => return Err(HELP.to_string()),
             other => return Err(format!("unknown arg: {other}\n{HELP}")),
         }
@@ -76,7 +92,64 @@ fn parse_args() -> Result<Args, String> {
         window,
         epochs,
         val_frac,
+        walk_forward,
+        gpu,
     })
+}
+
+/// Which backend a run used (for the log line).
+fn backend_label(gpu: bool) -> &'static str {
+    if gpu && cfg!(feature = "gpu") {
+        "gpu(wgpu)"
+    } else if gpu {
+        "cpu (--gpu ignored: built without --features gpu)"
+    } else {
+        "cpu"
+    }
+}
+
+/// Dispatch holdout training to the GPU backend when requested and available,
+/// else the CPU backend.
+fn holdout_dispatch(
+    gpu: bool,
+    o: &[f32],
+    h: &[f32],
+    l: &[f32],
+    c: &[f32],
+    v: &[f32],
+    cfg: &TrainChampionConfig,
+    val_frac: f64,
+) -> Option<(PerAssetCnn<CpuBackend>, TrainReport, ValMetrics)> {
+    if gpu {
+        #[cfg(feature = "gpu")]
+        {
+            use janus_ml::backend::AutodiffGpuBackend;
+            return train_champion_with_holdout::<AutodiffGpuBackend>(o, h, l, c, v, cfg, val_frac);
+        }
+    }
+    train_champion_with_holdout::<AutodiffCpuBackend>(o, h, l, c, v, cfg, val_frac)
+}
+
+/// Dispatch walk-forward validation to the GPU backend when requested and
+/// available, else the CPU backend.
+fn walk_forward_dispatch(
+    gpu: bool,
+    o: &[f32],
+    h: &[f32],
+    l: &[f32],
+    c: &[f32],
+    v: &[f32],
+    cfg: &TrainChampionConfig,
+    n_folds: usize,
+) -> Option<WalkForwardReport> {
+    if gpu {
+        #[cfg(feature = "gpu")]
+        {
+            use janus_ml::backend::AutodiffGpuBackend;
+            return train_walk_forward::<AutodiffGpuBackend>(o, h, l, c, v, cfg, n_folds);
+        }
+    }
+    train_walk_forward::<AutodiffCpuBackend>(o, h, l, c, v, cfg, n_folds)
 }
 
 type Ohlcv = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>);
@@ -186,10 +259,92 @@ fn print_val(m: &ValMetrics) {
     println!("  VERDICT: {verdict}");
 }
 
+/// Print the walk-forward report: one line per fold + the aggregate verdict.
+fn print_walk_forward(r: &WalkForwardReport) {
+    println!(
+        "\nwalk-forward validation — {} folds, each trained on all prior bars \
+         (purged) and validated on a distinct later window:",
+        r.folds.len()
+    );
+    println!("  fold  split_bar  n_val   acc    baseline  long_P(base)   short_P(base)");
+    for (i, m) in r.folds.iter().enumerate() {
+        let lp = &m.per_class[1];
+        let sp = &m.per_class[2];
+        println!(
+            "  {:>3}   {:>8}  {:>6}  {:.3}  {:.3}     {:.3}({:.3})   {:.3}({:.3})",
+            i,
+            m.split_bar,
+            m.n_val,
+            m.accuracy,
+            m.majority_baseline,
+            lp.precision,
+            lp.base_rate,
+            sp.precision,
+            sp.base_rate,
+        );
+    }
+    println!(
+        "  MEAN: acc {:.3} vs baseline {:.3} | long_P {:.3} (base {:.3}) | short_P {:.3} (base {:.3})",
+        r.mean_accuracy,
+        r.mean_majority_baseline,
+        r.mean_long_precision,
+        r.mean_long_base,
+        r.mean_short_precision,
+        r.mean_short_base,
+    );
+    // Directional robustness — the trading-relevant signal. Overall accuracy vs
+    // the majority (mostly-flat) baseline is a poor gauge here: a signal that
+    // only ACTS on the minority long/short classes sacrifices accuracy on the
+    // dominant flat class by design. What matters is whether long/short calls
+    // beat their own base rate, and whether that holds across folds (regimes).
+    let n = r.folds.len();
+    let long_beats = r
+        .folds
+        .iter()
+        .filter(|m| m.per_class[1].precision > m.per_class[1].base_rate + 0.02)
+        .count();
+    let short_beats = r
+        .folds
+        .iter()
+        .filter(|m| m.per_class[2].precision > m.per_class[2].base_rate + 0.02)
+        .count();
+    println!(
+        "  directional edge held in: long {long_beats}/{n} folds, short {short_beats}/{n} folds \
+         (accuracy beat baseline in {}/{n} — expected-low for a minority-class signal).",
+        r.folds_beating_baseline,
+    );
+
+    let dir_robust = long_beats * 2 >= n && short_beats * 2 >= n; // both, majority of folds
+    let mean_dir_edge = r.mean_long_precision > r.mean_long_base + 0.02
+        && r.mean_short_precision > r.mean_short_base + 0.02;
+    let some_edge = long_beats * 2 >= n || short_beats * 2 >= n;
+    let verdict = if dir_robust && mean_dir_edge {
+        "ROBUST DIRECTIONAL EDGE — long AND short precision beat their base rate \
+         in a majority of folds (mean ~2x base), across distinct time windows, so \
+         it is not one lucky split. NOTE: absolute precision is still low (~2x \
+         chance ≠ mostly-right), and classification edge ≠ profit. Next gate is a \
+         PnL backtest through the consensus + risk gates — do NOT enable on \
+         classification metrics alone."
+    } else if some_edge {
+        "PARTIAL DIRECTIONAL EDGE — one direction beats its base rate across folds \
+         but the other does not. Suggestive but asymmetric; more data / label work \
+         before a backtest."
+    } else {
+        "NO ROBUST EDGE — directional precision does not consistently beat its base \
+         rate across folds. Do not enable."
+    };
+    println!("  VERDICT: {verdict}");
+}
+
 fn run() -> Result<(), String> {
     let args = parse_args()?;
     let (o, h, l, c, v) = read_ohlcv(&args.csv)?;
-    println!("loaded {} bars from {}", c.len(), args.csv);
+    println!(
+        "loaded {} bars from {} (backend: {})",
+        c.len(),
+        args.csv,
+        backend_label(args.gpu)
+    );
 
     let cfg = TrainChampionConfig {
         window: args.window,
@@ -206,18 +361,29 @@ fn run() -> Result<(), String> {
         )
     };
 
+    // --walk-forward: multi-fold out-of-sample validation across distinct time
+    // windows. A validation experiment — no artifact is saved.
+    if args.walk_forward > 0 {
+        let report = walk_forward_dispatch(args.gpu, &o, &h, &l, &c, &v, &cfg, args.walk_forward)
+            .ok_or_else(too_short)?;
+        print_walk_forward(&report);
+        return Ok(());
+    }
+
     // With --val-frac, train on a leakage-safe time split and report
     // out-of-sample generalization; the saved artifact is the holdout-trained
     // model (retrain on all bars only once it clears validation). Otherwise
     // train on every bar (the plain minting path).
     let model = if args.val_frac > 0.0 {
         let (model, report, val) =
-            train_champion_with_holdout(&o, &h, &l, &c, &v, &cfg, args.val_frac)
+            holdout_dispatch(args.gpu, &o, &h, &l, &c, &v, &cfg, args.val_frac)
                 .ok_or_else(too_short)?;
         print_train(&report);
         print_val(&val);
         model
     } else {
+        // Plain minting path is CPU-only (fast enough); --gpu applies to
+        // validation runs where many trainings dominate.
         let (model, report) = train_champion(&o, &h, &l, &c, &v, &cfg).ok_or_else(too_short)?;
         print_train(&report);
         model

@@ -23,6 +23,7 @@ use crate::labeler::{BreakoutLabelConfig, generate_labels_breakout, label_counts
 use crate::models::per_asset_cnn::PerAssetCnn;
 use crate::models::trainable_per_asset_cnn::{CnnTrainer, TrainablePerAssetCnnConfig};
 use crate::per_asset_dataset::{Sample, class_weights, make_windows};
+use burn_core::tensor::backend::AutodiffBackend;
 
 /// Configuration for [`train_champion`].
 #[derive(Debug, Clone)]
@@ -123,14 +124,15 @@ pub fn train_champion(
     )?;
     let labels = generate_labels_breakout(high, low, close, &cfg.label);
 
-    // 3) sliding-window samples → train on all of them.
+    // 3) sliding-window samples → train on all of them (CPU backend).
     let samples = make_windows(&features, nf, n_bars, &labels, cfg.window, None);
-    train_on_samples(&samples, cfg)
+    train_on_samples::<AutodiffCpuBackend>(&samples, cfg)
 }
 
-/// Train a `PerAssetCnn` on a prepared sample set — the shared training core of
-/// [`train_champion`] and [`train_champion_with_holdout`]. `None` if empty.
-fn train_on_samples(
+/// Train a `PerAssetCnn` on a prepared sample set — the shared training core,
+/// generic over the autodiff backend `B` (CPU or, under `--features gpu`, wgpu).
+/// The result is always a CPU inference model. `None` if empty.
+fn train_on_samples<B: AutodiffBackend>(
     samples: &[Sample],
     cfg: &TrainChampionConfig,
 ) -> Option<(PerAssetCnn<CpuBackend>, TrainReport)> {
@@ -148,10 +150,10 @@ fn train_on_samples(
             .map(|&w| w as f32)
             .collect::<Vec<f32>>()
     });
-    let mut trainer = CnnTrainer::new(&cfg.model, cfg.lr, cfg.weight_decay, weights);
+    let mut trainer = CnnTrainer::<B>::new(&cfg.model, cfg.lr, cfg.weight_decay, weights);
 
     // 5) training loop with LR warmup + early stopping.
-    let device = Default::default();
+    let device = B::Device::default();
     let mut order: Vec<usize> = (0..samples.len()).collect();
     let mut history = Vec::with_capacity(cfg.epochs);
     let mut best = f32::INFINITY;
@@ -175,10 +177,8 @@ fn train_on_samples(
                 data.extend_from_slice(&samples[idx].features);
                 lbls.push(samples[idx].label);
             }
-            let x = Tensor::<AutodiffCpuBackend, 3>::from_data(
-                TensorData::new(data, [bsz, nf, cfg.window]),
-                &device,
-            );
+            let x =
+                Tensor::<B, 3>::from_data(TensorData::new(data, [bsz, nf, cfg.window]), &device);
             epoch_loss += trainer.step(x, &lbls);
             batches += 1;
         }
@@ -337,7 +337,31 @@ fn evaluate(
 /// Returns the model trained on the purged train split plus its validation
 /// [`ValMetrics`]. `None` when `val_frac ∉ (0, 0.9)` or the series is too short
 /// to form both splits.
-pub fn train_champion_with_holdout(
+/// Partition terminal-bar-ordered windows into a purged (train, val) split.
+///
+/// `all[k]` ends at bar `first_bar + k`. Training keeps windows whose forward
+/// label horizon stays strictly before `split_bar`; validation keeps windows in
+/// `[split_bar, val_end)`; the `horizon`-wide band in between is purged.
+fn split_purged(
+    all: &[Sample],
+    first_bar: usize,
+    horizon: usize,
+    split_bar: usize,
+    val_end: usize,
+) -> (Vec<Sample>, Vec<Sample>) {
+    let (mut train, mut val) = (Vec::new(), Vec::new());
+    for (k, s) in all.iter().enumerate() {
+        let t = first_bar + k;
+        if t + horizon < split_bar {
+            train.push(s.clone());
+        } else if t >= split_bar && t < val_end {
+            val.push(s.clone());
+        }
+    }
+    (train, val)
+}
+
+pub fn train_champion_with_holdout<B: AutodiffBackend>(
     open: &[f32],
     high: &[f32],
     low: &[f32],
@@ -375,24 +399,121 @@ pub fn train_champion_with_holdout(
         return None;
     }
 
-    let (mut train_samples, mut val_samples) = (Vec::new(), Vec::new());
-    for (k, s) in all.iter().enumerate() {
-        let t = first_bar + k; // terminal (labeled) bar
-        if t + horizon < split_bar {
-            train_samples.push(s.clone()); // label stays strictly before the split
-        } else if t >= split_bar {
-            val_samples.push(s.clone()); // in the validation region
-        }
-        // else: purge zone [split_bar - horizon, split_bar) — dropped
-    }
+    let (train_samples, val_samples) = split_purged(&all, first_bar, horizon, split_bar, n_bars);
     if train_samples.is_empty() || val_samples.is_empty() {
         return None;
     }
 
     let n_train = train_samples.len();
-    let (model, report) = train_on_samples(&train_samples, cfg)?;
+    let (model, report) = train_on_samples::<B>(&train_samples, cfg)?;
     let metrics = evaluate(&model, &val_samples, cfg, n_train, split_bar, horizon);
     Some((model, report, metrics))
+}
+
+/// Aggregate walk-forward metrics across folds.
+#[derive(Debug, Clone)]
+pub struct WalkForwardReport {
+    /// Per-fold out-of-sample metrics, earliest validation window first.
+    pub folds: Vec<ValMetrics>,
+    /// Mean validation accuracy across folds.
+    pub mean_accuracy: f64,
+    /// Mean majority-class baseline across folds.
+    pub mean_majority_baseline: f64,
+    /// Mean long precision and its mean base rate.
+    pub mean_long_precision: f64,
+    pub mean_long_base: f64,
+    /// Mean short precision and its mean base rate.
+    pub mean_short_precision: f64,
+    pub mean_short_base: f64,
+    /// How many folds beat their own majority baseline.
+    pub folds_beating_baseline: usize,
+}
+
+/// Anchored (expanding-window) walk-forward validation over `n_folds` rolling
+/// out-of-sample segments.
+///
+/// Fold *f* trains on every bar before its validation segment (purged by the
+/// label horizon) and validates on the next unseen segment — so each fold is a
+/// genuine out-of-sample test on a *distinct* time period. A model that only
+/// beats the baseline on one lucky split fails here; a consistent per-fold edge
+/// is the signal worth trusting. Generic over the autodiff backend `B`.
+pub fn train_walk_forward<B: AutodiffBackend>(
+    open: &[f32],
+    high: &[f32],
+    low: &[f32],
+    close: &[f32],
+    volume: &[f32],
+    cfg: &TrainChampionConfig,
+    n_folds: usize,
+) -> Option<WalkForwardReport> {
+    if n_folds == 0 {
+        return None;
+    }
+    let nf = cfg.model.n_features;
+    let n_bars = close.len();
+    let features = precompute_features(
+        open,
+        high,
+        low,
+        close,
+        volume,
+        &LiveState::default(),
+        cfg.window,
+    )?;
+    let labels = generate_labels_breakout(high, low, close, &cfg.label);
+    let all = make_windows(&features, nf, n_bars, &labels, cfg.window, None);
+    if all.is_empty() {
+        return None;
+    }
+
+    let first_bar = (cfg.window + crate::per_asset_dataset::WARMUP_EXTRA).max(cfg.window - 1);
+    let horizon = cfg.label.max_breakout_wait + cfg.label.max_hold_bars;
+    let last = n_bars.saturating_sub(horizon); // last bar with a complete forward label
+    if last <= first_bar {
+        return None;
+    }
+    let seg = (last - first_bar) / (n_folds + 1);
+    if seg <= horizon {
+        return None; // segments too small to leave a purge band
+    }
+
+    let mut folds = Vec::new();
+    for f in 0..n_folds {
+        let split_bar = first_bar + (f + 1) * seg;
+        let val_end = if f + 1 == n_folds {
+            last
+        } else {
+            first_bar + (f + 2) * seg
+        };
+        let (train, val) = split_purged(&all, first_bar, horizon, split_bar, val_end);
+        if train.is_empty() || val.is_empty() {
+            continue;
+        }
+        let n_train = train.len();
+        let Some((model, _report)) = train_on_samples::<B>(&train, cfg) else {
+            continue;
+        };
+        folds.push(evaluate(&model, &val, cfg, n_train, split_bar, horizon));
+    }
+    if folds.is_empty() {
+        return None;
+    }
+
+    let k = folds.len() as f64;
+    let mean = |sel: fn(&ValMetrics) -> f64| folds.iter().map(sel).sum::<f64>() / k;
+    Some(WalkForwardReport {
+        mean_accuracy: mean(|m| m.accuracy),
+        mean_majority_baseline: mean(|m| m.majority_baseline),
+        mean_long_precision: mean(|m| m.per_class[1].precision),
+        mean_long_base: mean(|m| m.per_class[1].base_rate),
+        mean_short_precision: mean(|m| m.per_class[2].precision),
+        mean_short_base: mean(|m| m.per_class[2].base_rate),
+        folds_beating_baseline: folds
+            .iter()
+            .filter(|m| m.accuracy > m.majority_baseline)
+            .count(),
+        folds,
+    })
 }
 
 #[cfg(test)]
@@ -474,7 +595,8 @@ mod tests {
             ..TrainChampionConfig::default()
         };
         let (_model, report, m) =
-            train_champion_with_holdout(&o, &h, &l, &c, &v, &cfg, 0.3).expect("should validate");
+            train_champion_with_holdout::<AutodiffCpuBackend>(&o, &h, &l, &c, &v, &cfg, 0.3)
+                .expect("should validate");
 
         let horizon = cfg.label.max_breakout_wait + cfg.label.max_hold_bars;
         assert_eq!(
@@ -512,7 +634,37 @@ mod tests {
         }
 
         // Out-of-range val_frac → None.
-        assert!(train_champion_with_holdout(&o, &h, &l, &c, &v, &cfg, 0.0).is_none());
-        assert!(train_champion_with_holdout(&o, &h, &l, &c, &v, &cfg, 0.95).is_none());
+        assert!(
+            train_champion_with_holdout::<AutodiffCpuBackend>(&o, &h, &l, &c, &v, &cfg, 0.0)
+                .is_none()
+        );
+        assert!(
+            train_champion_with_holdout::<AutodiffCpuBackend>(&o, &h, &l, &c, &v, &cfg, 0.95)
+                .is_none()
+        );
+    }
+
+    /// Walk-forward produces one out-of-sample fold per requested segment, each
+    /// on a distinct time window, with well-formed aggregate metrics.
+    #[test]
+    fn walk_forward_produces_disjoint_folds() {
+        let (o, h, l, c, v) = synth_ohlcv(2400);
+        let cfg = TrainChampionConfig {
+            epochs: 2,
+            warmup_epochs: 1,
+            early_stopping_patience: 99,
+            ..TrainChampionConfig::default()
+        };
+        let r = train_walk_forward::<AutodiffCpuBackend>(&o, &h, &l, &c, &v, &cfg, 3)
+            .expect("should walk-forward");
+        assert_eq!(r.folds.len(), 3, "one fold per segment");
+        assert!(r.folds_beating_baseline <= 3);
+        assert!((0.0..=1.0).contains(&r.mean_accuracy));
+        // Fold validation windows advance in time (split_bar strictly increasing).
+        for w in r.folds.windows(2) {
+            assert!(w[1].split_bar > w[0].split_bar, "folds advance in time");
+        }
+        // 0 folds → None.
+        assert!(train_walk_forward::<AutodiffCpuBackend>(&o, &h, &l, &c, &v, &cfg, 0).is_none());
     }
 }
