@@ -38,6 +38,20 @@ const AO_FAST: usize = 5;
 const AO_SLOW: usize = 34;
 const EPS: f64 = 1e-10;
 
+/// Warmup context (bars BEFORE the returned window) that [`extract_features`]
+/// computes over, so that every one of the returned `window` columns is fully
+/// warmed and matches the full-series [`precompute_features`] the model trains
+/// on. Sized to the deepest history-dependent channel: `normalized_velocity` /
+/// `price_acceleration` use a `norm_window = 100` rolling-std over a 3-bar
+/// momentum series (→ 103 bars needed for the earliest window column), which
+/// dominates `norm_close` (60), `market_phase` (AO_SLOW+CONSOL = 54), and
+/// `hurst` (~41). 110 leaves margin; the two exponential channels (`norm_atr`,
+/// `rsi`) converge to within ~1e-3 over this warmup. Before this was `25`,
+/// which left those channels under-warmed / at their defaults at inference —
+/// a train/serve feature-parity skew (the model was served out-of-distribution
+/// features). See the `bounded_warmup_matches_full_series` regression test.
+const WARMUP: usize = 110;
+
 /// Live market scalars that feed channels 7–9 (broadcast across the window).
 #[derive(Debug, Clone, Copy)]
 pub struct LiveState {
@@ -540,9 +554,10 @@ fn compute_channels(
     out
 }
 
-/// Minimum bars required by [`extract_features`].
+/// Minimum bars required by [`extract_features`]: the returned `window` plus
+/// the [`WARMUP`] context needed to fully warm every channel.
 pub fn min_rows(window: usize) -> usize {
-    window + CONSOL_BARS.max(RSI_PERIOD).max(ATR_PERIOD) + 5
+    window + WARMUP
 }
 
 /// Compute all [`N_FEATURES`] channels over the WHOLE series → row-major
@@ -605,8 +620,7 @@ pub fn extract_features(
     {
         return None;
     }
-    let warmup = CONSOL_BARS.max(RSI_PERIOD).max(ATR_PERIOD) + 5;
-    let take = window + warmup;
+    let take = window + WARMUP;
     let s = n - take;
     let f64s = |a: &[f32]| a[s..].iter().map(|&v| v as f64).collect::<Vec<_>>();
 
@@ -766,6 +780,64 @@ mod tests {
                 window
             )
             .is_none()
+        );
+    }
+
+    /// Train/serve feature-parity regression guard.
+    ///
+    /// The live path ([`extract_features`], bounded to the last
+    /// `window + WARMUP` bars) must produce the SAME features as the full-series
+    /// training path ([`precompute_features`], sliced to the last window) for
+    /// the same terminal bars — otherwise the CNN champion is served
+    /// out-of-distribution features. Before `WARMUP = 110` the inference warmup
+    /// was 25, leaving history-dependent channels under-warmed or at their
+    /// defaults (measured divergence up to 1.0 on `market_phase`, 0.5 on
+    /// `hurst`, plus `norm_close`/`velocity`/`accel`). This asserts the skew is
+    /// gone: fixed-window channels match ~exactly; the four exponential-moving
+    /// channels (`norm_atr`, `rsi`, `range_tightness`, `atr_trend`) converge to
+    /// within a tiny tolerance over the warmup.
+    #[test]
+    fn bounded_warmup_matches_full_series() {
+        let window = 60;
+        // Long series: the full-series path sees deep history the bounded path
+        // cannot. If WARMUP is deep enough, the terminal window still matches.
+        let n = min_rows(window) + 300;
+        let close: Vec<f32> = (0..n)
+            .map(|i| 100.0 + (i as f32 * 0.11).sin() * 8.0 + (i as f32 * 0.017).cos() * 3.0)
+            .collect();
+        let high: Vec<f32> = close.iter().map(|c| c + 1.3).collect();
+        let low: Vec<f32> = close.iter().map(|c| c - 1.1).collect();
+        let open: Vec<f32> = close.iter().map(|c| c - 0.2).collect();
+        let volume: Vec<f32> = (0..n)
+            .map(|i| 1000.0 + ((i * 13) % 97) as f32 * 7.0)
+            .collect();
+        let st = LiveState::default();
+
+        let full = precompute_features(&open, &high, &low, &close, &volume, &st, window).unwrap();
+        let inf = extract_features(&open, &high, &low, &close, &volume, &st, window).unwrap();
+
+        // Channels that read an exponential-moving stat (Wilder RSI / EWM ATR)
+        // converge rather than snap — allow a small tolerance for them and
+        // require ~bit-exactness for every fixed-window channel.
+        let ewm = [2usize, 4, 5, 15]; // norm_atr, rsi, range_tightness, atr_trend
+        let (mut max_fixed, mut max_ewm) = (0f32, 0f32);
+        for c in 0..N_FEATURES {
+            for j in 0..window {
+                let d = (inf[c * window + j] - full[c * n + (n - window + j)]).abs();
+                if ewm.contains(&c) {
+                    max_ewm = max_ewm.max(d);
+                } else {
+                    max_fixed = max_fixed.max(d);
+                }
+            }
+        }
+        assert!(
+            max_fixed < 1e-4,
+            "fixed-window channels diverge (train/serve skew): {max_fixed}"
+        );
+        assert!(
+            max_ewm < 1e-2,
+            "exponential channels beyond convergence tolerance: {max_ewm}"
         );
     }
 
