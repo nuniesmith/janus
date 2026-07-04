@@ -21,3 +21,6 @@ logs/
 **/*.onnx
 **/*.pt
 **/*.safetensors
+
+# Minted model artifacts (reproducible via crates/ml train_cnn_champion; not tracked)
+models/*.bin
