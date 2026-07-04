@@ -516,6 +516,165 @@ pub fn train_walk_forward<B: AutodiffBackend>(
     })
 }
 
+/// Run the model over samples → per-sample `(argmax class, softmax confidence)`,
+/// in the same order as `samples`.
+fn predict_samples(
+    model: &PerAssetCnn<CpuBackend>,
+    samples: &[Sample],
+    cfg: &TrainChampionConfig,
+) -> Vec<(usize, f64)> {
+    let nf = cfg.model.n_features;
+    let device = Default::default();
+    let mut out = Vec::with_capacity(samples.len());
+    for chunk in samples.chunks(256) {
+        let bsz = chunk.len();
+        let mut data = Vec::with_capacity(bsz * nf * cfg.window);
+        for s in chunk {
+            data.extend_from_slice(&s.features);
+        }
+        let x = Tensor::<CpuBackend, 3>::from_data(
+            TensorData::new(data, [bsz, nf, cfg.window]),
+            &device,
+        );
+        let probs = model.predict_proba(x).to_data().to_vec::<f32>().unwrap();
+        for i in 0..bsz {
+            let row = &probs[i * 4..i * 4 + 4];
+            let (cls, &p) = row
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                .unwrap();
+            out.push((cls, p as f64));
+        }
+    }
+    out
+}
+
+/// Aggregate walk-forward PnL backtest across folds.
+#[derive(Debug, Clone)]
+pub struct WalkForwardBacktest {
+    /// Per-fold backtest reports (earliest out-of-sample window first).
+    pub folds: Vec<crate::backtest::BacktestReport>,
+    /// Summed net return across all fold trades (additive fraction of notional).
+    pub total_net_return: f64,
+    /// Total net R multiples across folds.
+    pub total_sum_r: f64,
+    /// Total trades / wins across folds.
+    pub total_trades: usize,
+    pub total_wins: usize,
+    /// Mean per-fold Sharpe.
+    pub mean_sharpe: f64,
+    /// Folds with a positive net return.
+    pub folds_profitable: usize,
+    /// Worst single-fold drawdown.
+    pub worst_drawdown: f64,
+}
+
+/// Walk-forward **PnL backtest** of the CNN directional signal: train each fold
+/// on GPU/CPU, then simulate trades on its unseen validation window (see
+/// [`crate::backtest`]). Turns the classification edge into a cost-aware money
+/// figure, out-of-sample and across regimes. Generic over the autodiff backend.
+#[allow(clippy::too_many_arguments)]
+pub fn walk_forward_backtest<B: AutodiffBackend>(
+    open: &[f32],
+    high: &[f32],
+    low: &[f32],
+    close: &[f32],
+    volume: &[f32],
+    cfg: &TrainChampionConfig,
+    n_folds: usize,
+    bt: &crate::backtest::BacktestConfig,
+) -> Option<WalkForwardBacktest> {
+    if n_folds == 0 {
+        return None;
+    }
+    let nf = cfg.model.n_features;
+    let n_bars = close.len();
+    let features = precompute_features(
+        open,
+        high,
+        low,
+        close,
+        volume,
+        &LiveState::default(),
+        cfg.window,
+    )?;
+    let labels = generate_labels_breakout(high, low, close, &cfg.label);
+    let all = make_windows(&features, nf, n_bars, &labels, cfg.window, None);
+    if all.is_empty() {
+        return None;
+    }
+
+    // f64 price arrays for the trade simulation.
+    let hi: Vec<f64> = high.iter().map(|&x| x as f64).collect();
+    let lo: Vec<f64> = low.iter().map(|&x| x as f64).collect();
+    let cl: Vec<f64> = close.iter().map(|&x| x as f64).collect();
+
+    let first_bar = (cfg.window + crate::per_asset_dataset::WARMUP_EXTRA).max(cfg.window - 1);
+    let horizon = cfg.label.max_breakout_wait + cfg.label.max_hold_bars;
+    let last = n_bars.saturating_sub(horizon);
+    if last <= first_bar {
+        return None;
+    }
+    let seg = (last - first_bar) / (n_folds + 1);
+    if seg <= horizon {
+        return None;
+    }
+
+    let mut reports = Vec::new();
+    for f in 0..n_folds {
+        let split_bar = first_bar + (f + 1) * seg;
+        let val_end = if f + 1 == n_folds {
+            last
+        } else {
+            first_bar + (f + 2) * seg
+        };
+        let (train, val) = split_purged(&all, first_bar, horizon, split_bar, val_end);
+        if train.is_empty() || val.is_empty() {
+            continue;
+        }
+        let Some((model, _r)) = train_on_samples::<B>(&train, cfg) else {
+            continue;
+        };
+        // val sample m corresponds to bar `split_bar + m` (contiguous run).
+        let preds = predict_samples(&model, &val, cfg);
+        let lo_b = split_bar;
+        let hi_b = split_bar + preds.len();
+        if hi_b > n_bars {
+            continue;
+        }
+        reports.push(crate::backtest::backtest_signals(
+            &preds,
+            &hi[lo_b..hi_b],
+            &lo[lo_b..hi_b],
+            &cl[lo_b..hi_b],
+            bt,
+        ));
+    }
+    if reports.is_empty() {
+        return None;
+    }
+
+    let total_trades: usize = reports.iter().map(|r| r.n_trades).sum();
+    let total_wins: usize = reports.iter().map(|r| r.wins).sum();
+    let total_net_return: f64 = reports.iter().map(|r| r.net_return).sum();
+    let total_sum_r: f64 = reports.iter().map(|r| r.sum_r).sum();
+    let mean_sharpe = reports.iter().map(|r| r.sharpe).sum::<f64>() / reports.len() as f64;
+    let folds_profitable = reports.iter().filter(|r| r.net_return > 0.0).count();
+    let worst_drawdown = reports.iter().map(|r| r.max_drawdown).fold(0.0, f64::max);
+
+    Some(WalkForwardBacktest {
+        folds: reports,
+        total_net_return,
+        total_sum_r,
+        total_trades,
+        total_wins,
+        mean_sharpe,
+        folds_profitable,
+        worst_drawdown,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
