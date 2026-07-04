@@ -12,8 +12,16 @@ Two neural paths exist in `forward`. They are **not** equivalent on-ramps:
 |---|---|---|
 | Enters the live loop? | **No** — request-driven side path only; the live loop uses `resolve_consensus` and never calls it | **Yes** — pushed into the same `strategy_votes` the live loop tallies (`lib.rs:1709`) |
 | Config wired? | No — `enable_ml_inference` is dead config; `with_ml_inference` has zero prod callers | Yes — `CnnInference::from_env` init'd in the live loop (`lib.rs:1402`) |
-| Feature contract | **Broken** — trainer emits 9 GAF features, forward extracts ~20+; input-size check guarantees fallback | Consistent — trainer and inference share the same 20-feature × 60-window spec |
+| Feature contract | **Broken** — trainer emits 9 GAF features, forward extracts ~20+; input-size check guarantees fallback | Same 20-feature × 60-window spec and same code — **but a warmup-context skew makes the *values* diverge at inference (see ⚠️ below)** |
 | Gate inheritance | Would need new routing | Automatic — it's just one vote among the rule strategies |
+
+> **⚠️ Correction (2026-07-03, adversarial verification).** An earlier read of
+> this path claimed the feature contract was fully consistent. That is true for
+> feature *count, order, and window* (so a champion loads and runs) — but an
+> empirical probe found the feature *values* diverge between training and live
+> inference. This is a real blocker; see **"Parity break — must fix before
+> enable"** below. It does not invalidate the champion-minting binary (it
+> correctly mints + roundtrips an artifact), only the readiness to enable.
 
 The CNN vote is the lowest-risk path because a `"per_asset_cnn"` vote is
 **structurally indistinguishable** from a rule vote once pushed — it has no
@@ -54,13 +62,48 @@ floor `avg_confidence ≥ 0.7`** (`lib.rs:2178`) → kill-switch choke point
 + `EXEC_ACCOUNT_TYPE=paper`, so the CNN can at most alter *published/paper*
 signals — it cannot bypass any control or place a live order.
 
-## The ONE blocker
+## ⚠️ Parity break — must fix before enable (found by adversarial verification)
 
-`train_champion` exists and is tested, **but nothing calls it and no champion
-`.bin` exists anywhere** (the golden dirs hold only READMEs; backward trains an
-LSTM/DQN, not a CNN; the `crates/ml` `[[bin]]` slots are stubbed/commented at
-`Cargo.toml:82,86`). There is no way to produce a champion today without adding
-a training-driver entrypoint.
+Both feature paths call the **same** implementation
+(`crates/ml/src/features/per_asset_cnn.rs`) with the same channel set, order,
+window, and normalization — so count/order/shape are guaranteed identical and a
+champion always loads. **But the input *length* differs, and several channels
+are history-dependent, so the feature values diverge:**
+
+- **Warmup-context skew.** Training computes channels over the **full series**
+  then slices 60-bar windows with ~94 bars of preceding context
+  (`train_per_asset.rs` → `make_windows`, `per_asset_dataset.rs`). Live
+  inference **hard-slices to the last `window + 25 = 85` bars**
+  (`services/forward/src/features/per_asset_cnn.rs` `extract_features`),
+  discarding earlier history even though the `CandleBuffer` holds ~149 bars.
+  History-dependent channels then differ for the same terminal bar. Measured on
+  a synthetic series (isolating warmup): `hurst` maxdiff **0.50** (16/60 cols
+  fall back to the 0.5 default at inference), `market_phase` maxdiff **1.00**
+  (29/60 cols are the 0.0 default at inference vs real values in training),
+  plus RSI/`norm_velocity`/`price_acceleration`/`norm_close` skew. Those
+  channels are out-of-distribution at inference.
+- **Live-scalar channels 7–9 skew (acknowledged in-code).** `train_champion`
+  passes `LiveState::default()`, so `book_imbalance`/`wave_ratio`/`vol_percentile`
+  are trained as **constants**; live, `cnn_inference.rs` feeds the real
+  live-varying values into those same channels.
+
+**Fix before enable:** reconcile the warmup contract so both paths produce
+identical features for the same terminal bar (either extend `extract_features`
+to compute over the full available buffer, or build training samples through
+the same limited-warmup tail), **add a golden regression test** asserting
+`training-window features == inference features`, and either feed real
+`LiveState` at training time or drop channels 7–9. Re-run the divergence check
+(require ~0 maxdiff across all 20 channels) before flipping the env.
+
+## The mint blocker — RESOLVED
+
+`train_champion` existed and was tested, **but nothing called it and no champion
+`.bin` existed** (the golden dirs hold only READMEs; backward trains an LSTM/DQN,
+not a CNN). This is now fixed: `crates/ml/src/bin/train_cnn_champion.rs` reads an
+OHLCV CSV, calls `train_champion`, saves the checkpoint, and reloads it through
+`PerAssetCnn::load` (the live path) to prove the artifact is valid. A first
+champion was minted on 4,521 BTCUSDT 1m bars. **Minting works; enabling is
+gated on the parity fix + validation above.**
 
 ## Minimal path (ordered)
 
@@ -68,14 +111,20 @@ a training-driver entrypoint.
 |---|------|-------|--------|
 | 1 | **Champion-minting binary** | **NEEDS-CODE** | Add a `crates/ml` `[[bin]]` (e.g. `train-cnn-champion`): load real OHLCV (QuestDB `candles_crypto` is already persisted, `fks/docker-compose.yml:345`), call `train_champion(...)` with `n_features=20, window=60`, then `model.save("models/per_asset_cnn.bin")`. |
 | 2 | **Run it** | **NEEDS-TRAINING** | Mint the `.bin` on a real per-asset series; verify with the existing roundtrip/parity tests. |
-| 3 | **Ship the champion** | READY | Mount the `.bin` into the janus container; point `CNN_CHECKPOINT_PATH` at it. |
-| 4 | **Flip the env** | READY | janus service in `fks/docker-compose.yml`: `ENABLE_CNN_INFERENCE=true` (+ optional `CNN_CHECKPOINT_PATH`, `CNN_CONFIDENCE_THRESHOLD`). On boot, `is_active()` flips true and votes enter consensus. |
-| 5 | **Observe in paper** | READY / safe | With `ENABLE_EXECUTION=false` + paper account, zero live-order blast radius. Pair CNN with a rule strategy (needs `min_strategies=2`), watch `source=per_asset_cnn` in published signals. |
+| 3 | **Fix the feature-parity break** | **NEEDS-CODE** | Reconcile the train/inference warmup contract + fix channels 7–9, and add a golden test asserting identical features (see ⚠️ section). Re-mint the champion after. **This is the true gate to enabling** — without it the model is served out-of-distribution features. |
+| 4 | **Validate out-of-sample** | **NEEDS-TRAINING** | Retrain with a train/validation/(walk-forward) holdout and report validation loss + per-class precision/recall on the actionable long/short classes. The first champion's `best_loss=0.09` is **in-sample training loss** (no split) on ~dozens of effectively-independent breakout episodes — overfit, not a quality signal. |
+| 5 | **Ship the champion** | READY | Mount the re-minted `.bin` into the janus container; point `CNN_CHECKPOINT_PATH` at it. |
+| 6 | **Flip the env** | READY | janus service in `fks/docker-compose.yml`: `ENABLE_CNN_INFERENCE=true` (+ optional `CNN_CHECKPOINT_PATH`, `CNN_CONFIDENCE_THRESHOLD`). On boot, `is_active()` flips true and votes enter consensus. |
+| 7 | **Observe in paper** | READY / safe | With `ENABLE_EXECUTION=false` + paper account, zero live-order blast radius. Pair CNN with a rule strategy (needs `min_strategies=2`), watch `source=per_asset_cnn` in published signals. |
 
-**Summary:** wiring, model, features, gates, and the training algorithm are all
-**READY**. Steps 1–2 (a champion-minting entrypoint + one training run) are the
-entire gap between "off" and a first live paper CNN vote. Everything after is
-env-only and reversible.
+**Summary (corrected after adversarial verification):** the live wiring, gates,
+model machinery, and the champion-minting binary are **READY** — steps 1–2 are
+done (the binary exists and mints + roundtrips a real artifact). But enabling is
+**not** env-only: step 3 (feature-parity fix + golden test) is a genuine
+NEEDS-CODE blocker, and step 4 (out-of-sample validation) is required before the
+model's votes should be trusted even in paper. The first champion is a
+**pipeline proof, not a validated model.** Steps 5–7 remain env-only and
+reversible once 3–4 are done.
 
 ## Decision points before step 1
 
