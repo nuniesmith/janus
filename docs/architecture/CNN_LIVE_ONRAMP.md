@@ -87,13 +87,15 @@ are history-dependent, so the feature values diverge:**
   are trained as **constants**; live, `cnn_inference.rs` feeds the real
   live-varying values into those same channels.
 
-**Fix before enable:** reconcile the warmup contract so both paths produce
-identical features for the same terminal bar (either extend `extract_features`
-to compute over the full available buffer, or build training samples through
-the same limited-warmup tail), **add a golden regression test** asserting
-`training-window features == inference features`, and either feed real
-`LiveState` at training time or drop channels 7–9. Re-run the divergence check
-(require ~0 maxdiff across all 20 channels) before flipping the env.
+**✅ Warmup skew FIXED (PR #129).** A single `WARMUP = 110` constant now drives
+both `extract_features`' slice depth and `min_rows` (the live `CandleBuffer`
+auto-sizes off it), so every returned window column is fully warmed. The new
+`bounded_warmup_matches_full_series` regression test asserts bounded-inference
+features match full-series training features: fixed-window channels <1e-4, the
+four EMA channels <1e-2 (was up to 1.0). **Channels 7–9 were a non-issue** —
+the live loop already passes `LiveState::default()` (`lib.rs:1698`), matching
+training, so no code change was needed there. Remaining gate before enable is
+now just **out-of-sample validation** (below).
 
 ## The mint blocker — RESOLVED
 
@@ -111,20 +113,22 @@ gated on the parity fix + validation above.**
 |---|------|-------|--------|
 | 1 | **Champion-minting binary** | **NEEDS-CODE** | Add a `crates/ml` `[[bin]]` (e.g. `train-cnn-champion`): load real OHLCV (QuestDB `candles_crypto` is already persisted, `fks/docker-compose.yml:345`), call `train_champion(...)` with `n_features=20, window=60`, then `model.save("models/per_asset_cnn.bin")`. |
 | 2 | **Run it** | **NEEDS-TRAINING** | Mint the `.bin` on a real per-asset series; verify with the existing roundtrip/parity tests. |
-| 3 | **Fix the feature-parity break** | **NEEDS-CODE** | Reconcile the train/inference warmup contract + fix channels 7–9, and add a golden test asserting identical features (see ⚠️ section). Re-mint the champion after. **This is the true gate to enabling** — without it the model is served out-of-distribution features. |
+| 3 | **Fix the feature-parity break** | ✅ **DONE (PR #129)** | `WARMUP=110` warms every channel; regression test proves bounded-inference == full-series training features (<1e-4 fixed, <1e-2 EMA). Channels 7–9 needed no change (live loop already passes `LiveState::default()`). |
 | 4 | **Validate out-of-sample** | **NEEDS-TRAINING** | Retrain with a train/validation/(walk-forward) holdout and report validation loss + per-class precision/recall on the actionable long/short classes. The first champion's `best_loss=0.09` is **in-sample training loss** (no split) on ~dozens of effectively-independent breakout episodes — overfit, not a quality signal. |
 | 5 | **Ship the champion** | READY | Mount the re-minted `.bin` into the janus container; point `CNN_CHECKPOINT_PATH` at it. |
 | 6 | **Flip the env** | READY | janus service in `fks/docker-compose.yml`: `ENABLE_CNN_INFERENCE=true` (+ optional `CNN_CHECKPOINT_PATH`, `CNN_CONFIDENCE_THRESHOLD`). On boot, `is_active()` flips true and votes enter consensus. |
 | 7 | **Observe in paper** | READY / safe | With `ENABLE_EXECUTION=false` + paper account, zero live-order blast radius. Pair CNN with a rule strategy (needs `min_strategies=2`), watch `source=per_asset_cnn` in published signals. |
 
-**Summary (corrected after adversarial verification):** the live wiring, gates,
-model machinery, and the champion-minting binary are **READY** — steps 1–2 are
-done (the binary exists and mints + roundtrips a real artifact). But enabling is
-**not** env-only: step 3 (feature-parity fix + golden test) is a genuine
-NEEDS-CODE blocker, and step 4 (out-of-sample validation) is required before the
-model's votes should be trusted even in paper. The first champion is a
-**pipeline proof, not a validated model.** Steps 5–7 remain env-only and
-reversible once 3–4 are done.
+**Summary (updated after the parity fix).** Steps 1–3 are **done**: the
+champion-minting binary exists (#128), and the train/serve feature-parity break
+is fixed with a regression guard (#129). The **only** remaining gate before a
+defensible enable is **step 4 — out-of-sample validation**: retrain with a
+train/validation/walk-forward holdout and report validation loss + per-class
+precision/recall on the actionable long/short classes. The first champion's
+`best_loss≈0.09` is in-sample training loss on ~dozens of effectively-independent
+breakout episodes — overfit, not evidence of generalization. Once a champion
+clears that bar, steps 5–7 (ship, flip env, observe in paper) are env-only and
+reversible.
 
 ## Decision points before step 1
 
