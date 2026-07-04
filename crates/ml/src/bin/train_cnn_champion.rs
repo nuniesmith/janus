@@ -133,10 +133,9 @@ fn run() -> Result<(), String> {
     let (model, report) = train_champion(&o, &h, &l, &c, &v, &cfg).ok_or_else(|| {
         format!(
             "not enough bars ({}) to form any training sample at window={} \
-             (need ~{} minimum)",
+             (need window + ~110 warmup + ~130 label-horizon bars)",
             c.len(),
             args.window,
-            args.window + 25
         )
     })?;
 
