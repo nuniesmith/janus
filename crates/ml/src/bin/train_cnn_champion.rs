@@ -19,14 +19,17 @@
 
 use janus_ml::CpuBackend;
 use janus_ml::backend::AutodiffCpuBackend;
+use janus_ml::backtest::BacktestConfig;
 use janus_ml::models::PerAssetCnn;
 use janus_ml::train_per_asset::{
-    CLASS_NAMES, TrainChampionConfig, TrainReport, ValMetrics, WalkForwardReport, train_champion,
-    train_champion_with_holdout, train_walk_forward,
+    CLASS_NAMES, TrainChampionConfig, TrainReport, ValMetrics, WalkForwardBacktest,
+    WalkForwardReport, train_champion, train_champion_with_holdout, train_walk_forward,
+    walk_forward_backtest,
 };
 
 const HELP: &str = "train_cnn_champion --csv <ohlcv.csv> --out <model.bin> \
-[--window 60] [--epochs 60] [--val-frac 0.2] [--walk-forward N] [--gpu]";
+[--window 60] [--epochs 60] [--val-frac 0.2] [--walk-forward N] [--backtest] \
+[--cost-bps 6] [--gpu]";
 
 struct Args {
     csv: String,
@@ -40,6 +43,11 @@ struct Args {
     /// rolling out-of-sample segments (no artifact saved) and overrides
     /// --val-frac.
     walk_forward: usize,
+    /// Run a walk-forward PnL backtest of the directional signal (per-side cost
+    /// = `cost_bps`), instead of classification metrics.
+    backtest: bool,
+    /// Per-side trading cost in basis points (fee + slippage) for --backtest.
+    cost_bps: f64,
     /// Train on the GPU (requires building with `--features gpu`).
     gpu: bool,
 }
@@ -51,6 +59,8 @@ fn parse_args() -> Result<Args, String> {
     let mut epochs = 60usize;
     let mut val_frac = 0.0f64;
     let mut walk_forward = 0usize;
+    let mut backtest = false;
+    let mut cost_bps = 6.0f64;
     let mut gpu = false;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -81,6 +91,13 @@ fn parse_args() -> Result<Args, String> {
                     .and_then(|s| s.parse().ok())
                     .ok_or_else(|| "--walk-forward needs a positive integer".to_string())?
             }
+            "--backtest" => backtest = true,
+            "--cost-bps" => {
+                cost_bps = it
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .ok_or_else(|| "--cost-bps needs a number".to_string())?
+            }
             "--gpu" => gpu = true,
             "-h" | "--help" => return Err(HELP.to_string()),
             other => return Err(format!("unknown arg: {other}\n{HELP}")),
@@ -93,6 +110,8 @@ fn parse_args() -> Result<Args, String> {
         epochs,
         val_frac,
         walk_forward,
+        backtest,
+        cost_bps,
         gpu,
     })
 }
@@ -110,6 +129,7 @@ fn backend_label(gpu: bool) -> &'static str {
 
 /// Dispatch holdout training to the GPU backend when requested and available,
 /// else the CPU backend.
+#[allow(clippy::too_many_arguments)]
 fn holdout_dispatch(
     gpu: bool,
     o: &[f32],
@@ -132,6 +152,7 @@ fn holdout_dispatch(
 
 /// Dispatch walk-forward validation to the GPU backend when requested and
 /// available, else the CPU backend.
+#[allow(clippy::too_many_arguments)]
 fn walk_forward_dispatch(
     gpu: bool,
     o: &[f32],
@@ -150,6 +171,29 @@ fn walk_forward_dispatch(
         }
     }
     train_walk_forward::<AutodiffCpuBackend>(o, h, l, c, v, cfg, n_folds)
+}
+
+/// Dispatch the walk-forward PnL backtest to GPU when requested/available.
+#[allow(clippy::too_many_arguments)]
+fn backtest_dispatch(
+    gpu: bool,
+    o: &[f32],
+    h: &[f32],
+    l: &[f32],
+    c: &[f32],
+    v: &[f32],
+    cfg: &TrainChampionConfig,
+    n_folds: usize,
+    bt: &BacktestConfig,
+) -> Option<WalkForwardBacktest> {
+    if gpu {
+        #[cfg(feature = "gpu")]
+        {
+            use janus_ml::backend::AutodiffGpuBackend;
+            return walk_forward_backtest::<AutodiffGpuBackend>(o, h, l, c, v, cfg, n_folds, bt);
+        }
+    }
+    walk_forward_backtest::<AutodiffCpuBackend>(o, h, l, c, v, cfg, n_folds, bt)
 }
 
 type Ohlcv = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>);
@@ -336,6 +380,62 @@ fn print_walk_forward(r: &WalkForwardReport) {
     println!("  VERDICT: {verdict}");
 }
 
+/// Print the walk-forward PnL backtest + a money verdict.
+fn print_backtest(r: &WalkForwardBacktest, cost_bps: f64) {
+    println!(
+        "\nwalk-forward PnL backtest — CNN signal standalone, {:.0} bps/side cost, \
+         TP 1.5 / SL 1.0 ATR bracket, one position at a time:",
+        cost_bps
+    );
+    println!("  fold  trades  win%    net_return  sum_R    sharpe  max_dd");
+    for (i, f) in r.folds.iter().enumerate() {
+        println!(
+            "  {:>3}   {:>5}  {:>5.1}  {:>+9.4}  {:>+6.2}  {:>+.3}  {:.4}",
+            i,
+            f.n_trades,
+            f.win_rate * 100.0,
+            f.net_return,
+            f.sum_r,
+            f.sharpe,
+            f.max_drawdown,
+        );
+    }
+    let win_pct = if r.total_trades > 0 {
+        100.0 * r.total_wins as f64 / r.total_trades as f64
+    } else {
+        0.0
+    };
+    println!(
+        "  TOTAL: {} trades, {:.1}% win, net_return {:+.4} ({:+.2} R), \
+         mean fold Sharpe {:+.3}, {}/{} folds profitable, worst fold DD {:.4}",
+        r.total_trades,
+        win_pct,
+        r.total_net_return,
+        r.total_sum_r,
+        r.mean_sharpe,
+        r.folds_profitable,
+        r.folds.len(),
+        r.worst_drawdown,
+    );
+    let n = r.folds.len();
+    let consistent = r.folds_profitable * 2 >= n; // majority of folds green
+    let verdict = if r.total_net_return > 0.0 && consistent && r.total_sum_r > 0.0 {
+        "NET PROFITABLE after costs across the majority of out-of-sample folds. \
+         This clears the standalone bar. Since the live loop adds consensus + \
+         risk gates that only filter further, the next step is a full gated \
+         paper-mode trial — NOT a live-money enable. Beware: transaction-cost \
+         and fill assumptions dominate at this trade frequency; stress-test them."
+    } else if r.total_net_return > 0.0 {
+        "marginally net positive but NOT consistent across folds — fragile, and \
+         likely inside the cost/slippage error bars. Not a green light."
+    } else {
+        "NET NEGATIVE after costs — the ~2x directional precision does NOT survive \
+         trading costs at this frequency/bracket. The classification edge is real \
+         but not, as-is, tradable. Do not enable; iterate on costs/holding/label."
+    };
+    println!("  VERDICT: {verdict}");
+}
+
 fn run() -> Result<(), String> {
     let args = parse_args()?;
     let (o, h, l, c, v) = read_ohlcv(&args.csv)?;
@@ -360,6 +460,24 @@ fn run() -> Result<(), String> {
             args.window,
         )
     };
+
+    // --backtest: walk-forward PnL backtest of the directional signal. A
+    // validation experiment — no artifact is saved.
+    if args.backtest {
+        let n_folds = if args.walk_forward > 0 {
+            args.walk_forward
+        } else {
+            5
+        };
+        let bt = BacktestConfig {
+            cost_per_side: args.cost_bps / 10_000.0,
+            ..Default::default()
+        };
+        let report = backtest_dispatch(args.gpu, &o, &h, &l, &c, &v, &cfg, n_folds, &bt)
+            .ok_or_else(too_short)?;
+        print_backtest(&report, args.cost_bps);
+        return Ok(());
+    }
 
     // --walk-forward: multi-fold out-of-sample validation across distinct time
     // windows. A validation experiment — no artifact is saved.

@@ -53,6 +53,7 @@
 //! ```
 
 pub mod backend;
+pub mod backtest;
 pub mod config;
 pub mod dataset;
 pub mod dqn;
