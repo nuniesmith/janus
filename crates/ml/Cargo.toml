@@ -77,6 +77,11 @@ default = ["cpu"]
 cpu = []
 gpu = ["burn-wgpu"]
 
+# Champion-minting CLI for the per-asset CNN (see docs/architecture/CNN_LIVE_ONRAMP.md).
+[[bin]]
+name = "train_cnn_champion"
+path = "src/bin/train_cnn_champion.rs"
+
 # TODO: Uncomment when benchmarks are implemented
 # [[bench]]
 # name = "feature_extraction"
