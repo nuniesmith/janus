@@ -114,26 +114,41 @@ gated on the parity fix + validation above.**
 | 1 | **Champion-minting binary** | **NEEDS-CODE** | Add a `crates/ml` `[[bin]]` (e.g. `train-cnn-champion`): load real OHLCV (QuestDB `candles_crypto` is already persisted, `fks/docker-compose.yml:345`), call `train_champion(...)` with `n_features=20, window=60`, then `model.save("models/per_asset_cnn.bin")`. |
 | 2 | **Run it** | **NEEDS-TRAINING** | Mint the `.bin` on a real per-asset series; verify with the existing roundtrip/parity tests. |
 | 3 | **Fix the feature-parity break** | ✅ **DONE (PR #129)** | `WARMUP=110` warms every channel; regression test proves bounded-inference == full-series training features (<1e-4 fixed, <1e-2 EMA). Channels 7–9 needed no change (live loop already passes `LiveState::default()`). |
-| 4 | **Validate out-of-sample** | ⚠️ **HARNESS DONE (#128); champion FAILS — blocked on DATA** | `train_champion_with_holdout` (`--val-frac`) does a leakage-safe purged time split + per-class metrics. First BTCUSDT champion (3 days, 20% holdout): **accuracy 0.369 < majority baseline 0.407 → does not generalize** (collapses to the majority class; long/short no edge). `best_loss` confirmed an overfit artifact. The blocker is now **data** — months of history, not 3 days — not code. |
-| 5 | **Ship the champion** | READY | Mount the re-minted `.bin` into the janus container; point `CNN_CHECKPOINT_PATH` at it. |
-| 6 | **Flip the env** | READY | janus service in `fks/docker-compose.yml`: `ENABLE_CNN_INFERENCE=true` (+ optional `CNN_CHECKPOINT_PATH`, `CNN_CONFIDENCE_THRESHOLD`). On boot, `is_active()` flips true and votes enter consensus. |
-| 7 | **Observe in paper** | READY / safe | With `ENABLE_EXECUTION=false` + paper account, zero live-order blast radius. Pair CNN with a rule strategy (needs `min_strategies=2`), watch `source=per_asset_cnn` in published signals. |
+| 4 | **Validate out-of-sample** | ✅ **DONE — ROBUST DIRECTIONAL EDGE (#128, #130)** | Leakage-safe purged holdout (`--val-frac`) + anchored **walk-forward** (`--walk-forward N`), GPU-accelerated (`--gpu`, #130). 3-day data → fails (acc 0.369 < 0.407 baseline). **130k-bar / 90-day data, 5-fold walk-forward: long precision beats base rate in 5/5 folds, short in 5/5 (mean ~2× base)** — consistent across regimes, not one lucky split. Accuracy doesn't beat the majority-flat baseline (expected for a minority-class signal). The data hypothesis was right. |
+| 5 | **PnL backtest** | ⛔ **DONE — NOT TRADABLE AS-IS (#130)** | Walk-forward event-driven backtest (`--backtest`, enter at signal bar, TP 1.5/SL 1.0 ATR bracket, intrabar exits, per-side cost). At 6 bps/side: **net −12.7 over 10.7k trades, 0/5 folds profitable, Sharpe −1.56.** At 0 bps the gross signal is only barely positive (41% win, Sharpe +0.006). Root cause: on 1m BTC, ATR ≈ 5 bps, so a 1.5-ATR target ≈ 7.5 bps < the 12-bps round-trip cost — the per-trade edge (~+0.1 bps) is ~100× smaller than costs. **The robust classification edge does NOT survive transaction costs.** Do not enable. |
+| 6 | **Ship the champion** | READY | Mount the (validated, all-data-retrained) `.bin` into the janus container; point `CNN_CHECKPOINT_PATH` at it. |
+| 7 | **Flip the env** | READY | janus service in `fks/docker-compose.yml`: `ENABLE_CNN_INFERENCE=true` (+ optional `CNN_CHECKPOINT_PATH`, `CNN_CONFIDENCE_THRESHOLD`). On boot, `is_active()` flips true and votes enter consensus. |
+| 8 | **Observe in paper** | READY / safe | With `ENABLE_EXECUTION=false` + paper account, zero live-order blast radius. Pair CNN with a rule strategy (needs `min_strategies=2`), watch `source=per_asset_cnn` in published signals. |
 
-**Summary (updated after validation).** All the *code* is done: minting binary
-(#128), train/serve feature-parity fix + regression guard (#129), and a
-leakage-safe out-of-sample validation harness (#128). Running it delivered the
-honest verdict — **the first champion does not generalize** (val accuracy 0.369
-< 0.407 majority baseline), exactly as expected from 3 days of autocorrelated 1m
-data. So the enable gate stays **shut**, and the remaining blocker is now clearly
-**data, not code**: the CNN needs *months* of history (QuestDB currently retains
-~3 days) before a champion can plausibly clear validation. Once a champion beats
-its baseline with real long/short precision on a walk-forward, steps 5–7 (ship,
-flip env, observe in paper) are env-only and reversible. Until then, nothing is
-enabled — which is the correct outcome.
+**Summary (updated after walk-forward).** All the training/validation *code* is
+done: minting binary (#128), feature-parity fix + regression guard (#129),
+leakage-safe holdout + **anchored walk-forward** validation (#128, #130), and a
+**GPU backend** (#130) that makes multi-fold sweeps fast. The experiment answered
+the paper's core question empirically: on 3 days of data the champion fails
+(acc 0.369 < 0.407), but on **~90 days (130k bars), 5-fold walk-forward shows a
+robust directional edge — long AND short precision beat their base rate in 5/5
+folds (~2× base), across distinct time windows.** The data hypothesis was right:
+the CNN+breakout-label approach carries real, regime-consistent directional
+signal once it has adequate history.
 
-**Next real step is a data pipeline**, not more model code: accumulate/backfill a
-multi-month OHLCV history (extend QuestDB retention or a one-off historical
-backfill), then re-run `--val-frac` and read the verdict.
+**But the PnL backtest (step 5) settled it: the edge is real but NOT tradable
+as-is.** At realistic 6-bps/side costs the signal loses decisively (net −12.7,
+0/5 folds profitable); even at zero cost the gross edge is noise-level
+(Sharpe +0.006). On 1m BTC the ATR-scaled profit target (~7.5 bps) is smaller
+than the round-trip cost (12 bps), so the ~+0.1 bps/trade edge is ~100× too
+small to overcome costs. **The enable gate stays shut — correctly and, now,
+conclusively.**
+
+**Honest next directions (open research, NOT queued work):** the labels are
+forward-looking breakout outcomes, but the backtest enters at the signal bar —
+a breakout-confirmation entry (as the labeler defines) might capture more of the
+move; lower frequency / wider brackets so the target exceeds costs; or accept
+the per-bar signal is simply too weak (gross Sharpe ≈ 0) and this asset/label/
+timeframe combination isn't the one. Steps 6–8 (ship/enable/observe) remain
+gated behind a tradable result that does not yet exist. **Nothing is enabled,
+which is the right outcome.** The value delivered is the rigorous, reusable
+rig — GPU trainer, purged walk-forward, cost-aware backtest — and a decisive,
+honest answer reached *before* any money was at risk.
 
 ## Decision points before step 1
 
