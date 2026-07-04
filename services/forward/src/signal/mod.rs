@@ -260,6 +260,21 @@ impl SignalGenerator {
     /// from the signal's metadata (confidence, symbol) so the pipeline can
     /// evaluate regime / gating / correlation checks.
     async fn submit_to_execution(&self, signal: &TradingSignal) -> Result<()> {
+        // Kill-switch choke point. Both submit paths funnel through here
+        // (submit_signal_to_execution and generate_from_analysis), so guarding
+        // here — not just in the public wrapper — ensures a tripped
+        // kill-switch suppresses EVERY order submit, including the
+        // analysis-driven path. Uses the cached state (no Redis round-trip).
+        if let Some(ks) = &self.kill_switch
+            && ks.is_killed_cached().await
+        {
+            warn!(
+                "🛑 kill-switch ACTIVE — suppressing execution submit for signal {} ({} {:?})",
+                signal.signal_id, signal.symbol, signal.signal_type,
+            );
+            return Ok(());
+        }
+
         // ── Brain-gated path ───────────────────────────────────────
         if let Some(gated) = &self.brain_gated_client {
             // Feed the real per-symbol detected regime (written to metadata by
@@ -583,8 +598,12 @@ impl SignalGenerator {
         let indicator_signal_type = self.analyze_from_analysis(analysis)?;
         let indicator_confidence = self.calculate_analysis_confidence(analysis);
 
-        // If ML inference is enabled, fuse predictions
-        let (final_signal_type, final_confidence) = if self.config.enable_ml_inference {
+        // If ML inference is enabled AND a model actually produces a
+        // prediction, fuse it in. `ml_applied` tracks whether the model truly
+        // contributed, so the signal source is not mislabeled as
+        // ModelInference when the model is absent or inference failed and we
+        // fell back to pure indicators.
+        let (final_signal_type, final_confidence, ml_applied) = if self.config.enable_ml_inference {
             if let Some(ref inference) = self.model_inference {
                 match inference.predict("signal_classifier", &features).await {
                     Ok(prediction) => {
@@ -594,31 +613,33 @@ impl SignalGenerator {
                         );
 
                         // Fuse indicator and ML predictions
-                        self.fuse_predictions(
+                        let (t, c) = self.fuse_predictions(
                             indicator_signal_type,
                             indicator_confidence,
                             prediction.signal_type,
                             prediction.confidence,
-                        )
+                        );
+                        (t, c, true)
                     }
                     Err(e) => {
                         warn!("ML inference failed, falling back to indicators: {}", e);
-                        (indicator_signal_type, indicator_confidence)
+                        (indicator_signal_type, indicator_confidence, false)
                     }
                 }
             } else {
-                (indicator_signal_type, indicator_confidence)
+                (indicator_signal_type, indicator_confidence, false)
             }
         } else {
-            (indicator_signal_type, indicator_confidence)
+            (indicator_signal_type, indicator_confidence, false)
         };
 
         if final_signal_type == SignalType::Hold {
             return Ok(None);
         }
 
-        // Create signal with appropriate source
-        let source = if self.config.enable_ml_inference {
+        // Create signal with a source reflecting what ACTUALLY produced it —
+        // ModelInference only when the model genuinely contributed.
+        let source = if ml_applied {
             SignalSource::ModelInference {
                 model_name: "signal_classifier".to_string(),
                 version: "v1".to_string(),
