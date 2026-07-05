@@ -20,7 +20,7 @@
 
 use burn::module::{Ignored, Module};
 use burn::optim::{Adam, AdamConfig, GradientsParams, Optimizer, adaptor::OptimizerAdaptor};
-use burn_core::tensor::backend::Backend;
+use burn_core::tensor::backend::{AutodiffBackend, Backend};
 use burn_core::tensor::{ElementConversion, Int, Tensor, TensorData, activation};
 use burn_nn::conv::{Conv1d, Conv1dConfig};
 use burn_nn::loss::CrossEntropyLossConfig;
@@ -324,30 +324,35 @@ fn st3<B: Backend>(name: &str, t: &Tensor<B, 3>) -> SerializedTensor {
 // Trainer (AdamW + weighted cross-entropy) — mirrors the LSTM AutodiffTrainer.
 // ---------------------------------------------------------------------------
 
-/// Minimal autodiff trainer for [`TrainablePerAssetCnn`] on the CPU backend.
-pub struct CnnTrainer {
-    model: TrainablePerAssetCnn<AutodiffCpuBackend>,
-    optimizer: OptimizerAdaptor<Adam, TrainablePerAssetCnn<AutodiffCpuBackend>, AutodiffCpuBackend>,
+/// Minimal autodiff trainer for [`TrainablePerAssetCnn`], generic over the
+/// autodiff backend `B` — [`AutodiffCpuBackend`] (NdArray) or, under the `gpu`
+/// feature, `AutodiffGpuBackend` (wgpu). The trained weights are always emitted
+/// into a CPU inference model via [`to_inference`](Self::to_inference), so the
+/// live path and checkpoint format are unchanged regardless of where training
+/// ran.
+pub struct CnnTrainer<B: AutodiffBackend = AutodiffCpuBackend> {
+    model: TrainablePerAssetCnn<B>,
+    optimizer: OptimizerAdaptor<Adam, TrainablePerAssetCnn<B>, B>,
     config: TrainablePerAssetCnnConfig,
     lr: f64,
     class_weights: Option<Vec<f32>>,
 }
 
-impl CnnTrainer {
-    /// Create a trainer for a freshly-initialised model.
+impl<B: AutodiffBackend> CnnTrainer<B> {
+    /// Create a trainer for a freshly-initialised model on `B`'s default device.
     pub fn new(
         config: &TrainablePerAssetCnnConfig,
         lr: f64,
         weight_decay: f64,
         class_weights: Option<Vec<f32>>,
     ) -> Self {
-        let device = Default::default();
-        let model = config.init::<AutodiffCpuBackend>(&device);
+        let device = B::Device::default();
+        let model = config.init::<B>(&device);
         let optimizer = AdamConfig::new()
             .with_weight_decay(Some(burn::optim::decay::WeightDecayConfig::new(
                 weight_decay as f32,
             )))
-            .init::<AutodiffCpuBackend, TrainablePerAssetCnn<AutodiffCpuBackend>>();
+            .init::<B, TrainablePerAssetCnn<B>>();
         Self {
             model,
             optimizer,
@@ -366,9 +371,9 @@ impl CnnTrainer {
     ///
     /// * `features`: `(batch, n_features, window)`.
     /// * `labels`: one class index per sample.
-    pub fn step(&mut self, features: Tensor<AutodiffCpuBackend, 3>, labels: &[i64]) -> f32 {
-        let device = Default::default();
-        let targets = Tensor::<AutodiffCpuBackend, 1, Int>::from_data(
+    pub fn step(&mut self, features: Tensor<B, 3>, labels: &[i64]) -> f32 {
+        let device = B::Device::default();
+        let targets = Tensor::<B, 1, Int>::from_data(
             TensorData::new(labels.to_vec(), [labels.len()]),
             &device,
         );
@@ -387,11 +392,13 @@ impl CnnTrainer {
     }
 
     /// The current trained model.
-    pub fn model(&self) -> &TrainablePerAssetCnn<AutodiffCpuBackend> {
+    pub fn model(&self) -> &TrainablePerAssetCnn<B> {
         &self.model
     }
 
-    /// Transfer the trained weights into a ready-to-serve inference model.
+    /// Transfer the trained weights into a ready-to-serve **CPU** inference
+    /// model. `extract_weights` is backend-agnostic (a `WeightMap` of f32), so a
+    /// GPU-trained model serves on the CPU path unchanged.
     pub fn to_inference(&self, window: usize) -> PerAssetCnn<crate::backend::CpuBackend> {
         let cfg = self.config.inference(window);
         let device = Default::default();
@@ -419,6 +426,42 @@ mod tests {
         let model = TrainablePerAssetCnnConfig::default().init::<AutodiffCpuBackend>(&device);
         let out = model.forward(input::<AutodiffCpuBackend>(3, 20, 60, &device));
         assert_eq!(out.dims(), [3, 4]);
+    }
+
+    /// Runtime smoke test: the wgpu device initialises and the conv net runs a
+    /// forward + backward pass on the GPU (not just that the stack compiles).
+    /// Gated on `--features gpu`; run with `cargo test -p jflow-ml --features gpu`.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_forward_backward_smoke() {
+        use crate::backend::AutodiffGpuBackend;
+        use burn_core::tensor::{Int, TensorData};
+        let device = Default::default();
+        let model = TrainablePerAssetCnnConfig::default().init::<AutodiffGpuBackend>(&device);
+        let x = input::<AutodiffGpuBackend>(4, 20, 60, &device);
+        let logits = model.forward(x);
+        assert_eq!(logits.dims(), [4, 4]);
+        let v = logits.clone().to_data().to_vec::<f32>().unwrap();
+        assert!(
+            v.iter().all(|x| x.is_finite()),
+            "GPU forward non-finite: {v:?}"
+        );
+
+        // Backward must also run on the GPU (grads flow through the conv kernels).
+        let targets = Tensor::<AutodiffGpuBackend, 1, Int>::from_data(
+            TensorData::new(vec![0i64, 1, 2, 3], [4]),
+            &device,
+        );
+        let loss = CrossEntropyLossConfig::new()
+            .init(&device)
+            .forward(logits, targets);
+        let loss_val = loss.clone().into_scalar().elem::<f32>();
+        assert!(
+            loss_val.is_finite() && loss_val > 0.0,
+            "GPU loss: {loss_val}"
+        );
+        let _grads = loss.backward();
+        eprintln!("GPU smoke OK: loss={loss_val:.4}");
     }
 
     /// Weight transfer + architecture equivalence: a trainable twin on the plain
