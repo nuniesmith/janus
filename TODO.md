@@ -151,13 +151,22 @@ path to *create* champions from scratch later.
       janus's own 20-channel `crates/ml` pipeline; the 15-feature contract is
       historical. (Exact window/classes confirmed from `crates/ml` when training
       lands — but the channel count is settled: 20.)
-- [ ] **Train champions from scratch in burn** (when data + GPU available):
-      `train_champion(ohlcv)` → features → labels → train → save the `.bin` +
-      `.json` sidecar. Then cosine LR / train-val split / temperature calibration
-      as training polish.
-- [ ] **Flip the gate** only once a trained model shows edge on a shadow basis:
-      `ENABLE_CNN_INFERENCE` → `ENABLE_BRAIN_RUNTIME`. The CNN-agreement /
-      -confidence gates already consume the vote (Track C).
+- [x] **Train champions from scratch in burn** — SHIPPED. `train_cnn_champion`
+      binary (`crates/ml/src/bin/`) does `train_champion(ohlcv)` → features →
+      labels → train → save `.bin` + roundtrip-verify. Now also: a **GPU
+      backend** (`--gpu`, wgpu/Vulkan, `--features gpu`), a leakage-safe
+      **train/val holdout** (`--val-frac`) and anchored **walk-forward**
+      (`--walk-forward`), and a cost-aware **PnL backtest** (`--backtest`).
+      Remaining polish: the `.json` sidecar (only the `.bin` is saved today) +
+      temperature calibration.
+- [ ] **Flip the gate** — BLOCKED ON A TRADABLE MODEL, not on tooling. The
+      empirical result: the CNN carries a real, regime-consistent directional
+      edge (walk-forward: long+short precision ~2× base in 5/5 folds on ~90d
+      BTCUSDT) but it is **NOT tradable as-is** — at 6 bps/side the backtest is
+      net-negative (the 1m ATR-bracket profit target is ~100× below round-trip
+      costs). So `ENABLE_CNN_INFERENCE` stays OFF until a model clears a gated
+      PnL backtest. The CNN-agreement/-confidence gates already consume the vote
+      (Track C). See `docs/architecture/CNN_LIVE_ONRAMP.md`.
 
 ### Track C — Safety: execution gate + risk · RUST_MIGRATION Phase 3 · ◀ all 9 gates live (advisory)
 - [x] **Port the 9-gate `ExecutionGate`** → `crates/execution-gate` (faithful
@@ -469,7 +478,7 @@ gaps are below.
 - [x] **Dependency vuln scanning in CI (2026-05-31).** `.github/workflows/security.yml` runs `cargo-audit` (RUSTSEC) on dependency-manifest changes, weekly, and on demand. **Informational** for now: it reports advisories in the job summary + a `::warning::` annotation but **exits 0** (green check), so it surfaces findings without red-lining `main` or training people to ignore a by-design-red check. Flip to a hard gate (drop the `exit 0`, mark required) once the advisory backlog above is cleared. Trivy filesystem scan still TODO.
 - [ ] **Service-backed integration tests in CI.** `ci.yml` runs `--lib` only; integration/e2e suites that need Postgres/Redis (e.g. `services/forward/tests/param_reload_integration.rs`, the execution scenarios) don't run. Add a job with service containers.
 - [ ] **Distributed tracing (OpenTelemetry/Jaeger).** `Config` has a `tracing`/`jaeger_endpoint` field that nothing reads. Either wire OTel export through it or drop the field. Plain `tracing` is used everywhere today.
-- [x] **Grafana dashboards + Alertmanager rules.** Decided: they live in **fks** (`infrastructure/config/prometheus/alerts/` + `grafana/dashboards/`). Done 2026-07: the fks alert board was audited against the live metric inventory and repointed/pruned to 85 real rules (fks #156/#157), the alert-linked dashboards were repointed to exported metrics (fks #159), and the completeness SLO is real end-to-end — `data_completeness_percent` is computed in the live ingestion path here (janus #123) and the armed `DataCompletenessLow` alert caught a genuine silent gap (dead MATIC→POL Binance stream, fks #163) on its first day. Remaining honest gap: metrics only the legacy standalone data binary sets (IndicatorActor calc counters, gap-accuracy) stay unwired until that pipeline joins the unified live path.
+- [x] **Grafana dashboards + Alertmanager rules.** Decided: they live in **fks** (`infrastructure/config/prometheus/alerts/` + `grafana/dashboards/`). Done 2026-07: the fks alert board was audited against the live metric inventory and repointed/pruned to 85 real rules (fks #156/#157), the alert-linked dashboards were repointed to exported metrics (fks #159), and the completeness SLO is computed in the live ingestion path here (janus #123) and the armed `DataCompletenessLow` alert caught a genuine silent gap (dead MATIC→POL Binance stream, fks #163) on its first day. **Caveat (found in review):** the SLI only computes for kline intervals ≤ ~15m — the rolling window is 1800s and the warm-up gate needs `2*max_interval` of history, so configuring any `DATA_KLINE_INTERVALS` entry > 15m silently pins the gauge at 0 (no warning). Default `1m,5m` works. Remaining honest gaps: that >15m edge case, and metrics only the legacy standalone data binary sets (IndicatorActor calc counters, gap-accuracy) stay unwired until that pipeline joins the unified live path.
 
 ---
 
