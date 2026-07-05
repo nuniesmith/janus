@@ -4,7 +4,7 @@
 //! series of gates in priority order, stopping at the first BLOCK. This is a
 //! faithful Rust port of the Python trading system's
 //! `services/execution_gate.py` (the `nuniesmith/ruby` repo), brought into janus
-//! as part of the Rust migration (see `fks-full/docs/architecture/RUST_MIGRATION.md`
+//! as part of the Rust migration (see `fks/docs/architecture/RUST_MIGRATION.md`
 //! §6 Phase 3 / §12-D, and the janus `TODO.md`).
 //!
 //! # Gate order

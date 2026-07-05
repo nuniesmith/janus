@@ -1,9 +1,9 @@
 //! `PerAssetCnn` — burn-native reimplementation of the Python `PerAssetCNN`.
 //!
 //! This is the first model ported as part of the Python → Rust migration
-//! (see fks-full `docs/architecture/RUST_MIGRATION.md`, Phase 2). It mirrors,
+//! (see fks `docs/architecture/RUST_MIGRATION.md`, Phase 2). It mirrors,
 //! layer-for-layer, the champion architecture defined in the Python trainer at
-//! `fks-full/src/ruby/src/ml/model.py` so that a `burn` model can serve the
+//! `fks/src/ruby/src/ml/model.py` so that a `burn` model can serve the
 //! same per-asset entry/exit signal at inference parity.
 //!
 //! # Architecture (inference path)

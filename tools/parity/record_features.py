@@ -12,7 +12,7 @@ both operate on float32 candles), so both sides see identical bars.
 Usage
 -----
     python tools/parity/record_features.py \
-        --ruby-src /path/to/fks-full/src/ruby/src \
+        --ruby-src /path/to/fks/src/ruby/src \
         --out crates/ml/tests/golden/per_asset_features
 
 Requires: numpy + pandas + the ruby `ml` package importable from --ruby-src.
@@ -45,7 +45,7 @@ def gen_ohlcv(n: int, seed: int):
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--ruby-src", required=True, help="path to fks-full/src/ruby/src (so `ml.features` imports)")
+    ap.add_argument("--ruby-src", required=True, help="path to fks/src/ruby/src (so `ml.features` imports)")
     ap.add_argument("--out", required=True, help="output golden directory")
     ap.add_argument("--cases", type=int, default=4)
     ap.add_argument("--window", type=int, default=60)

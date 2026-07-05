@@ -18,7 +18,7 @@
 | **TA** | [`indicators-ta`](https://crates.io/crates/indicators-ta) `0.1.5` | ✅ **DONE** — `jflow-indicators` retired; janus consumes published `indicators-ta` (superset). Cost the workspace a polars 0.44→0.53 bump. | shipped |
 | **Bybit client** | [`exchange-apiws`](https://crates.io/crates/exchange-apiws) `0.4.0` | ✅ **DONE** — `jflow-bybit-client` retired; forward consumes 0.4.0's signed Bybit via a thin `bybit_compat` adapter (REST order entry + WS feed) | shipped |
 | **Exchange ingestion** | `exchange-apiws` `0.5.0` | ✅ **DONE** — `services/data` bridges now wrap the published Coinbase/Kraken/OKX connectors; the duplicate `jflow-exchanges` adapters are out of the data path. CNS metrics + health stay janus-side. | shipped |
-| **Framework** | `rustrade` | ✋ **reframed — not janus's job** (lives in fks-full `bots/`; `JanusBrain` already ties them together) | n/a |
+| **Framework** | `rustrade` | ✋ **reframed — not janus's job** (lives in fks `bots/`; `JanusBrain` already ties them together) | n/a |
 
 > **Phase 1 shipped** (branch `claude/phase1-indicators-ta`): the workspace
 > moved to **polars 0.53** to match `indicators-ta`, which required 0.53 API
@@ -56,7 +56,7 @@
 > **On `rustrade`:** janus is a ~50-crate multi-service ML engine with its own
 > lifecycle (it dropped `rustrade-supervisor` at extraction). Forcing it into
 > `rustrade::Bot`/`Brain` is a poor fit. `rustrade` belongs in the **`bots/`
-> layer** (in `fks-full`) that *consumes* janus's signals — not inside janus.
+> layer** (in `fks`) that *consumes* janus's signals — not inside janus.
 > A thin `rustrade::Brain` adapter that calls janus's brain REST API can live
 > in `bots/` so a rustrade bot can use janus as its brain. Tracked there, not
 > here.
@@ -175,7 +175,7 @@ purely dependency + import-path swaps.
 - [ ] Verify: data-completeness + health checks against live feeds.
 
 ### Phase 4 — Framework, in `bots/` not janus (optional, separate repo)
-- [ ] In `fks-full` `bots/`: a `rustrade::Brain` adapter that calls janus's
+- [ ] In `fks` `bots/`: a `rustrade::Brain` adapter that calls janus's
       brain REST API, so a `rustrade::Bot` can use janus as its brain. Pure
       addition; no janus change.
 
@@ -188,7 +188,7 @@ Phase 0 (now) ──► Phase 1 TA (now, against indicators-ta 0.1.x) ──► 
                                                                     
 Phase 2 Bybit  ── gated on ─► exchange-apiws signed-Bybit release ─► delete jflow-bybit-client
 Phase 3 Ingest ── gated on ─► exchange-apiws Coinbase/OKX (or scope to Kraken) ─► delete jflow-exchanges
-Phase 4 bots   ── independent, lives in fks-full
+Phase 4 bots   ── independent, lives in fks
 ```
 
 Phase 1 is unblocked and self-contained — **start there.** Phases 2 and 3 each

@@ -6,11 +6,11 @@
 > *path / method / purpose* map plus a config reference — for exact request /
 > response JSON shapes, follow the linked handler source (paths are clickable in
 > most editors). gRPC/proto contracts (`proto/fks/…`), example binaries, and the
-> fks-full `bots/*` are **out of scope** here.
+> fks `bots/*` are **out of scope** here.
 >
 > This is the janus half of the **Track D** infra contract (see
-> [`TODO.md`](../TODO.md) and `fks-full/docs/architecture/RUST_MIGRATION.md`
-> §12-C): the routes fks-full's nginx + SvelteKit WebUI repoint to once they
+> [`TODO.md`](../TODO.md) and `fks/docs/architecture/RUST_MIGRATION.md`
+> §12-C): the routes fks's nginx + SvelteKit WebUI repoint to once they
 > stop pointing at the retired `fks_ruby`.
 
 ---
@@ -223,4 +223,4 @@ Opt-in; off unless `JANUS_CANDLE_SCAN=1`. See
 
 - [`TODO.md`](../TODO.md) — roadmap; Tracks A (data) / C (gate) / D (infra contract).
 - [`docs/architecture/`](architecture/) — `RISK_TOPOLOGY.md`, `ML_STORY.md`, and the rest.
-- `fks-full/docs/architecture/RUST_MIGRATION.md` — cross-repo migration + the §12-C repoint.
+- `fks/docs/architecture/RUST_MIGRATION.md` — cross-repo migration + the §12-C repoint.

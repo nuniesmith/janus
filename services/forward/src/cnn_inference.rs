@@ -10,7 +10,7 @@
 //! never altered by a non-actionable CNN.
 //!
 //! This is the gated component of the forward-service CNN hook
-//! (fks-full `docs/architecture/RUST_MIGRATION.md`, Phase 2/3). It is built and
+//! (fks `docs/architecture/RUST_MIGRATION.md`, Phase 2/3). It is built and
 //! tested in isolation; the single call-site in the strategy-consensus loop is
 //! added separately (it needs a per-symbol rolling candle buffer).
 

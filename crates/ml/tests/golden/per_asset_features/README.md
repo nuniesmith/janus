@@ -1,7 +1,7 @@
 # PerAssetCnn feature-pipeline goldens
 
 Python↔Rust parity vectors for `features::per_asset_cnn::extract_features`
-(the bit-faithful port of `fks-full/src/ruby/src/ml/features.py`). Each `*.json`
+(the bit-faithful port of `fks/src/ruby/src/ml/features.py`). Each `*.json`
 here is checked by the `python_goldens` test: it runs the Rust extractor on the
 case's OHLCV + scalars and asserts the output matches the recorded **Python**
 `extract_features` output within `2e-3`.
@@ -19,7 +19,7 @@ needed — `features.py` is pure numpy/pandas):
 
 ```sh
 python tools/parity/record_features.py \
-    --ruby-src /path/to/fks-full/src/ruby/src \
+    --ruby-src /path/to/fks/src/ruby/src \
     --out crates/ml/tests/golden/per_asset_features
 ```
 

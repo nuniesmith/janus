@@ -2,7 +2,7 @@
 
 **Rust ML inference engine and neuromorphic trading brain.**
 
-A self-contained 39-crate Rust workspace implementing ML inference, neuromorphic GPU compute, signal generation, gRPC services, QuestDB data pipelines, and risk management. The workspace builds and runs **standalone** — its own [`Dockerfile`](Dockerfile) and [`docker-compose.yml`](docker-compose.yml) live in this repo. It can also be consumed as a service by the [fks-full](https://github.com/nuniesmith/fks-full) orchestrator.
+A self-contained 39-crate Rust workspace implementing ML inference, neuromorphic GPU compute, signal generation, gRPC services, QuestDB data pipelines, and risk management. The workspace builds and runs **standalone** — its own [`Dockerfile`](Dockerfile) and [`docker-compose.yml`](docker-compose.yml) live in this repo. It can also be consumed as a service by the [fks](https://github.com/nuniesmith/fks) orchestrator.
 
 ---
 
@@ -65,7 +65,7 @@ docker compose logs -f janus   # tail janus
 docker compose down            # stop & remove
 ```
 
-`docker-compose.yml` boots the janus binary together with the backing services it needs to come up cleanly (Redis, Postgres, QuestDB) on its own bridge network. Downstream consumers (Alertmanager, JanusAI, a Ruby executor) are **not** included — janus tolerates their absence (signal pushes log a warning and continue); fks-full provides them when janus runs as part of that stack.
+`docker-compose.yml` boots the janus binary together with the backing services it needs to come up cleanly (Redis, Postgres, QuestDB) on its own bridge network. Downstream consumers (Alertmanager, JanusAI, a Ruby executor) are **not** included — janus tolerates their absence (signal pushes log a warning and continue); fks provides them when janus runs as part of that stack.
 
 ## Building (from source)
 
@@ -103,7 +103,7 @@ The compose file sets the backing-service URLs above; see `config/janus.toml` an
 ## Deployment
 
 - **Standalone** — `docker compose up -d` in this repo builds the image (multi-stage [`Dockerfile`](Dockerfile), unified `janus` binary) and runs it with its backing services.
-- **As part of [fks-full](https://github.com/nuniesmith/fks-full)** — the orchestrator builds this repo's image and runs janus alongside the shared infrastructure (Alertmanager, Ruby executor, Grafana, …). It's the same self-contained workspace in both cases.
+- **As part of [fks](https://github.com/nuniesmith/fks)** — the orchestrator builds this repo's image and runs janus alongside the shared infrastructure (Alertmanager, Ruby executor, Grafana, …). It's the same self-contained workspace in both cases.
 
 ## Stats
 

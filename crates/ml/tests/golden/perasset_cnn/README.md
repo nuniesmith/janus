@@ -23,13 +23,13 @@ run in an environment with `torch` and the ruby `ml` package available:
 ```sh
 # champion parity (true 93.5% model)
 python tools/parity/record_perasset_cnn.py \
-    --ruby-src /path/to/fks-full/src/ruby/src \
-    --checkpoint /path/to/fks-full/models/cnn_btc.pt \
+    --ruby-src /path/to/fks/src/ruby/src \
+    --checkpoint /path/to/fks/models/cnn_btc.pt \
     --out crates/ml/tests/golden/perasset_cnn/cnn_btc.json
 
 # architecture parity only (no checkpoint required)
 python tools/parity/record_perasset_cnn.py \
-    --ruby-src /path/to/fks-full/src/ruby/src \
+    --ruby-src /path/to/fks/src/ruby/src \
     --out crates/ml/tests/golden/perasset_cnn/seeded.json
 ```
 

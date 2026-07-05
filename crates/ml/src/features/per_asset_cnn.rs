@@ -1,5 +1,5 @@
 //! `per_asset_cnn` features — bit-faithful Rust port of the Python champion
-//! feature pipeline (`fks-full/src/ruby/src/ml/features.py`, **inference path**).
+//! feature pipeline (`fks/src/ruby/src/ml/features.py`, **inference path**).
 //!
 //! Produces the `(N_FEATURES=20, window)` tensor `PerAssetCnn` consumes, from
 //! OHLCV bars plus three live scalars (order-book `imbalance`, volatility

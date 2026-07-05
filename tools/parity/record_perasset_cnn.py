@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Record PyTorch→burn parity goldens for PerAssetCNN.
 
-Part of the Python → Rust migration parity harness (see fks-full
+Part of the Python → Rust migration parity harness (see fks
 `docs/architecture/RUST_MIGRATION.md`). This script loads the *Python* champion
 `PerAssetCNN` (the parity oracle), runs a set of fixed inputs through it in
 `eval()` mode, and writes a golden JSON that the Rust differential test at
@@ -17,13 +17,13 @@ Usage
 -----
     # against a trained champion checkpoint
     python tools/parity/record_perasset_cnn.py \
-        --ruby-src /path/to/fks-full/src/ruby/src \
-        --checkpoint /path/to/fks-full/models/cnn_btc.pt \
+        --ruby-src /path/to/fks/src/ruby/src \
+        --checkpoint /path/to/fks/models/cnn_btc.pt \
         --out crates/ml/tests/golden/perasset_cnn/cnn_btc.json
 
     # architecture-parity only (fresh seeded init, no checkpoint needed)
     python tools/parity/record_perasset_cnn.py \
-        --ruby-src /path/to/fks-full/src/ruby/src \
+        --ruby-src /path/to/fks/src/ruby/src \
         --out crates/ml/tests/golden/perasset_cnn/seeded.json
 
 Requires: torch (+ the ruby `ml` package importable from --ruby-src).
@@ -68,7 +68,7 @@ def _state_dict_to_weightmap(sd: dict[str, torch.Tensor]) -> list[dict]:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--ruby-src", required=True, help="path to fks-full/src/ruby/src (so `ml.model` imports)")
+    ap.add_argument("--ruby-src", required=True, help="path to fks/src/ruby/src (so `ml.model` imports)")
     ap.add_argument("--checkpoint", default=None, help="champion .pt; omit for a fresh seeded init")
     ap.add_argument("--out", required=True, help="output golden JSON path")
     ap.add_argument("--cases", type=int, default=8, help="number of input cases to record")

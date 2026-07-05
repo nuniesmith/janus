@@ -8,11 +8,11 @@
 > **Last synced:** 2026-06-08
 >
 > ⭐ **2026-06-07 — janus is now the platform.** `src/ruby/` was deleted from
-> `fks-full`; the Python data/engine/trainer service is gone. janus no longer
-> *suggests to* Ruby — it **is** the trading platform fks-full runs. The forward
+> `fks`; the Python data/engine/trainer service is gone. janus no longer
+> *suggests to* Ruby — it **is** the trading platform fks runs. The forward
 > roadmap is therefore the **Ruby→Rust migration** (see *"The migration is the
 > roadmap now"* right after the status snapshot, and
-> `fks-full/docs/architecture/RUST_MIGRATION.md`).
+> `fks/docs/architecture/RUST_MIGRATION.md`).
 >
 > 📋 **Consolidation plan:** [`CONSOLIDATION_PLAN.md`](CONSOLIDATION_PLAN.md) —
 > staged plan to consume `indicators-ta` (TA) + `exchange-apiws` (exchanges)
@@ -23,11 +23,11 @@
 
 ## Status snapshot (2026-06-08)
 
-- **Platform shift (2026-06-07):** `src/ruby/` was deleted from fks-full —
+- **Platform shift (2026-06-07):** `src/ruby/` was deleted from fks —
   **janus is the platform now**, not just the brain. The remaining roadmap is
-  the **Ruby→Rust migration**: rebuild the capabilities fks-full used to get
+  the **Ruby→Rust migration**: rebuild the capabilities fks used to get
   from the Python service as janus crates/services. See *"The migration is the
-  roadmap now"* below and `fks-full/docs/architecture/RUST_MIGRATION.md`.
+  roadmap now"* below and `fks/docs/architecture/RUST_MIGRATION.md`.
 - **Build:** `cargo check --workspace --all-targets` is green in CI (needs
   `protobuf-compiler` on the runner for the `fks-proto` build script). The new
   `crates/execution-gate` is dependency-light and builds/tests standalone
@@ -64,11 +64,11 @@
 
 ## ⭐ The Ruby→Rust migration is the roadmap now (2026-06-07)
 
-`src/ruby/` is gone from fks-full; janus must stand alone as the platform. This
+`src/ruby/` is gone from fks; janus must stand alone as the platform. This
 section is the **forward plan** — the capabilities to rebuild natively, in
 dependency order, each shippable behind a flag so the running service never
 degrades. It's the janus-side companion to
-`fks-full/docs/architecture/RUST_MIGRATION.md` (phase rationale + parity
+`fks/docs/architecture/RUST_MIGRATION.md` (phase rationale + parity
 strategy). Method throughout: **strangler-fig + golden-vector parity**, never
 rewrite-and-pray.
 
@@ -78,7 +78,7 @@ rewrite-and-pray.
 Track A (data SoT) ───┐
 Track C (safety/gate) ─┼─► together they unblock a janus-only live path
 Track B (ML parity) ──┘    (Track B gated on the user's .pt goldens)
-Track D (infra contract) ── coordinates with fks-full's nginx/WebUI repoint
+Track D (infra contract) ── coordinates with fks's nginx/WebUI repoint
 Track E (long tail) ──────── rebuild-if-needed; Rithmic stays Python
 ```
 
@@ -244,10 +244,10 @@ path to *create* champions from scratch later.
 - [ ] **Exit:** order flow gated entirely in Rust; the human-confirmation
       invariant (`EXECUTION_MODE=paper_trading` default) preserved throughout.
 
-### Track D — Infra contract: serve what fks-full repoints to · RUST_MIGRATION §12-C
-fks-full's removal of Ruby left its WebUI + nginx pointing at `fks_ruby` (still
+### Track D — Infra contract: serve what fks repoints to · RUST_MIGRATION §12-C
+fks's removal of Ruby left its WebUI + nginx pointing at `fks_ruby` (still
 74 refs in nginx, 9 in `vite.config.ts`, 10 `ruby_signal` refs in the WebUI).
-janus must serve the contract before fks-full can repoint cleanly — that's the
+janus must serve the contract before fks can repoint cleanly — that's the
 janus half of the work.
 - [~] **Serve the WebUI/data contract from `lib/janus-api`** — the routes the
       SvelteKit dashboard + nginx call. **Chart path done:** `/sse/bars/{symbol}`
@@ -259,10 +259,10 @@ janus half of the work.
       `PositionTracker`'s open positions — `PositionState` now retains the
       latest economics), `/factory/status` (per-module health + uptime). All in
       `lib/janus-api/src/webui_contract.rs`, served truthfully from janus state,
-      empty-safe. **Remaining:** the **fks-full side** — repoint nginx +
+      empty-safe. **Remaining:** the **fks side** — repoint nginx +
       `vite.config.ts` off `fks_ruby` onto janus (74 nginx refs / 9 vite refs);
       optional `/factory/coverage/{symbol}` + asset-list endpoints if the UI
-      still needs them (the `ruby_signal` field is retired). Tracked in fks-full.
+      still needs them (the `ruby_signal` field is retired). Tracked in fks.
 - [x] **Documented the public surface** → [`docs/PUBLIC_API.md`](docs/PUBLIC_API.md):
       the brain / data / forward / execution HTTP+WS routes (`/api/v1/brain/*`,
       `/api/v1/risk/*` incl. `/risk/validate`, `/api/v1/positions/*`, the data
@@ -284,7 +284,7 @@ janus half of the work.
 > **Goal:** janus decides *what to trade and how much* across asset classes
 > under explicit risk rules. A 2026-06 cross-repo survey found that **much of
 > this already exists on disk but is not in the running binary**. See
-> `fks-full/docs/MULTI_ASSET_BRAIN_ROADMAP.md` (Track 3 + 5). These are the
+> `fks/docs/MULTI_ASSET_BRAIN_ROADMAP.md` (Track 3 + 5). These are the
 > highest-value items and are **not** otherwise tracked below.
 
 ### The orphaned sophisticated pipeline
@@ -519,13 +519,13 @@ gaps are below.
 
 ## Out of scope for this repo
 
-Cross-cutting / fks-full-owned items (tracked in
-[fks-full](https://github.com/nuniesmith/fks-full)):
+Cross-cutting / fks-owned items (tracked in
+[fks](https://github.com/nuniesmith/fks)):
 
 - `RC-CRATES-*` (rustcode workspace: runtime/api/tools/plugins/commands/server/claw-cli/compat-harness/lsp)
 - `API-*` (rustcode API security & config; rc-core/rc-api/rc-rag/rc-llm split)
 - `OSS-*` evaluation queue (OpenViking, Heretic, Nanochat)
-- **fks-full infrastructure repoint** — nginx / WebUI / test scripts off
+- **fks infrastructure repoint** — nginx / WebUI / test scripts off
   `fks_ruby` (RUST_MIGRATION §12-C). janus's half (serving the contract) is
   **Track D** above.
 

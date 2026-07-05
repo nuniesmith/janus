@@ -1,7 +1,7 @@
 //! `MasterCnn` — burn-native reimplementation of the Python `MasterCNN`.
 //!
 //! Portfolio-level risk aggregator (RUST_MIGRATION.md Phase 2, second model).
-//! Mirrors `fks-full/src/ruby/src/ml/model.py::MasterCNN`: it encodes one
+//! Mirrors `fks/src/ruby/src/ml/model.py::MasterCNN`: it encodes one
 //! feature window per tracked asset through the **shared** [`AssetEncoder`]
 //! (same backbone as `PerAssetCnn`, separate weights), lets the asset
 //! embeddings attend to each other via cross-asset multi-head attention, then

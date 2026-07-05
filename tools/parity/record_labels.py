@@ -12,7 +12,7 @@ are rounded to float32 so both sides see identical bars.
 Usage
 -----
     python tools/parity/record_labels.py \
-        --ruby-src /path/to/fks-full/src/ruby/src \
+        --ruby-src /path/to/fks/src/ruby/src \
         --out crates/ml/tests/golden/labels
 
 Requires: numpy + pandas + the ruby `ml` package importable from --ruby-src.
@@ -42,7 +42,7 @@ def gen_ohlc(n: int, seed: int):
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--ruby-src", required=True, help="path to fks-full/src/ruby/src (so `ml.labeler` imports)")
+    ap.add_argument("--ruby-src", required=True, help="path to fks/src/ruby/src (so `ml.labeler` imports)")
     ap.add_argument("--out", required=True, help="output golden directory")
     ap.add_argument("--cases", type=int, default=4)
     ap.add_argument("--bars", type=int, default=320)

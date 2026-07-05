@@ -1,7 +1,7 @@
 # Breakout-labeler goldens
 
 Python↔Rust parity vectors for `labeler::generate_labels_breakout` (the port of
-`fks-full/src/ruby/src/ml/labeler.py::generate_labels_breakout`). Each `*.json`
+`fks/src/ruby/src/ml/labeler.py::generate_labels_breakout`). Each `*.json`
 is checked by the `python_goldens` test: it runs the Rust labeler on the case's
 OHLC and asserts the per-bar labels **exactly** match the recorded Python output
 (labels are integers, so parity is exact, not tolerance-based).
@@ -19,7 +19,7 @@ needed — `labeler.py` is pure numpy/pandas):
 
 ```sh
 python tools/parity/record_labels.py \
-    --ruby-src /path/to/fks-full/src/ruby/src \
+    --ruby-src /path/to/fks/src/ruby/src \
     --out crates/ml/tests/golden/labels
 ```
 

@@ -4,7 +4,7 @@
 //! The Track D data contract (see `docs/PUBLIC_API.md` and `TODO.md`): the
 //! SvelteKit dashboard's overview page pre-fetches these three endpoints. They
 //! were served by the retired Python "Ruby" service; this serves them
-//! **truthfully from janus state** so fks-full's nginx/WebUI can repoint:
+//! **truthfully from janus state** so fks's nginx/WebUI can repoint:
 //!
 //! - **`/api/pipeline/scores/json`** → `{assets: [...]}` from the latest
 //!   per-symbol signals (Redis), mapping confidence → `score` and the signal

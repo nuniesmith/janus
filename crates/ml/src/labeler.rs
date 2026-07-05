@@ -1,5 +1,5 @@
 //! `labeler` — Rust port of the Python champion training labeler
-//! (`fks-full/src/ruby/src/ml/labeler.py::generate_labels_breakout`).
+//! (`fks/src/ruby/src/ml/labeler.py::generate_labels_breakout`).
 //!
 //! First building block of burn-native training (RUST_MIGRATION.md Phase 4):
 //! turns historical OHLC bars into the 4-class targets `PerAssetCnn` is trained
