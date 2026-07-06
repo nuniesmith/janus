@@ -44,6 +44,7 @@ pub mod brain_wiring;
 pub mod bybit_compat;
 pub mod cnn_inference;
 pub mod execution;
+pub mod experience;
 pub mod features;
 pub mod gate_integration;
 pub mod gate_metrics_redis;
@@ -1486,6 +1487,29 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                 crate::gate_metrics_redis::GateMetricsRedisConfig::from_env(),
             )
             .await;
+            // Experience pipeline producer (Phase 1, default OFF —
+            // JANUS_EXPERIENCE_ENABLED). When enabled, every closed candle
+            // records a post-gate decision transition (docs/architecture/
+            // EXPERIENCE_PIPELINE.md §3.5); the recorder is task-owned like
+            // the analyzers, and its writer runs as a detached task fed over
+            // a bounded try_send channel — the loop never blocks on it.
+            let experience_cfg = crate::experience::ExperienceConfig::from_env();
+            let mut experience_recorder = if experience_cfg.enabled {
+                let redis_client = state_clone.redis_client().await.ok();
+                if redis_client.is_none() {
+                    warn!(
+                        "experience pipeline: Redis unavailable at startup — spool \
+                         doorbells disabled; backward's sweep will pick batches up"
+                    );
+                }
+                let (tx, _writer_task) =
+                    crate::experience::spawn_writer(experience_cfg.clone(), redis_client);
+                info!("experience pipeline: ENABLED (recording per-bar decision transitions)");
+                Some(crate::experience::ExperienceRecorder::new(tx))
+            } else {
+                None
+            };
+
             // Per-symbol previous close, for the close-to-close log returns fed to
             // the gate's correlation guard.
             let mut prev_close: HashMap<String, f64> = HashMap::new();
@@ -1607,10 +1631,24 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                                 let high = kline.high.to_f64().unwrap_or(0.0);
                                 let low = kline.low.to_f64().unwrap_or(0.0);
                                 let close = kline.close.to_f64().unwrap_or(0.0);
+                                // Experience record timestamp = candle close time (μs → ms).
+                                let exp_close_ms = kline.close_time / 1_000;
 
                                 // Feed the candle into the indicator analyzer
                                 if let Err(e) = analyzer.update_hlc(high, low, close) {
                                     warn!("[{}] Failed to update indicators: {}", analyzer_key, e);
+                                    // A broken-indicator bar is still a bar janus did not
+                                    // act on — record the Hold (EXPERIENCE_PIPELINE §3.5).
+                                    if let Some(rec) = experience_recorder.as_mut() {
+                                        rec.observe(
+                                            &analyzer_key,
+                                            &symbol_str,
+                                            &kline.interval,
+                                            exp_close_ms,
+                                            close,
+                                            crate::experience::DecisionCtx::hold(),
+                                        );
+                                    }
                                     continue;
                                 }
 
@@ -1670,6 +1708,16 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                                     Ok(a) => a,
                                     Err(e) => {
                                         warn!("[{}] Indicator analysis failed: {}", analyzer_key, e);
+                                        if let Some(rec) = experience_recorder.as_mut() {
+                                            rec.observe(
+                                                &analyzer_key,
+                                                &symbol_str,
+                                                &kline.interval,
+                                                exp_close_ms,
+                                                close,
+                                                crate::experience::DecisionCtx::hold(),
+                                            );
+                                        }
                                         continue;
                                     }
                                 };
@@ -1910,6 +1958,17 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
 
                                 // ── Consensus: require at least 2 strategies agreeing ──
                                 if strategy_votes.is_empty() {
+                                    // No strategy voted — janus held (§3.5).
+                                    if let Some(rec) = experience_recorder.as_mut() {
+                                        rec.observe(
+                                            &analyzer_key,
+                                            &symbol_str,
+                                            &kline.interval,
+                                            exp_close_ms,
+                                            close,
+                                            crate::experience::DecisionCtx::hold(),
+                                        );
+                                    }
                                     continue;
                                 }
 
@@ -1943,7 +2002,20 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                                             }),
                                         ) {
                                             Some(decision) => decision,
-                                            None => continue, // No consensus — Hold
+                                            None => {
+                                                // No consensus — Hold (§3.5).
+                                                if let Some(rec) = experience_recorder.as_mut() {
+                                                    rec.observe(
+                                                        &analyzer_key,
+                                                        &symbol_str,
+                                                        &kline.interval,
+                                                        exp_close_ms,
+                                                        close,
+                                                        crate::experience::DecisionCtx::hold(),
+                                                    );
+                                                }
+                                                continue;
+                                            }
                                         }
                                     } else {
                                         match resolve_consensus(
@@ -1953,7 +2025,20 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                                             None::<fn(&str) -> f64>,
                                         ) {
                                             Some(decision) => decision,
-                                            None => continue, // No consensus — Hold
+                                            None => {
+                                                // No consensus — Hold (§3.5).
+                                                if let Some(rec) = experience_recorder.as_mut() {
+                                                    rec.observe(
+                                                        &analyzer_key,
+                                                        &symbol_str,
+                                                        &kline.interval,
+                                                        exp_close_ms,
+                                                        close,
+                                                        crate::experience::DecisionCtx::hold(),
+                                                    );
+                                                }
+                                                continue;
+                                            }
                                         }
                                     };
 
@@ -1963,6 +2048,17 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                                         "[{}] Signal confidence {:.2} below threshold {:.2} — skipping",
                                         analyzer_key, avg_confidence, min_confidence,
                                     );
+                                    // Confidence-filtered — the post-filter outcome is Hold (§3.5).
+                                    if let Some(rec) = experience_recorder.as_mut() {
+                                        rec.observe(
+                                            &analyzer_key,
+                                            &symbol_str,
+                                            &kline.interval,
+                                            exp_close_ms,
+                                            close,
+                                            crate::experience::DecisionCtx::hold(),
+                                        );
+                                    }
                                     continue;
                                 }
 
@@ -2175,6 +2271,10 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                                 // risk-rejected entries. A prop-firm violation blocks under
                                 // JANUS_PROP_FIRM_ENFORCE; a RiskManager rejection blocks
                                 // under JANUS_RISK_ENFORCE.
+                                // Suppression reason surfaced to the experience record
+                                // (§3.5: a blocked Buy/Sell is still that decision — the
+                                // gate is part of the environment).
+                                let mut exp_blocked: Option<String> = None;
                                 if final_type != janus_core::SignalType::Hold && avg_confidence >= 0.7 {
                                     let block_reason = if prop_firm_enforce
                                         && prop_firm_label.starts_with("violation")
@@ -2189,6 +2289,7 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                                     } else {
                                         None
                                     };
+                                    exp_blocked = block_reason.clone();
                                     if let Some(reason) = block_reason {
                                         warn!(
                                             symbol = %symbol_str,
@@ -2200,6 +2301,26 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                                     {
                                         warn!("Failed to submit live signal to execution: {}", e);
                                     }
+                                } else if final_type != janus_core::SignalType::Hold {
+                                    // Actionable consensus below the 0.7 execution floor:
+                                    // published to the bus, never submitted.
+                                    exp_blocked = Some("below_exec_floor".to_string());
+                                }
+
+                                // Record the post-gate decision transition (§3.5 site 3).
+                                if let Some(rec) = experience_recorder.as_mut() {
+                                    rec.observe(
+                                        &analyzer_key,
+                                        &symbol_str,
+                                        &kline.interval,
+                                        exp_close_ms,
+                                        close,
+                                        crate::experience::DecisionCtx {
+                                            action: final_type,
+                                            confidence: avg_confidence,
+                                            blocked: exp_blocked,
+                                        },
+                                    );
                                 }
 
                                 // Update health with live stats
