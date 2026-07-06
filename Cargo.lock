@@ -5813,6 +5813,7 @@ name = "janus-forward"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arrow 57.3.0",
  "async-trait",
  "axum 0.8.8",
  "chrono",
@@ -5822,6 +5823,7 @@ dependencies = [
  "futures",
  "futures-util",
  "indicators-ta",
+ "janus-backward",
  "jflow-cns",
  "jflow-common",
  "jflow-core",
@@ -5845,6 +5847,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sqlx",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
