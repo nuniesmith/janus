@@ -48,7 +48,10 @@ use tokio_util::sync::CancellationToken;
 
 // Re-exports for convenience
 pub use http::start_http_server;
-pub use metrics::{JanusMetrics, PrometheusExporter, RiskMetricsCollector, SignalMetricsCollector};
+pub use metrics::{
+    ExperienceMetricsCollector, JanusMetrics, PrometheusExporter, RiskMetricsCollector,
+    SignalMetricsCollector,
+};
 pub use persistence::{
     Database, DatabaseConfig, DatabaseError,
     repositories::{
@@ -206,6 +209,23 @@ impl BackwardService {
         );
         for i in 0..self.config.worker_threads {
             let cancel = self.cancel.clone();
+
+            // Worker 0 is the experience intake worker: BRPOP the ingest
+            // doorbell queue + sweep the spool directory (design §4.3).
+            if i == 0 {
+                let intake_config =
+                    tasks::intake::IntakeWorkerConfig::from_env(self.config.redis_url.clone());
+                let intake_metrics = ExperienceMetricsCollector::global().clone();
+                let handle = tokio::spawn(async move {
+                    info!("Worker 0 started (experience intake)");
+                    tasks::intake::run_intake_worker(intake_config, intake_metrics, cancel).await;
+                    info!("Worker 0 exited");
+                });
+                self.worker_handles.push(handle);
+                info!("Worker 0 spawned (experience intake)");
+                continue;
+            }
+
             let db = Arc::clone(&self.database);
             let worker_id = i;
             let handle = tokio::spawn(async move {
@@ -465,6 +485,20 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
         .register_module_health("backward", true, Some("running".to_string()))
         .await;
 
+    // Spawn the experience intake worker (design §4.3). In the unified binary
+    // `BackwardService::start()` is not called, so the intake loop is started
+    // here directly.
+    let intake_cancel = CancellationToken::new();
+    let intake_task = {
+        let intake_config =
+            tasks::intake::IntakeWorkerConfig::from_env(state.config.redis.url.clone());
+        let intake_metrics = ExperienceMetricsCollector::global().clone();
+        let cancel = intake_cancel.clone();
+        tokio::spawn(async move {
+            tasks::intake::run_intake_worker(intake_config, intake_metrics, cancel).await;
+        })
+    };
+
     // Subscribe to signals from signal bus
     let mut signal_rx = state.signal_bus.subscribe();
     let signal_repo = service.signal_repository();
@@ -549,6 +583,13 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
     info!("Backward module shutting down...");
 
     // Cancel tasks
+    intake_cancel.cancel();
+    if tokio::time::timeout(tokio::time::Duration::from_secs(10), intake_task)
+        .await
+        .is_err()
+    {
+        tracing::warn!("Experience intake worker did not stop within 10s, abandoning");
+    }
     persist_task.abort();
 
     // Shutdown service

@@ -31,7 +31,9 @@ pub mod experience_store;
 pub mod models;
 pub mod repositories;
 
-pub use experience_store::{ExperienceStore, ExperienceStoreConfig, PersistenceMetrics};
+pub use experience_store::{
+    ExperienceStore, ExperienceStoreConfig, PersistenceMetrics, experience_point_id,
+};
 
 use anyhow::{Context, Result};
 use sqlx::postgres::{PgPool, PgPoolOptions};

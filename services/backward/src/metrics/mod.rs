@@ -3,6 +3,7 @@
 //! Comprehensive metrics collection and export for JANUS service using Prometheus.
 //! Tracks signal generation, risk management, ML inference, and system performance.
 
+pub mod experience_metrics;
 pub mod prometheus_exporter;
 pub mod risk_metrics;
 pub mod signal_metrics;
@@ -10,6 +11,7 @@ pub mod signal_metrics;
 use prometheus::{Gauge, Histogram, HistogramOpts, IntCounter, IntGauge, Opts, Registry};
 use std::sync::Arc;
 
+pub use experience_metrics::ExperienceMetricsCollector;
 pub use prometheus_exporter::PrometheusExporter;
 pub use risk_metrics::RiskMetricsCollector;
 pub use signal_metrics::SignalMetricsCollector;
