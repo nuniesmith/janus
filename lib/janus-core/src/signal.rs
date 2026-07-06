@@ -20,6 +20,57 @@ pub enum SignalType {
     Close,
 }
 
+impl SignalType {
+    /// Canonical `SignalType → u8` action code — **the frozen wire contract**
+    /// for experience records (Arrow `action_type: UInt8` in
+    /// `services/backward/src/tasks/ingest.rs` and the Qdrant payload; see
+    /// `docs/architecture/EXPERIENCE_PIPELINE.md` §3.2):
+    ///
+    /// | variant | code |
+    /// |---------|------|
+    /// | `Buy`   | `0`  |
+    /// | `Sell`  | `1`  |
+    /// | `Hold`  | `2`  |
+    /// | `Close` | `3`  |
+    ///
+    /// This is the ONE canonical definition — both `services/forward` (the
+    /// experience writer) and `services/backward` (ingest) must use it.
+    /// The mapping is an explicit `match` (not `as u8`), so reordering the
+    /// enum cannot silently change stored codes; the pinned-value unit test
+    /// below breaks loudly if anyone edits this table. Never change existing
+    /// codes — persisted experiences depend on them.
+    #[must_use]
+    pub const fn to_u8(self) -> u8 {
+        match self {
+            SignalType::Buy => 0,
+            SignalType::Sell => 1,
+            SignalType::Hold => 2,
+            SignalType::Close => 3,
+        }
+    }
+
+    /// Inverse of [`SignalType::to_u8`]. Returns `None` for codes outside
+    /// the frozen contract (`> 3`) — callers decide whether an unknown code
+    /// is a skip-row or a hard error.
+    #[must_use]
+    pub const fn from_u8(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(SignalType::Buy),
+            1 => Some(SignalType::Sell),
+            2 => Some(SignalType::Hold),
+            3 => Some(SignalType::Close),
+            _ => None,
+        }
+    }
+}
+
+/// Canonical action-code conversion (see [`SignalType::to_u8`]).
+impl From<SignalType> for u8 {
+    fn from(signal_type: SignalType) -> Self {
+        signal_type.to_u8()
+    }
+}
+
 impl std::fmt::Display for SignalType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -225,6 +276,49 @@ mod tests {
 
         // Note: In a real async test, you'd await the receive
         assert_eq!(bus.subscriber_count(), 1);
+    }
+
+    #[test]
+    fn test_action_code_pinned_values() {
+        // The frozen Arrow/Qdrant wire contract (EXPERIENCE_PIPELINE.md §3.2,
+        // ingest.rs expected_schema docs): 0=Buy, 1=Sell, 2=Hold, 3=Close.
+        // If this test fails, someone changed the canonical mapping — that
+        // corrupts every persisted experience. Do not "fix" the test; fix
+        // the mapping.
+        assert_eq!(SignalType::Buy.to_u8(), 0);
+        assert_eq!(SignalType::Sell.to_u8(), 1);
+        assert_eq!(SignalType::Hold.to_u8(), 2);
+        assert_eq!(SignalType::Close.to_u8(), 3);
+
+        assert_eq!(u8::from(SignalType::Buy), 0);
+        assert_eq!(u8::from(SignalType::Sell), 1);
+        assert_eq!(u8::from(SignalType::Hold), 2);
+        assert_eq!(u8::from(SignalType::Close), 3);
+
+        assert_eq!(SignalType::from_u8(0), Some(SignalType::Buy));
+        assert_eq!(SignalType::from_u8(1), Some(SignalType::Sell));
+        assert_eq!(SignalType::from_u8(2), Some(SignalType::Hold));
+        assert_eq!(SignalType::from_u8(3), Some(SignalType::Close));
+    }
+
+    #[test]
+    fn test_action_code_round_trip_exhaustive() {
+        // Every variant round-trips through the wire code...
+        for signal_type in [
+            SignalType::Buy,
+            SignalType::Sell,
+            SignalType::Hold,
+            SignalType::Close,
+        ] {
+            assert_eq!(SignalType::from_u8(signal_type.to_u8()), Some(signal_type));
+        }
+        // ...and every u8 either round-trips or is rejected.
+        for code in 0..=u8::MAX {
+            match SignalType::from_u8(code) {
+                Some(signal_type) => assert_eq!(signal_type.to_u8(), code),
+                None => assert!(code > 3, "code {code} unexpectedly rejected"),
+            }
+        }
     }
 
     #[test]
