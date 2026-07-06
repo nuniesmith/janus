@@ -419,6 +419,15 @@ impl ParamReloadManager {
                     "Optimization failed for asset"
                 );
             }
+            ParamNotification::ConfigUpdate { changed, .. } => {
+                // Acknowledgement only (published by janus-api `PUT
+                // /api/config`): these are boot-time settings, nothing to
+                // hot-apply here.
+                info!(
+                    changed = ?changed,
+                    "Janus config overrides changed (effective after restart)"
+                );
+            }
         }
 
         // Broadcast to internal subscribers

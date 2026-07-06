@@ -294,6 +294,16 @@ pub enum ParamNotification {
         asset: String,
         error: String,
     },
+    /// Janus runtime-config overrides changed (published by the janus-api
+    /// `PUT /api/config` endpoint when the WebUI saves settings). This is a
+    /// *notification only*: the listed fields are boot-time configuration
+    /// (env-var driven), so subscribers log the change but nothing is
+    /// reconfigured live — the new values apply on the next restart.
+    ConfigUpdate {
+        timestamp: String,
+        /// Names of the config fields that were changed (e.g. `optimize_trials`).
+        changed: Vec<String>,
+    },
 }
 
 /// Error types for parameter operations
@@ -460,6 +470,14 @@ impl ParamManager {
             }
             ParamNotification::OptimizationFailed { asset, error, .. } => {
                 warn!("Optimization failed for {}: {}", asset, error);
+            }
+            ParamNotification::ConfigUpdate { changed, .. } => {
+                // Acknowledgement only — these are boot-time settings; the
+                // running modules keep their current values until restart.
+                info!(
+                    "Janus config overrides changed (effective after restart): {:?}",
+                    changed
+                );
             }
         }
 
@@ -646,6 +664,22 @@ mod tests {
         let manager = ParamManager::new("test");
         let err = manager.process_notification("{ not valid json").await;
         assert!(matches!(err, Err(ParamError::Serialization(_))));
+    }
+
+    #[tokio::test]
+    async fn process_notification_accepts_config_update() {
+        // The janus-api `PUT /api/config` endpoint publishes this variant
+        // when settings overrides are saved. It must parse cleanly (no
+        // Serialization warn-noise in the subscriber loops) and leave the
+        // param cache untouched — it is an acknowledgement, not a reload.
+        let manager = ParamManager::new("test");
+        let payload = serde_json::to_string(&ParamNotification::ConfigUpdate {
+            timestamp: "2026-07-06T00:00:00Z".into(),
+            changed: vec!["optimize_trials".into(), "janus_auto_start".into()],
+        })
+        .unwrap();
+        manager.process_notification(&payload).await.unwrap();
+        assert!(manager.get_all().await.is_empty());
     }
 
     #[test]

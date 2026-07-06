@@ -8,6 +8,7 @@
 //! - WebSocket streaming (optional)
 
 pub mod bars;
+pub mod config_api;
 mod param_updates;
 pub mod position_store;
 pub mod sse_bars;
@@ -178,6 +179,13 @@ fn create_router(
         // Runtime log level control
         .route("/api/log-level", get(log_level_get_handler))
         .route("/api/log-level", post(log_level_set_handler))
+        // Janus/optimizer config for the WebUI settings panel (env defaults ⊕
+        // Redis overrides — see config_api module docs for the boot-time
+        // effect-at-runtime caveats).
+        .route(
+            "/api/config",
+            get(config_api::get_config_handler).put(config_api::put_config_handler),
+        )
         // Position event ingress (JFLOW-C foundation: receive + log, no guidance yet)
         .route("/api/v1/positions/event", post(position_event_handler))
         .route("/api/v1/positions/close", post(position_close_handler))
@@ -338,6 +346,20 @@ async fn root_handler(State(state): State<Arc<JanusState>>) -> impl IntoResponse
 /// This prevents a single failed module (e.g., backward's DB connection) from
 /// cascading into nginx never starting due to `depends_on: condition: service_healthy`.
 /// Use `/api/modules/health` for detailed per-module status.
+///
+/// The response additionally carries a `components` map (purely additive to
+/// the [`janus_core::state::HealthStatus`] fields) for the FKS WebUI status
+/// bar / settings System-Info panel:
+///
+/// ```json
+/// "components": {
+///   "redis": { "status": "connected" | "disconnected" },
+///   "feed":  { "status": "connected" | "idle" | "disconnected" }
+/// }
+/// ```
+///
+/// `redis` is a live PING (see [`redis_component_status`]); `feed` is derived
+/// from the data module's entry in the modules list ([`feed_component_status`]).
 async fn health_handler(State(state): State<Arc<JanusState>>) -> impl IntoResponse {
     let health = state.health_status().await;
 
@@ -350,7 +372,77 @@ async fn health_handler(State(state): State<Arc<JanusState>>) -> impl IntoRespon
         StatusCode::OK
     };
 
-    (status, Json(health))
+    let redis = redis_component_status(&state).await;
+    let feed = feed_component_status(&health);
+    let mut body =
+        serde_json::to_value(&health).unwrap_or_else(|_| serde_json::json!({ "status": "error" }));
+    body["components"] = serde_json::json!({
+        "redis": { "status": redis },
+        "feed": { "status": feed },
+    });
+
+    (status, Json(body))
+}
+
+/// Timeout for the `/health` Redis PING (the WebUI polls every 15s; a wedged
+/// Redis must not stall the healthcheck).
+const REDIS_PING_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_millis(1_500);
+
+/// Live Redis connectivity for `/health`'s `components.redis`.
+///
+/// One PING per call over a fresh multiplexed connection — the same
+/// per-request pattern every other handler in this crate uses (`JanusState`
+/// only caches the parsed `redis::Client`; there is no shared pooled
+/// connection to reuse). At the WebUI's 15s poll cadence this is negligible.
+/// Also refreshes the `janus_redis_connected` Prometheus gauge so alerting
+/// tracks the same signal the UI shows.
+async fn redis_component_status(state: &Arc<JanusState>) -> &'static str {
+    let ping = async {
+        let client = state.redis_client().await.ok()?;
+        let mut conn = client.get_multiplexed_async_connection().await.ok()?;
+        redis::cmd("PING")
+            .query_async::<String>(&mut conn)
+            .await
+            .ok()
+    };
+    let connected = matches!(
+        tokio::time::timeout(REDIS_PING_TIMEOUT, ping).await,
+        Ok(Some(_))
+    );
+    janus_core::metrics::metrics()
+        .redis_connected
+        .set(if connected { 1.0 } else { 0.0 });
+    if connected {
+        "connected"
+    } else {
+        "disconnected"
+    }
+}
+
+/// Market-data feed status for `/health`'s `components.feed`, derived from
+/// the data module's already-computed health entry:
+///
+/// - no data module registered / module unhealthy → `"disconnected"`
+/// - services in standby, or the data module idling in standby mode
+///   (`DATA_SOURCE=standby` reports `"standby …"` / `"running (standby)"`)
+///   → `"idle"`
+/// - healthy and running → `"connected"`
+fn feed_component_status(health: &janus_core::state::HealthStatus) -> &'static str {
+    let Some(data) = health.modules.iter().find(|m| m.name == "data") else {
+        return "disconnected";
+    };
+    if !data.healthy {
+        return "disconnected";
+    }
+    let msg = data.message.as_deref().unwrap_or("");
+    if health.service_state == ServiceState::Standby || msg.contains("standby") {
+        return "idle";
+    }
+    if health.service_state == ServiceState::Running {
+        "connected"
+    } else {
+        "disconnected"
+    }
 }
 
 /// Status handler (detailed status)
@@ -1553,6 +1645,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn health_reports_components_map() {
+        // The components map is additive: the pre-existing HealthStatus
+        // fields must survive alongside it (backward compatibility).
+        let state = test_state().await;
+        let router = test_router(state);
+
+        let (status, body) = get_json(&router, "/health").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "healthy");
+        assert!(body["modules"].is_array());
+        assert!(body["uptime_seconds"].is_number());
+
+        // Redis state depends on the test environment (a live local Redis
+        // answers the PING); assert the vocabulary, not the value.
+        let redis = body["components"]["redis"]["status"].as_str().unwrap();
+        assert!(
+            redis == "connected" || redis == "disconnected",
+            "unexpected redis status: {redis}"
+        );
+        // No data module is registered on a bare test state → disconnected.
+        assert_eq!(body["components"]["feed"]["status"], "disconnected");
+    }
+
+    #[tokio::test]
+    async fn health_feed_component_tracks_data_module() {
+        let state = test_state().await;
+
+        // Registered but everything still in standby → idle.
+        state
+            .register_module_health("data", true, Some("standby".to_string()))
+            .await;
+        let router = test_router(state.clone());
+        let (_, body) = get_json(&router, "/health").await;
+        assert_eq!(body["components"]["feed"]["status"], "idle");
+
+        // Services running + live ingestion stats → connected.
+        state.start_services();
+        state
+            .register_module_health("data", true, Some("live: 10 assets, 5 trades".to_string()))
+            .await;
+        let (_, body) = get_json(&router, "/health").await;
+        assert_eq!(body["components"]["feed"]["status"], "connected");
+
+        // Data module in standby mode while services run → idle.
+        state
+            .register_module_health("data", true, Some("running (standby)".to_string()))
+            .await;
+        let (_, body) = get_json(&router, "/health").await;
+        assert_eq!(body["components"]["feed"]["status"], "idle");
+
+        // Unhealthy module → disconnected (regardless of service state).
+        state
+            .register_module_health("data", false, Some("stopped".to_string()))
+            .await;
+        let (_, body) = get_json(&router, "/health").await;
+        assert_eq!(body["components"]["feed"]["status"], "disconnected");
+    }
+
+    #[tokio::test]
     async fn test_status_endpoint() {
         let state = test_state().await;
         let router = test_router(state);
@@ -1633,6 +1784,178 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         // Should return a modules array (possibly empty)
         assert!(body["modules"].is_array());
+    }
+
+    // ═════════════════════════════════════════════════════════════════
+    // Config API (GET/PUT /api/config)
+    // ═════════════════════════════════════════════════════════════════
+
+    /// State whose Redis URL points at a closed port so the Redis-degraded
+    /// paths are deterministic (no dependency on a dev machine's Redis).
+    async fn test_state_unreachable_redis() -> Arc<JanusState> {
+        let mut config = Config::default();
+        config.redis.url = "redis://127.0.0.1:1/".to_string();
+        Arc::new(JanusState::new(config).await.unwrap())
+    }
+
+    /// Send a PUT request with a JSON body → `(StatusCode, serde_json::Value)`.
+    async fn put_json(
+        router: &Router,
+        uri: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let req = http::Request::builder()
+            .method("PUT")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let resp = router.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let value: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        (status, value)
+    }
+
+    #[tokio::test]
+    async fn config_get_falls_back_to_env_defaults_without_redis() {
+        let router = test_router(test_state_unreachable_redis().await);
+
+        let (status, body) = get_json(&router, "/api/config").await;
+        assert_eq!(status, StatusCode::OK, "Redis down must not be an error");
+        assert_eq!(body["source"], "env_defaults");
+        assert_eq!(body["redis_available"], false);
+
+        // All seven settings-panel fields are present with the right types.
+        let config = &body["config"];
+        assert!(config["optimize_assets"].is_string());
+        assert!(config["optimize_interval"].is_string());
+        assert!(config["optimize_trials"].is_u64());
+        assert!(config["optimize_historical_days"].is_u64());
+        assert!(config["data_kline_intervals"].is_string());
+        assert!(config["janus_auto_start"].is_boolean());
+        assert!(config["janus_bootstrap_days"].is_u64());
+
+        assert!(!body["assets_list"].as_array().unwrap().is_empty());
+        // The effective interval must be renderable by the UI's select.
+        let interval = config["optimize_interval"].as_str().unwrap();
+        let valid: Vec<&str> = body["valid_intervals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(valid.contains(&interval));
+        // Every field is boot-time config → all listed as requires_restart.
+        assert_eq!(body["requires_restart"].as_array().unwrap().len(), 7);
+    }
+
+    #[tokio::test]
+    async fn config_put_rejects_invalid_payloads_before_touching_redis() {
+        let router = test_router(test_state_unreachable_redis().await);
+
+        // Interval outside the valid set.
+        let (status, body) = put_json(
+            &router,
+            "/api/config",
+            serde_json::json!({ "optimize_interval": "7q" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["ok"], false);
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("optimize_interval")
+        );
+
+        // Trials out of bounds.
+        let (status, _) = put_json(
+            &router,
+            "/api/config",
+            serde_json::json!({ "optimize_trials": 0 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // Kline interval Binance doesn't stream.
+        let (status, _) = put_json(
+            &router,
+            "/api/config",
+            serde_json::json!({ "data_kline_intervals": "1m,17m" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // Empty payload — nothing to save.
+        let (status, _) = put_json(&router, "/api/config", serde_json::json!({})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn config_put_returns_503_when_redis_is_down() {
+        let router = test_router(test_state_unreachable_redis().await);
+
+        let (status, body) = put_json(
+            &router,
+            "/api/config",
+            serde_json::json!({ "optimize_trials": 200 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["error"], "redis_unavailable");
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires Redis connection on localhost"]
+    async fn config_put_then_get_roundtrips_overrides_via_redis() {
+        use redis::AsyncCommands;
+
+        // Point the state at the local Redis (REDIS_URL wins, matching the
+        // deployed container's auth'd URL).
+        let redis_url =
+            std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379/".to_string());
+        let mut config = Config::default();
+        config.redis.url = redis_url.clone();
+        let state = Arc::new(JanusState::new(config).await.unwrap());
+        let router = test_router(state);
+
+        // Snapshot the overrides hash so the test restores whatever an
+        // operator had stored.
+        let client = redis::Client::open(redis_url.as_str()).unwrap();
+        let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+        let previous: std::collections::HashMap<String, String> =
+            conn.hgetall(config_api::OVERRIDES_KEY).await.unwrap();
+
+        let (status, body) = put_json(
+            &router,
+            "/api/config",
+            serde_json::json!({ "optimize_trials": 321, "janus_auto_start": true }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["source"], "redis");
+
+        let (status, body) = get_json(&router, "/api/config").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["source"], "redis");
+        assert_eq!(body["redis_available"], true);
+        assert_eq!(body["config"]["optimize_trials"], 321);
+        assert_eq!(body["config"]["janus_auto_start"], true);
+
+        // Restore the pre-test hash.
+        let _: () = conn.del(config_api::OVERRIDES_KEY).await.unwrap();
+        if !previous.is_empty() {
+            let items: Vec<(String, String)> = previous.into_iter().collect();
+            let _: () = conn
+                .hset_multiple(config_api::OVERRIDES_KEY, &items)
+                .await
+                .unwrap();
+        }
     }
 
     // ═════════════════════════════════════════════════════════════════
