@@ -8,11 +8,13 @@
 //! performance in the hot path.
 
 pub mod errors;
+pub mod gaf;
 pub mod risk;
 pub mod traits;
 pub mod types;
 
 pub use errors::*;
+pub use gaf::gaf_flat;
 pub use risk::{
     Order as RiskOrder, PortfolioState, Position, RiskChecker, RiskError, RiskLimits,
     RiskUtilization,
