@@ -95,12 +95,22 @@ pub struct IngestMetrics {
 ///
 /// Reads an Arrow IPC file at the path specified in the job, validates its
 /// schema, iterates over record batches, and persists valid experiences to
-/// the Qdrant vector database via the provided [`ExperienceStore`].
+/// the Qdrant vector database via the provided [`ExperienceStore`]. Point IDs
+/// are deterministic UUIDv5s of `(job.batch_id, row_index)`, so re-delivery
+/// of the same job is idempotent.
+///
+/// Returns the collected [`IngestMetrics`] on success. Returns an error when
+/// the file cannot be read or when persistence hard-fails (vector-dimension
+/// mismatch, Qdrant unreachable, …) so the caller can retry and eventually
+/// park the spool file. A *missing* file is not an error (at-least-once
+/// delivery: someone already ingested and deleted it).
 ///
 /// If `store` is `None`, the function validates and counts rows but does not
-/// persist them (legacy behaviour, useful for dry-run / testing).
-#[allow(dead_code)]
-pub async fn handle_ingest(job: IngestJob, store: Option<&ExperienceStore>) -> Result<()> {
+/// persist them (dry-run / testing).
+pub async fn handle_ingest(
+    job: IngestJob,
+    store: Option<&ExperienceStore>,
+) -> Result<IngestMetrics> {
     info!(
         batch_id = %job.batch_id,
         shm_path = %job.shm_path,
@@ -119,7 +129,7 @@ pub async fn handle_ingest(job: IngestJob, store: Option<&ExperienceStore>) -> R
             path = %job.shm_path,
             "IPC file does not exist — skipping ingest"
         );
-        return Ok(());
+        return Ok(metrics);
     }
 
     let file = File::open(ipc_path).with_context(|| {
@@ -175,6 +185,11 @@ pub async fn handle_ingest(job: IngestJob, store: Option<&ExperienceStore>) -> R
     }
 
     // ── 4. Read and process record batches ────────────────────────────────
+    // Cumulative Arrow-row offset across record batches within this file,
+    // used to derive deterministic per-row point IDs.
+    let mut row_offset = 0usize;
+    let mut persist_failure: Option<anyhow::Error> = None;
+
     for batch_result in reader {
         match batch_result {
             Ok(batch) => {
@@ -205,7 +220,7 @@ pub async fn handle_ingest(job: IngestJob, store: Option<&ExperienceStore>) -> R
 
                         // ── 5. Persist to vector database ─────────────
                         if let Some(s) = store {
-                            match s.persist_batch(&batch).await {
+                            match s.persist_batch(&batch, &job.batch_id, row_offset).await {
                                 Ok(persisted) => {
                                     metrics.rows_persisted += persisted;
                                     debug!(
@@ -223,6 +238,7 @@ pub async fn handle_ingest(job: IngestJob, store: Option<&ExperienceStore>) -> R
                                         "Failed to persist batch to vector store"
                                     );
                                     metrics.rows_persist_failed += valid_rows;
+                                    persist_failure = Some(e);
                                 }
                             }
                         }
@@ -237,6 +253,8 @@ pub async fn handle_ingest(job: IngestJob, store: Option<&ExperienceStore>) -> R
                         metrics.rows_skipped += batch_rows;
                     }
                 }
+
+                row_offset += batch_rows;
             }
             Err(e) => {
                 error!(
@@ -259,7 +277,16 @@ pub async fn handle_ingest(job: IngestJob, store: Option<&ExperienceStore>) -> R
         "Ingest job completed"
     );
 
-    Ok(())
+    // Persistence hard-failures (dim mismatch, Qdrant down, …) fail the job
+    // so the intake worker can retry and eventually park the spool file.
+    if let Some(e) = persist_failure {
+        return Err(e.context(format!(
+            "Ingest job '{}' failed to persist to the vector store",
+            job.batch_id
+        )));
+    }
+
+    Ok(metrics)
 }
 
 /// Validate that the file schema contains all expected fields with correct types.
@@ -537,6 +564,49 @@ mod tests {
         let m = store.metrics().await;
         assert_eq!(m.points_upserted, 8);
         assert_eq!(m.upsert_errors, 0);
+    }
+
+    #[tokio::test]
+    async fn test_handle_ingest_is_idempotent_on_redelivery() {
+        let store = ExperienceStore::mock();
+        let batch = create_test_batch(8);
+        let path = write_test_ipc(&[batch]);
+        let path_str = path.to_string_lossy().to_string();
+
+        let job = IngestJob {
+            batch_id: "test-idempotent".to_string(),
+            shm_path: path_str,
+        };
+
+        // Duplicate delivery (queue entry + sweep race) must not duplicate rows
+        handle_ingest(job.clone(), Some(&store)).await.unwrap();
+        handle_ingest(job, Some(&store)).await.unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(store.mock_point_count().await, 8);
+    }
+
+    #[tokio::test]
+    async fn test_handle_ingest_fails_on_dim_mismatch() {
+        // Store configured for dim 4, test batches carry 9-dim vectors
+        let config = crate::persistence::ExperienceStoreConfig {
+            vector_dim: 4,
+            ..Default::default()
+        };
+        let store = ExperienceStore::new(config).await.unwrap();
+
+        let batch = create_test_batch(3);
+        let path = write_test_ipc(&[batch]);
+        let job = IngestJob {
+            batch_id: "test-dim-mismatch".to_string(),
+            shm_path: path.to_string_lossy().to_string(),
+        };
+
+        let result = handle_ingest(job, Some(&store)).await;
+        let _ = std::fs::remove_file(&path);
+
+        assert!(result.is_err(), "dim mismatch must hard-fail the job");
+        assert_eq!(store.mock_point_count().await, 0);
     }
 
     #[tokio::test]

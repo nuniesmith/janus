@@ -26,7 +26,9 @@
 //! Each experience row is stored as a Qdrant point where:
 //! - **Vector**: The `state_gaf` binary field decoded as `f32` little-endian values
 //! - **Payload**: Metadata fields (action, reward, symbol, timestamp, done flag)
-//! - **ID**: A UUID v4 generated per row for deduplication
+//! - **ID**: A deterministic UUID v5 of `(batch_id, row_index)` so that
+//!   at-least-once delivery (Redis queue + spool sweep) re-upserts the same
+//!   point instead of duplicating it (design §5)
 
 use anyhow::{Context, Result};
 use arrow::array::{
@@ -87,6 +89,11 @@ impl Default for ExperienceStoreConfig {
 
 impl ExperienceStoreConfig {
     /// Load configuration from environment variables, falling back to defaults.
+    ///
+    /// Note: `QDRANT_USE_MOCK` defaults to **false** — mock mode must be
+    /// requested explicitly (`QDRANT_USE_MOCK=true`). A misconfigured or
+    /// unreachable Qdrant is a hard error at store construction, never a
+    /// silent fallback to in-memory storage (design §5).
     pub fn from_env() -> Self {
         Self {
             qdrant_url: std::env::var("QDRANT_URL")
@@ -102,9 +109,9 @@ impl ExperienceStoreConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(256),
             use_mock: std::env::var("QDRANT_USE_MOCK")
-                .unwrap_or_else(|_| "true".to_string())
+                .unwrap_or_else(|_| "false".to_string())
                 .parse()
-                .unwrap_or(true),
+                .unwrap_or(false),
             timeout_secs: std::env::var("QDRANT_TIMEOUT_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -165,10 +172,11 @@ struct MockStore {
 }
 
 impl MockStore {
-    fn upsert(&mut self, rows: &[ExperienceRow]) -> usize {
+    /// Upsert points by ID: an existing point with the same ID is replaced
+    /// (mirrors Qdrant upsert semantics so idempotency is testable).
+    fn upsert(&mut self, points: &[(String, ExperienceRow)]) -> usize {
         let mut count = 0;
-        for row in rows {
-            let id = uuid::Uuid::new_v4().to_string();
+        for (id, row) in points {
             let mut payload: HashMap<String, serde_json::Value> = HashMap::new();
             payload.insert("action_type".into(), serde_json::json!(row.action_type));
             payload.insert("action_symbol".into(), serde_json::json!(row.action_symbol));
@@ -177,7 +185,12 @@ impl MockStore {
             payload.insert("done".into(), serde_json::json!(row.done));
             payload.insert("timestamp_ms".into(), serde_json::json!(row.timestamp_ms));
 
-            self.points.push((id, row.state_vector.clone(), payload));
+            let entry = (id.clone(), row.state_vector.clone(), payload);
+            if let Some(existing) = self.points.iter_mut().find(|(pid, _, _)| pid == id) {
+                *existing = entry;
+            } else {
+                self.points.push(entry);
+            }
             count += 1;
         }
         count
@@ -210,8 +223,12 @@ impl ExperienceStore {
     /// Create a new experience store.
     ///
     /// If `config.use_mock` is `true`, no real Qdrant connection is attempted.
-    /// Otherwise the constructor tries to connect and falls back to mock mode
-    /// on failure.
+    /// Otherwise the constructor connects to Qdrant and verifies it is
+    /// reachable via a health check. A failed connection is an **error** —
+    /// there is no silent fallback to mock mode (design §5); mock mode is
+    /// only available via explicit `use_mock=true` / `QDRANT_USE_MOCK=true`.
+    /// Callers that need startup resilience should retry with backoff (see
+    /// [`Self::connect_with_retry`]).
     pub async fn new(config: ExperienceStoreConfig) -> Result<Self> {
         if config.use_mock {
             info!("ExperienceStore running in mock mode (no Qdrant connection)");
@@ -224,33 +241,61 @@ impl ExperienceStore {
             });
         }
 
-        match Qdrant::from_url(&config.qdrant_url)
+        let client = Qdrant::from_url(&config.qdrant_url)
             .timeout(std::time::Duration::from_secs(config.timeout_secs))
             .build()
-        {
-            Ok(client) => {
-                info!(url = %config.qdrant_url, "Connected to Qdrant for experience persistence");
-                Ok(Self {
-                    config,
-                    client: Some(client),
-                    mock: Arc::new(RwLock::new(MockStore::default())),
-                    is_mock: false,
-                    metrics: Arc::new(RwLock::new(PersistenceMetrics::default())),
-                })
+            .with_context(|| {
+                format!(
+                    "Failed to build Qdrant client for '{}' (set QDRANT_USE_MOCK=true only for explicit mock mode)",
+                    config.qdrant_url
+                )
+            })?;
+
+        client.health_check().await.with_context(|| {
+            format!(
+                "Qdrant health check failed at '{}' — refusing to fall back to mock mode",
+                config.qdrant_url
+            )
+        })?;
+
+        info!(url = %config.qdrant_url, "Connected to Qdrant for experience persistence");
+        Ok(Self {
+            config,
+            client: Some(client),
+            mock: Arc::new(RwLock::new(MockStore::default())),
+            is_mock: false,
+            metrics: Arc::new(RwLock::new(PersistenceMetrics::default())),
+        })
+    }
+
+    /// Create a store, retrying with exponential backoff while Qdrant is
+    /// unreachable (real mode only — mock mode never fails).
+    ///
+    /// Returns `None` if `cancel` fires before a connection is established.
+    pub async fn connect_with_retry(
+        config: ExperienceStoreConfig,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Option<Self> {
+        let mut backoff = std::time::Duration::from_secs(5);
+        const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(300);
+
+        loop {
+            match Self::new(config.clone()).await {
+                Ok(store) => return Some(store),
+                Err(e) => {
+                    error!(
+                        error = %e,
+                        retry_in_secs = backoff.as_secs(),
+                        "ExperienceStore connection failed — retrying"
+                    );
+                }
             }
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    "Failed to connect to Qdrant — falling back to mock mode"
-                );
-                Ok(Self {
-                    config,
-                    client: None,
-                    mock: Arc::new(RwLock::new(MockStore::default())),
-                    is_mock: true,
-                    metrics: Arc::new(RwLock::new(PersistenceMetrics::default())),
-                })
+
+            tokio::select! {
+                _ = cancel.cancelled() => return None,
+                _ = tokio::time::sleep(backoff) => {}
             }
+            backoff = (backoff * 2).min(MAX_BACKOFF);
         }
     }
 
@@ -346,8 +391,23 @@ impl ExperienceStore {
 
     /// Persist a validated Arrow record batch to the vector store.
     ///
+    /// `batch_id` and `row_offset` (the number of Arrow rows in preceding
+    /// record batches of the same IPC file) derive the deterministic UUIDv5
+    /// point IDs, so re-ingesting the same file upserts the same points.
+    ///
+    /// Hard-fails (returns `Err`) when:
+    /// - any row's `state_gaf` vector length ≠ the configured collection dim
+    ///   (the whole batch is rejected so the caller can park the file, rather
+    ///   than letting Qdrant reject rows one by one — design §5), or
+    /// - any upsert chunk fails (e.g. Qdrant down), so the caller can retry.
+    ///
     /// Returns the number of rows successfully persisted.
-    pub async fn persist_batch(&self, batch: &RecordBatch) -> Result<usize> {
+    pub async fn persist_batch(
+        &self,
+        batch: &RecordBatch,
+        batch_id: &str,
+        row_offset: usize,
+    ) -> Result<usize> {
         let rows = self.extract_rows(batch)?;
 
         if rows.is_empty() {
@@ -355,11 +415,34 @@ impl ExperienceStore {
             return Ok(0);
         }
 
+        // ── Dimension hard-check (design §5) ──────────────────────────────
+        let expected_dim = self.config.vector_dim as usize;
+        if let Some((row_idx, row)) = rows
+            .iter()
+            .find(|(_, r)| r.state_vector.len() != expected_dim)
+        {
+            anyhow::bail!(
+                "Batch '{}' has state_gaf vector of length {} at row {} but the \
+                 configured collection dim is {} — rejecting the whole batch",
+                batch_id,
+                row.state_vector.len(),
+                row_idx,
+                expected_dim
+            );
+        }
+
         let total = rows.len();
+        let points: Vec<(String, ExperienceRow)> = rows
+            .into_iter()
+            .map(|(row_idx, row)| (experience_point_id(batch_id, row_offset + row_idx), row))
+            .collect();
+
         let mut persisted = 0;
+        let mut chunk_errors = 0usize;
+        let mut last_error = String::new();
 
         // Chunk into upsert batches
-        for chunk in rows.chunks(self.config.upsert_batch_size) {
+        for chunk in points.chunks(self.config.upsert_batch_size) {
             match self.upsert_chunk(chunk).await {
                 Ok(n) => {
                     persisted += n;
@@ -369,6 +452,8 @@ impl ExperienceStore {
                 }
                 Err(e) => {
                     error!(error = %e, chunk_size = chunk.len(), "Failed to upsert experience chunk");
+                    last_error = format!("{e:#}");
+                    chunk_errors += 1;
                     let mut m = self.metrics.write().await;
                     m.upsert_errors += 1;
                     m.rows_failed += chunk.len();
@@ -376,18 +461,39 @@ impl ExperienceStore {
             }
         }
 
+        if chunk_errors > 0 {
+            anyhow::bail!(
+                "Batch '{}': {} of {} upsert chunk(s) failed (persisted {}/{} rows); last error: {}",
+                batch_id,
+                chunk_errors,
+                points.len().div_ceil(self.config.upsert_batch_size),
+                persisted,
+                total,
+                last_error
+            );
+        }
+
         debug!(persisted, total, "Persisted experience batch");
         Ok(persisted)
     }
 
-    /// Persist pre-extracted experience rows directly.
+    /// Persist pre-extracted experience rows directly (best-effort).
+    ///
+    /// Point IDs are random UUIDv4 — this path is **not** idempotent and is
+    /// intended for seeding / testing, not for the at-least-once ingest path
+    /// (use [`Self::persist_batch`] there).
     pub async fn persist_rows(&self, rows: &[ExperienceRow]) -> Result<usize> {
         if rows.is_empty() {
             return Ok(0);
         }
 
+        let points: Vec<(String, ExperienceRow)> = rows
+            .iter()
+            .map(|row| (uuid::Uuid::new_v4().to_string(), row.clone()))
+            .collect();
+
         let mut persisted = 0;
-        for chunk in rows.chunks(self.config.upsert_batch_size) {
+        for chunk in points.chunks(self.config.upsert_batch_size) {
             match self.upsert_chunk(chunk).await {
                 Ok(n) => {
                     persisted += n;
@@ -408,11 +514,11 @@ impl ExperienceStore {
 
     // ── Internal helpers ──────────────────────────────────────────────────
 
-    /// Upsert a chunk of experience rows to Qdrant (or mock).
-    async fn upsert_chunk(&self, rows: &[ExperienceRow]) -> Result<usize> {
+    /// Upsert a chunk of `(point_id, row)` pairs to Qdrant (or mock).
+    async fn upsert_chunk(&self, points: &[(String, ExperienceRow)]) -> Result<usize> {
         if self.is_mock {
             let mut store = self.mock.write().await;
-            let n = store.upsert(rows);
+            let n = store.upsert(points);
             return Ok(n);
         }
 
@@ -421,7 +527,10 @@ impl ExperienceStore {
             .as_ref()
             .context("Qdrant client not initialised")?;
 
-        let points: Vec<PointStruct> = rows.iter().map(|row| self.row_to_point(row)).collect();
+        let points: Vec<PointStruct> = points
+            .iter()
+            .map(|(id, row)| self.row_to_point(id.clone(), row))
+            .collect();
         let count = points.len();
 
         client
@@ -434,12 +543,11 @@ impl ExperienceStore {
         Ok(count)
     }
 
-    /// Convert a single `ExperienceRow` into a Qdrant `PointStruct`.
-    fn row_to_point(&self, row: &ExperienceRow) -> PointStruct {
+    /// Convert a single `ExperienceRow` into a Qdrant `PointStruct` with the
+    /// given (deterministic) point ID.
+    fn row_to_point(&self, id: String, row: &ExperienceRow) -> PointStruct {
         use qdrant_client::qdrant::Value;
         use qdrant_client::qdrant::value::Kind;
-
-        let id = uuid::Uuid::new_v4().to_string();
 
         let mut payload: HashMap<String, Value> = HashMap::new();
 
@@ -494,11 +602,12 @@ impl ExperienceStore {
         PointStruct::new(id, row.state_vector.clone(), payload)
     }
 
-    /// Extract `ExperienceRow`s from a validated Arrow record batch.
+    /// Extract `ExperienceRow`s from a validated Arrow record batch, paired
+    /// with their original Arrow row index (used for deterministic point IDs).
     ///
     /// Rows that cannot be fully decoded (missing required columns, bad binary
     /// length, etc.) are skipped with a warning and counted in the metrics.
-    pub fn extract_rows(&self, batch: &RecordBatch) -> Result<Vec<ExperienceRow>> {
+    pub fn extract_rows(&self, batch: &RecordBatch) -> Result<Vec<(usize, ExperienceRow)>> {
         let num_rows = batch.num_rows();
         if num_rows == 0 {
             return Ok(Vec::new());
@@ -647,18 +756,21 @@ impl ExperienceStore {
                 }
             });
 
-            rows.push(ExperienceRow {
-                state_vector,
-                state_raw,
-                action_type: action_type_arr.value(i),
-                action_symbol: action_symbol_arr.value(i).to_string(),
-                action_qty: action_qty_arr.value(i),
-                reward: reward_arr.value(i),
-                next_state_vector,
-                next_state_raw,
-                done: done_arr.value(i),
-                timestamp_ms: timestamp_arr.value(i),
-            });
+            rows.push((
+                i,
+                ExperienceRow {
+                    state_vector,
+                    state_raw,
+                    action_type: action_type_arr.value(i),
+                    action_symbol: action_symbol_arr.value(i).to_string(),
+                    action_qty: action_qty_arr.value(i),
+                    reward: reward_arr.value(i),
+                    next_state_vector,
+                    next_state_raw,
+                    done: done_arr.value(i),
+                    timestamp_ms: timestamp_arr.value(i),
+                },
+            ));
         }
 
         if failed > 0 {
@@ -680,6 +792,14 @@ impl ExperienceStore {
 }
 
 // ─── Utility functions ────────────────────────────────────────────────────────
+
+/// Deterministic Qdrant point ID: UUIDv5 of `(batch_id, row_index)` under a
+/// janus-experience namespace. At-least-once delivery (queue entry + sweep)
+/// therefore re-upserts the same point instead of duplicating it (design §5).
+pub fn experience_point_id(batch_id: &str, row_index: usize) -> String {
+    let namespace = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, b"janus:experience");
+    uuid::Uuid::new_v5(&namespace, format!("{batch_id}:{row_index}").as_bytes()).to_string()
+}
 
 /// Decode a byte slice as a sequence of little-endian `f32` values.
 ///
@@ -814,16 +934,19 @@ mod tests {
 
         assert_eq!(rows.len(), 5);
 
-        // Check first row
-        assert_eq!(rows[0].state_vector.len(), 9);
-        assert!((rows[0].state_vector[0] - 1.0).abs() < 1e-6);
-        assert_eq!(rows[0].action_type, 0);
-        assert_eq!(rows[0].action_symbol, "BTCUSD");
-        assert!(!rows[0].done);
-        assert_eq!(rows[0].timestamp_ms, 1_700_000_000_000);
+        // Check first row (rows are paired with their Arrow row index)
+        let (idx, first) = &rows[0];
+        assert_eq!(*idx, 0);
+        assert_eq!(first.state_vector.len(), 9);
+        assert!((first.state_vector[0] - 1.0).abs() < 1e-6);
+        assert_eq!(first.action_type, 0);
+        assert_eq!(first.action_symbol, "BTCUSD");
+        assert!(!first.done);
+        assert_eq!(first.timestamp_ms, 1_700_000_000_000);
 
-        // Last row should be terminal
-        assert!(rows[4].done);
+        // Last row should be terminal, with its original index
+        assert_eq!(rows[4].0, 4);
+        assert!(rows[4].1.done);
     }
 
     #[test]
@@ -839,7 +962,7 @@ mod tests {
         let store = ExperienceStore::mock();
         let batch = create_test_batch(10);
 
-        let persisted = store.persist_batch(&batch).await.unwrap();
+        let persisted = store.persist_batch(&batch, "batch-a", 0).await.unwrap();
         assert_eq!(persisted, 10);
 
         assert_eq!(store.mock_point_count().await, 10);
@@ -848,6 +971,63 @@ mod tests {
         assert_eq!(m.points_upserted, 10);
         assert_eq!(m.upsert_calls, 1);
         assert_eq!(m.upsert_errors, 0);
+    }
+
+    #[tokio::test]
+    async fn test_persist_batch_is_idempotent() {
+        let store = ExperienceStore::mock();
+        let batch = create_test_batch(10);
+
+        store.persist_batch(&batch, "batch-a", 0).await.unwrap();
+        // Re-ingesting the same batch (sweep + queue race) must not duplicate
+        store.persist_batch(&batch, "batch-a", 0).await.unwrap();
+        assert_eq!(store.mock_point_count().await, 10);
+
+        // A different batch_id produces distinct points
+        store.persist_batch(&batch, "batch-b", 0).await.unwrap();
+        assert_eq!(store.mock_point_count().await, 20);
+
+        // Same batch_id at a different row offset also produces distinct points
+        store.persist_batch(&batch, "batch-a", 10).await.unwrap();
+        assert_eq!(store.mock_point_count().await, 30);
+    }
+
+    #[tokio::test]
+    async fn test_persist_batch_rejects_dim_mismatch() {
+        let config = ExperienceStoreConfig {
+            vector_dim: 4, // test batches carry 9-dim vectors
+            ..Default::default()
+        };
+        let store = ExperienceStore::new(config).await.unwrap();
+        let batch = create_test_batch(3);
+
+        let result = store.persist_batch(&batch, "batch-dim", 0).await;
+        assert!(result.is_err(), "expected dim mismatch to hard-fail");
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(msg.contains("configured collection dim"), "got: {msg}");
+
+        // Nothing partially persisted
+        assert_eq!(store.mock_point_count().await, 0);
+    }
+
+    #[test]
+    fn test_experience_point_id_deterministic() {
+        let a = experience_point_id("batch-1", 0);
+        let b = experience_point_id("batch-1", 0);
+        assert_eq!(a, b);
+
+        assert_ne!(
+            experience_point_id("batch-1", 0),
+            experience_point_id("batch-1", 1)
+        );
+        assert_ne!(
+            experience_point_id("batch-1", 0),
+            experience_point_id("batch-2", 0)
+        );
+
+        // Valid UUID, version 5
+        let parsed = uuid::Uuid::parse_str(&a).unwrap();
+        assert_eq!(parsed.get_version_num(), 5);
     }
 
     #[tokio::test]
@@ -896,7 +1076,10 @@ mod tests {
         let store = ExperienceStore::new(config).await.unwrap();
         let batch = create_test_batch(10);
 
-        let persisted = store.persist_batch(&batch).await.unwrap();
+        let persisted = store
+            .persist_batch(&batch, "batch-chunked", 0)
+            .await
+            .unwrap();
         assert_eq!(persisted, 10);
         assert_eq!(store.mock_point_count().await, 10);
 
@@ -909,7 +1092,7 @@ mod tests {
     async fn test_mock_clear() {
         let store = ExperienceStore::mock();
         let batch = create_test_batch(5);
-        store.persist_batch(&batch).await.unwrap();
+        store.persist_batch(&batch, "batch-clear", 0).await.unwrap();
         assert_eq!(store.mock_point_count().await, 5);
 
         store.mock_clear().await;
@@ -939,7 +1122,7 @@ mod tests {
             timestamp_ms: 1_700_000_000_000,
         };
 
-        let point = store.row_to_point(&row);
+        let point = store.row_to_point(experience_point_id("batch-p", 0), &row);
 
         // Should have a UUID-format ID
         assert!(point.id.is_some());
