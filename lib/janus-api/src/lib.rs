@@ -543,24 +543,14 @@ pub(crate) async fn fetch_latest_signals_from_redis(
         .await
         .map_err(|e| ApiError::Internal(format!("Failed to get Redis connection: {}", e)))?;
 
-    // Try to fetch from sorted set (signals:recent) ordered by timestamp
+    // Fetch from the sorted set (janus:signals:recent) ordered by timestamp.
+    // This is the only index the signal writer populates (see
+    // services/forward/src/persistence/signal_redis.rs); an empty result
+    // simply means no signals have been persisted yet.
     let signal_ids: Vec<String> = conn
         .zrevrange::<&str, Vec<String>>("janus:signals:recent", 0, (limit - 1) as isize)
         .await
         .unwrap_or_default();
-
-    if signal_ids.is_empty() {
-        // Fallback: try list-based storage
-        let signal_jsons: Vec<String> = conn
-            .lrange::<&str, Vec<String>>("janus:signals:list", 0, (limit - 1) as isize)
-            .await
-            .unwrap_or_default();
-
-        return Ok(signal_jsons
-            .into_iter()
-            .filter_map(|s| serde_json::from_str(&s).ok())
-            .collect());
-    }
 
     // Fetch full signal data for each ID
     let mut signals = Vec::with_capacity(signal_ids.len());

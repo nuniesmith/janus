@@ -233,6 +233,84 @@ fn completeness_pct(received: u64, expected: u64) -> f64 {
     (100.0 * received as f64 / expected as f64).min(100.0)
 }
 
+/// Baseline rolling window for the data-completeness SLI (30 minutes).
+const COMPLETENESS_WINDOW_MIN_SECS: u64 = 1800;
+
+/// Grace period shielding the most recent kline boundary (typically in
+/// flight for a second or two) from being counted as missing.
+const COMPLETENESS_GRACE_SECS: u64 = 15;
+
+/// Rolling-window length (seconds) for the data-completeness SLI.
+///
+/// The pruning in [`CompletenessWindow::observe`] caps the anchor snapshot's
+/// age at the window length, while the warm-up gate only lets the gauge
+/// compute once the anchor is at least `2 * max_interval` old. A fixed
+/// window therefore silently pins the gauge at 0 forever whenever any
+/// configured interval exceeds half the window (>15m at the 1800s baseline,
+/// e.g. `1h`). Scale the baseline up so the window always spans at least two
+/// of the longest configured interval (`1h` → 7200s, `4h` → 28800s).
+fn completeness_window_secs(max_interval_secs: u64) -> u64 {
+    COMPLETENESS_WINDOW_MIN_SECS.max(2 * max_interval_secs)
+}
+
+/// Rolling snapshot window driving the `data_completeness_percent` gauge.
+///
+/// Holds `(epoch secs, cumulative closed klines)` snapshots; each tick the
+/// window's oldest entry anchors the expectation: completeness =
+/// closed-klines-received / boundary-aligned-expected over the window.
+struct CompletenessWindow {
+    /// Parsed kline interval durations contributing to the expectation.
+    interval_secs: Vec<u64>,
+    /// Number of symbols each interval is ingested for.
+    asset_count: u64,
+    /// Longest configured interval; drives the warm-up gate.
+    max_interval: u64,
+    /// Rolling-window length; always ≥ `2 * max_interval` (see
+    /// [`completeness_window_secs`]).
+    window_secs: u64,
+    /// `(epoch secs, cumulative closed klines)` snapshots, oldest first.
+    snapshots: std::collections::VecDeque<(u64, u64)>,
+}
+
+impl CompletenessWindow {
+    fn new(interval_secs: Vec<u64>, asset_count: u64) -> Self {
+        let max_interval = interval_secs.iter().copied().max().unwrap_or(0);
+        Self {
+            interval_secs,
+            asset_count,
+            max_interval,
+            window_secs: completeness_window_secs(max_interval),
+            snapshots: std::collections::VecDeque::new(),
+        }
+    }
+
+    /// Record a snapshot and return the completeness percentage, or `None`
+    /// while the warm-up gate is closed (the window does not yet span two of
+    /// the longest interval, or there is no expectation), so cold starts
+    /// never report a bogus low completeness and the gauge is left untouched.
+    fn observe(&mut self, now_epoch: u64, closed_total: u64) -> Option<f64> {
+        self.snapshots.push_back((now_epoch, closed_total));
+        while self.snapshots.len() > 1 && self.snapshots[1].0 + self.window_secs <= now_epoch {
+            self.snapshots.pop_front();
+        }
+        let &(anchor_ts, anchor_closed) = self.snapshots.front()?;
+        if self.max_interval == 0 || now_epoch.saturating_sub(anchor_ts) < 2 * self.max_interval {
+            return None;
+        }
+        let expected: u64 = self
+            .interval_secs
+            .iter()
+            .map(|&i| expected_closed_klines(anchor_ts, now_epoch, COMPLETENESS_GRACE_SECS, i))
+            .sum::<u64>()
+            * self.asset_count;
+        if expected == 0 {
+            return None;
+        }
+        let received = closed_total.saturating_sub(anchor_closed);
+        Some(completeness_pct(received, expected))
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // start_module — unified JANUS binary entry point
 // ═══════════════════════════════════════════════════════════════════════════
@@ -508,22 +586,23 @@ async fn run_live_mode(state: Arc<janus_core::JanusState>) -> janus_core::Result
         })
         .collect();
 
+    // ── data_completeness_percent (rolling window) ────────────────────
+    // The gauge stays untouched (and the DataCompletenessLow alert stays
+    // gated) until the window spans two of the longest interval, so cold
+    // starts never report a bogus low completeness. The window scales with
+    // the longest configured interval so that warm-up gate can always open.
+    let mut completeness = CompletenessWindow::new(kline_interval_secs, config.assets.len() as u64);
+    if completeness.window_secs > COMPLETENESS_WINDOW_MIN_SECS {
+        info!(
+            "completeness SLI: longest kline interval is {}s — rolling window scaled from {}s to {}s so the gauge can warm up",
+            completeness.max_interval, COMPLETENESS_WINDOW_MIN_SECS, completeness.window_secs,
+        );
+    }
+
     let health_handle = tokio::spawn(async move {
         let mut interval =
             tokio::time::interval(tokio::time::Duration::from_secs(health_poll_secs));
         let mut tick_count: u64 = 0;
-
-        // ── data_completeness_percent (rolling window) ────────────────
-        // Snapshots of (epoch secs, cumulative closed klines). Each tick the
-        // window's oldest entry anchors the expectation: completeness =
-        // closed-klines-received / boundary-aligned-expected over the window.
-        // The gauge stays 0 (and the DataCompletenessLow alert stays gated)
-        // until the window spans two of the longest interval, so cold starts
-        // never report a bogus low completeness.
-        const COMPLETENESS_WINDOW_SECS: u64 = 1800;
-        const COMPLETENESS_GRACE_SECS: u64 = 15;
-        let mut window: std::collections::VecDeque<(u64, u64)> = std::collections::VecDeque::new();
-        let max_interval = kline_interval_secs.iter().copied().max().unwrap_or(0);
 
         loop {
             tokio::select! {
@@ -545,33 +624,10 @@ async fn run_live_mode(state: Arc<janus_core::JanusState>) -> janus_core::Result
                     BACKFILL_QUEUE_SIZE.set(0); // keep metric alive; real value set by scheduler
 
                     // ── data_completeness_percent ─────────────────────
-                    if let Ok(d) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-                        let now_epoch = d.as_secs();
-                        window.push_back((now_epoch, closed));
-                        while window.len() > 1
-                            && window[1].0 + COMPLETENESS_WINDOW_SECS <= now_epoch
-                        {
-                            window.pop_front();
-                        }
-                        if let Some(&(anchor_ts, anchor_closed)) = window.front()
-                            && max_interval > 0
-                            && now_epoch.saturating_sub(anchor_ts) >= 2 * max_interval
-                        {
-                            let expected: u64 = kline_interval_secs
-                                .iter()
-                                .map(|&i| expected_closed_klines(
-                                    anchor_ts,
-                                    now_epoch,
-                                    COMPLETENESS_GRACE_SECS,
-                                    i,
-                                ))
-                                .sum::<u64>()
-                                * asset_count as u64;
-                            if expected > 0 {
-                                let received = closed.saturating_sub(anchor_closed);
-                                DATA_COMPLETENESS.set(completeness_pct(received, expected));
-                            }
-                        }
+                    if let Ok(d) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                        && let Some(pct) = completeness.observe(d.as_secs(), closed)
+                    {
+                        DATA_COMPLETENESS.set(pct);
                     }
 
                     let status = format!(
@@ -1144,7 +1200,10 @@ async fn process_trade_data(
 
 #[cfg(test)]
 mod completeness_tests {
-    use super::{completeness_pct, expected_closed_klines, interval_secs};
+    use super::{
+        COMPLETENESS_WINDOW_MIN_SECS, CompletenessWindow, completeness_pct,
+        completeness_window_secs, expected_closed_klines, interval_secs,
+    };
 
     #[test]
     fn interval_parsing() {
@@ -1186,5 +1245,105 @@ mod completeness_tests {
         assert_eq!(completeness_pct(0, 0), 0.0); // no expectation → stay gated
         let pct = completeness_pct(999, 1000);
         assert!((pct - 99.9).abs() < 1e-9);
+    }
+
+    #[test]
+    fn window_scales_with_longest_interval() {
+        // Default deploys (1m,5m) keep the 30-minute baseline.
+        assert_eq!(completeness_window_secs(60), COMPLETENESS_WINDOW_MIN_SECS);
+        assert_eq!(completeness_window_secs(300), COMPLETENESS_WINDOW_MIN_SECS);
+        assert_eq!(completeness_window_secs(900), COMPLETENESS_WINDOW_MIN_SECS);
+        // Anything longer than 15m needs the window to grow so the 2×max
+        // warm-up gate can open: 1h → 7200s, 4h → 28800s.
+        assert_eq!(completeness_window_secs(3_600), 7_200);
+        assert_eq!(completeness_window_secs(14_400), 28_800);
+        // No parseable intervals → baseline (the gate stays closed anyway).
+        assert_eq!(completeness_window_secs(0), COMPLETENESS_WINDOW_MIN_SECS);
+    }
+
+    /// Regression test for the >15m dead-gauge bug: with a 1h interval the
+    /// old fixed 1800s window pruned the anchor before it could ever become
+    /// `2 * 3600s` old, so the warm-up gate never opened and the gauge pinned
+    /// at 0 forever. With the scaled window the gauge must go live once the
+    /// window spans two hours.
+    #[test]
+    fn one_hour_interval_produces_live_gauge() {
+        let mut w = CompletenessWindow::new(vec![3_600], 2); // 1h × 2 assets
+        assert_eq!(w.window_secs, 7_200);
+
+        let poll = 10; // default health_poll_secs
+        let mut live_at = None;
+        // Simulate perfect ingestion: every 1h boundary delivers one closed
+        // kline per asset. Snapshot the cumulative count each poll tick.
+        for tick in 0..=(3 * 3_600 / poll) {
+            let now = 1_000_000 + tick * poll; // unaligned start, like real life
+            let closed_total = 2 * (now / 3_600 - 1_000_000 / 3_600);
+            if let Some(pct) = w.observe(now, closed_total) {
+                live_at.get_or_insert(now - 1_000_000);
+                assert_eq!(pct, 100.0, "perfect ingestion must read 100%");
+            }
+        }
+        // The gauge went live once the anchor was 2×3600s old — not never
+        // (the old bug), and not before the warm-up gate allows.
+        let live_at = live_at.expect("gauge never went live — warm-up gate never opened");
+        assert!(
+            (7_200..7_200 + 2 * 3_600).contains(&live_at),
+            "gauge went live at +{live_at}s, expected shortly after 7200s"
+        );
+
+        // And a genuine gap is visible: two hours with no closed klines on
+        // either asset drags the percentage down, not back to a gated 0.
+        let frozen_total = 2 * ((1_000_000 + 3 * 3_600) / 3_600 - 1_000_000 / 3_600);
+        let mut gap_pct = None;
+        for tick in 1..=(2 * 3_600 / poll) {
+            let now = 1_000_000 + 3 * 3_600 + tick * poll;
+            gap_pct = w.observe(now, frozen_total).or(gap_pct);
+        }
+        let gap_pct = gap_pct.expect("gauge must stay live through a gap");
+        assert!(
+            gap_pct < 100.0,
+            "a 2h silent gap must lower completeness, got {gap_pct}"
+        );
+    }
+
+    /// The old behaviour, pinned forever: a fixed 1800s window with a 1h
+    /// interval never opens the gate. Reproduced here by forcing the
+    /// unscaled window, so the scaling in `CompletenessWindow::new` is
+    /// provably what fixes it.
+    #[test]
+    fn unscaled_window_never_goes_live_for_one_hour_interval() {
+        let mut w = CompletenessWindow::new(vec![3_600], 2);
+        w.window_secs = COMPLETENESS_WINDOW_MIN_SECS; // pre-fix behaviour
+
+        let poll = 10;
+        for tick in 0..=(24 * 3_600 / poll) {
+            let now = 1_000_000 + tick * poll;
+            let closed_total = 2 * (now / 3_600 - 1_000_000 / 3_600);
+            assert_eq!(
+                w.observe(now, closed_total),
+                None,
+                "fixed 1800s window must keep the gate closed (the bug)"
+            );
+        }
+    }
+
+    /// Default 1m,5m deploys keep their behaviour: baseline window, gauge
+    /// live after ten minutes (2 × 5m), 100% under perfect ingestion.
+    #[test]
+    fn default_intervals_unaffected() {
+        let mut w = CompletenessWindow::new(vec![60, 300], 3);
+        assert_eq!(w.window_secs, COMPLETENESS_WINDOW_MIN_SECS);
+
+        let poll = 10;
+        let mut live_at = None;
+        for tick in 0..=(3_600 / poll) {
+            let now = 2_000_000 + tick * poll;
+            let closed_total = 3 * ((now / 60 - 2_000_000 / 60) + (now / 300 - 2_000_000 / 300));
+            if let Some(pct) = w.observe(now, closed_total) {
+                live_at.get_or_insert(now - 2_000_000);
+                assert_eq!(pct, 100.0);
+            }
+        }
+        assert_eq!(live_at, Some(600), "gauge must go live at 2 × 5m");
     }
 }
