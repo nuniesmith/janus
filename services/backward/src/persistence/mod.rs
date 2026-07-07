@@ -32,7 +32,8 @@ pub mod models;
 pub mod repositories;
 
 pub use experience_store::{
-    ExperienceStore, ExperienceStoreConfig, PersistenceMetrics, experience_point_id,
+    ExperienceStore, ExperienceStoreConfig, PersistenceMetrics, TrainingSample,
+    experience_point_id, training_sample_from_point,
 };
 
 use anyhow::{Context, Result};
