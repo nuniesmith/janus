@@ -521,6 +521,32 @@ impl ExperienceStore {
         Ok((points, total))
     }
 
+    // ── Training read (EXPERIENCE_PIPELINE.md §7 Phase 2) ────────────────
+
+    /// Sample live-collected experiences shaped for the DQN replay buffer.
+    ///
+    /// Reuses the newest-first [`Self::sample`] scroll path (with vectors +
+    /// payload) and maps each point into a [`TrainingSample`] — exactly the
+    /// `(state_vector, action, reward, next_state_vector, done)` tuple the
+    /// replay buffer needs. Points that predate the Phase 1.5 payload contract
+    /// (missing `reward`/`action_type`/`done`/`next_state_vector`) are skipped
+    /// rather than silently defaulted, so a partial upgrade never injects
+    /// zero-reward garbage into training.
+    ///
+    /// Mock mode returns an empty vec (the underlying `sample` is honest about
+    /// having no Qdrant to scroll), so this never fabricates training data.
+    pub async fn sample_for_training(
+        &self,
+        limit: usize,
+        since_ms: Option<i64>,
+    ) -> Result<Vec<TrainingSample>> {
+        let (points, _total) = self.sample(limit, None, None, since_ms).await?;
+        Ok(points
+            .iter()
+            .filter_map(training_sample_from_point)
+            .collect())
+    }
+
     // ── Batch persistence ─────────────────────────────────────────────────
 
     /// Persist a validated Arrow record batch to the vector store.
@@ -998,6 +1024,56 @@ pub struct SamplePoint {
     pub payload: serde_json::Map<String, serde_json::Value>,
 }
 
+/// A replay-ready experience recovered from a Qdrant point, containing exactly
+/// the fields the DQN replay buffer needs (EXPERIENCE_PIPELINE.md §7 Phase 2).
+///
+/// `action` is the canonical `0=Buy, 1=Sell, 2=Hold, 3=Close` index (design
+/// §3.2). `state_vector` / `next_state_vector` are the flat GAF vectors at `t`
+/// and `t+1`; `reward` is the signed next-bar return (design §3.3); `done` is
+/// the episode-termination flag (design §3.4).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrainingSample {
+    pub state_vector: Vec<f32>,
+    pub action: u8,
+    pub reward: f32,
+    pub next_state_vector: Vec<f32>,
+    pub done: bool,
+}
+
+/// Map a sampled Qdrant point to a [`TrainingSample`].
+///
+/// Returns `None` when a required field is missing or malformed — the point's
+/// vector is empty, `action_type`/`reward`/`done` are absent, or the
+/// `next_state_vector` payload (a JSON-encoded `Vec<f32>` string written by
+/// [`ExperienceStore::row_to_point`]) cannot be parsed. This keeps pre-Phase-2
+/// points out of the replay buffer instead of defaulting them.
+pub fn training_sample_from_point(point: &SamplePoint) -> Option<TrainingSample> {
+    if point.vector.is_empty() {
+        return None;
+    }
+    let payload = &point.payload;
+    let action = payload.get("action_type")?.as_i64()?;
+    if !(0..=3).contains(&action) {
+        return None;
+    }
+    let reward = payload.get("reward")?.as_f64()? as f32;
+    let done = payload.get("done")?.as_bool()?;
+    let next_state_vector: Vec<f32> = payload
+        .get("next_state_vector")
+        .and_then(|v| v.as_str())
+        .and_then(|s| serde_json::from_str(s).ok())?;
+    if next_state_vector.is_empty() {
+        return None;
+    }
+    Some(TrainingSample {
+        state_vector: point.vector.clone(),
+        action: action as u8,
+        reward,
+        next_state_vector,
+        done,
+    })
+}
+
 fn point_id_string(id: &qdrant_client::qdrant::PointId) -> Option<String> {
     use qdrant_client::qdrant::point_id::PointIdOptions;
     match id.point_id_options.as_ref()? {
@@ -1395,5 +1471,115 @@ mod tests {
         assert_eq!(deserialized.action_symbol, "ETHUSD");
         assert_eq!(deserialized.state_vector.len(), 2);
         assert!(deserialized.done);
+    }
+
+    // ── Phase 2: training read mapping (payload → replay tuple) ───────────
+
+    /// Build a `SamplePoint` whose payload mirrors what `sample()` returns
+    /// after `qdrant_value_to_json` (integers/doubles/bools/strings), including
+    /// the JSON-string-encoded `next_state_vector` written by `row_to_point`.
+    fn sample_point_with(
+        vector: Vec<f32>,
+        action_type: i64,
+        reward: f64,
+        done: bool,
+        next_state: &[f32],
+    ) -> SamplePoint {
+        let mut payload = serde_json::Map::new();
+        payload.insert("action_type".into(), serde_json::json!(action_type));
+        payload.insert("reward".into(), serde_json::json!(reward));
+        payload.insert("done".into(), serde_json::json!(done));
+        payload.insert(
+            "next_state_vector".into(),
+            serde_json::json!(serde_json::to_string(next_state).unwrap()),
+        );
+        SamplePoint {
+            id: "00000000-0000-0000-0000-000000000001".into(),
+            vector,
+            payload,
+        }
+    }
+
+    #[test]
+    fn test_training_sample_from_point_maps_all_fields() {
+        let point = sample_point_with(vec![0.1, 0.2, 0.3], 1, -0.0007, true, &[0.4, 0.5, 0.6]);
+        let sample = training_sample_from_point(&point).expect("should map");
+        assert_eq!(sample.state_vector, vec![0.1, 0.2, 0.3]);
+        assert_eq!(sample.action, 1);
+        assert!((sample.reward - -0.0007).abs() < 1e-9);
+        assert_eq!(sample.next_state_vector, vec![0.4, 0.5, 0.6]);
+        assert!(sample.done);
+    }
+
+    #[test]
+    fn test_training_sample_from_point_round_trips_row_to_point_payload() {
+        // Full contract check: persist path (row_to_point) → scroll decode
+        // (qdrant_value_to_json) → training mapping recovers the replay tuple.
+        let store = ExperienceStore::mock();
+        let row = ExperienceRow {
+            state_vector: vec![1.0, 2.0, 3.0],
+            state_raw: None,
+            action_type: 0,
+            action_symbol: "BTCUSDT".into(),
+            action_qty: 0.0,
+            reward: 0.0031,
+            next_state_vector: vec![1.1, 2.1, 3.1],
+            next_state_raw: None,
+            done: false,
+            timestamp_ms: 1_782_000_000_000,
+            meta: None,
+        };
+        let point = store.row_to_point(experience_point_id("b", 0), &row);
+        // Decode the qdrant payload exactly as sample() would.
+        let payload: serde_json::Map<String, serde_json::Value> = point
+            .payload
+            .into_iter()
+            .map(|(k, v)| (k, qdrant_value_to_json(v)))
+            .collect();
+        let sp = SamplePoint {
+            id: "x".into(),
+            vector: row.state_vector.clone(),
+            payload,
+        };
+        let sample = training_sample_from_point(&sp).expect("should map");
+        assert_eq!(sample.state_vector, row.state_vector);
+        assert_eq!(sample.action, row.action_type);
+        assert!((sample.reward - row.reward).abs() < 1e-6);
+        assert_eq!(sample.next_state_vector, row.next_state_vector);
+        assert_eq!(sample.done, row.done);
+    }
+
+    #[test]
+    fn test_training_sample_from_point_skips_incomplete() {
+        // Empty vector → skipped.
+        let mut p = sample_point_with(vec![], 2, 0.0, false, &[0.1]);
+        assert!(training_sample_from_point(&p).is_none());
+
+        // Missing reward → skipped (pre-Phase-2 point).
+        p = sample_point_with(vec![0.1], 2, 0.0, false, &[0.1]);
+        p.payload.remove("reward");
+        assert!(training_sample_from_point(&p).is_none());
+
+        // Missing next_state_vector → skipped.
+        p = sample_point_with(vec![0.1], 2, 0.0, false, &[0.1]);
+        p.payload.remove("next_state_vector");
+        assert!(training_sample_from_point(&p).is_none());
+
+        // Empty next_state_vector JSON → skipped.
+        p = sample_point_with(vec![0.1], 2, 0.0, false, &[]);
+        assert!(training_sample_from_point(&p).is_none());
+
+        // Out-of-range action index → skipped.
+        p = sample_point_with(vec![0.1], 7, 0.0, false, &[0.1]);
+        assert!(training_sample_from_point(&p).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_sample_for_training_mock_is_empty() {
+        // Mock mode has no Qdrant to scroll; it must return an honest empty
+        // result rather than fabricating training data.
+        let store = ExperienceStore::mock();
+        let samples = store.sample_for_training(100, None).await.unwrap();
+        assert!(samples.is_empty());
     }
 }

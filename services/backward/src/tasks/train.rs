@@ -18,6 +18,7 @@
 //! target computation, replacing the earlier inference-only forward-pass
 //! pipeline.
 
+use crate::persistence::{ExperienceStore, ExperienceStoreConfig, TrainingSample};
 use crate::worker::TrainJob;
 use anyhow::{Context, Result};
 use common::{Action, ActionType, Experience, State, StateMetadata};
@@ -76,6 +77,43 @@ pub struct TrainingConfig {
     pub gaf_window: usize,
     /// GAF image size for seeding.
     pub gaf_image_size: usize,
+
+    // ── Qdrant training source (Phase 2 — EXPERIENCE_PIPELINE.md §7) ───
+    /// When `true`, fill the replay buffer from live-collected experiences in
+    /// Qdrant *in addition to* the seed path. Defaults to `false` and is
+    /// normally driven by the [`TRAIN_FROM_QDRANT_ENV`] env var in
+    /// [`handle_training`]; the seed/placeholder path is unchanged when off.
+    pub train_from_qdrant: bool,
+    /// Maximum number of experiences to scroll from Qdrant per training job.
+    pub qdrant_sample_limit: usize,
+    /// Optional lower bound (epoch ms) on `timestamp_ms` when loading from
+    /// Qdrant — `None` loads the most recent `qdrant_sample_limit` points.
+    pub qdrant_since_ms: Option<i64>,
+}
+
+/// Environment variable gating the Qdrant training-data path. Absent or any
+/// value other than `1/true/yes/on` (case-insensitive) keeps the live default:
+/// training seeds from `seed_closes`/placeholders exactly as before.
+pub const TRAIN_FROM_QDRANT_ENV: &str = "JANUS_TRAIN_FROM_QDRANT";
+
+/// Whether the Qdrant training path is enabled via [`TRAIN_FROM_QDRANT_ENV`].
+/// Default OFF.
+fn train_from_qdrant_enabled() -> bool {
+    parse_train_from_qdrant(std::env::var(TRAIN_FROM_QDRANT_ENV).ok().as_deref())
+}
+
+/// Pure env-value parser for the Qdrant training gate (kept separate from
+/// [`train_from_qdrant_enabled`] so it is testable without mutating process
+/// env). Only `1/true/yes/on` (case-insensitive, trimmed) enable it; anything
+/// else — including `None` (unset) — leaves it OFF.
+fn parse_train_from_qdrant(val: Option<&str>) -> bool {
+    match val {
+        Some(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        None => false,
+    }
 }
 
 impl Default for TrainingConfig {
@@ -99,6 +137,9 @@ impl Default for TrainingConfig {
             seed_closes: None,
             gaf_window: 32,
             gaf_image_size: 16,
+            train_from_qdrant: false,
+            qdrant_sample_limit: 10_000,
+            qdrant_since_ms: None,
         }
     }
 }
@@ -221,6 +262,120 @@ pub fn experiences_from_series(
     Ok(experiences)
 }
 
+// ─── Qdrant experience loading (Phase 2) ────────────────────────────────────────
+
+/// Map the canonical stored action index (design §3.2: `0=Buy, 1=Sell,
+/// 2=Hold, 3=Close`) back to an [`ActionType`]. Inverse of [`action_to_index`].
+/// Unknown indices fall back to `Hold` (the neutral action).
+fn action_from_index(index: u8) -> ActionType {
+    match index {
+        0 => ActionType::Buy,
+        1 => ActionType::Sell,
+        3 => ActionType::Close,
+        _ => ActionType::Hold,
+    }
+}
+
+/// Convert a Qdrant-recovered [`TrainingSample`] into a replay-buffer
+/// [`Experience`].
+///
+/// The stored GAF vectors drop straight into `State::from_flat_gaf` — the
+/// replay buffer only ever reads `gaf_features_flat` (via `state_to_features`,
+/// which pads/truncates to `model_input_size`), so a dim mismatch degrades to
+/// pad/truncate rather than a panic. The raw-feature channel is left empty
+/// (`state_raw` is optional in the record and unused by the LSTM path today).
+fn experience_from_training_sample(sample: &TrainingSample) -> Experience {
+    let meta = StateMetadata::new("QDRANT".to_string());
+    let state = State::from_flat_gaf(sample.state_vector.clone(), vec![], meta.clone());
+    let next_state = State::from_flat_gaf(sample.next_state_vector.clone(), vec![], meta);
+    let action = Action::new(action_from_index(sample.action), "QDRANT".to_string(), 0.0);
+    Experience::new(state, action, sample.reward, next_state, sample.done)
+}
+
+/// Summary of the reward signal across a batch of loaded experiences, logged so
+/// a training run from live data is observable (requirement 3).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RewardDistribution {
+    pub count: usize,
+    pub min: f32,
+    pub max: f32,
+    pub mean: f32,
+    pub std: f32,
+    pub positive: usize,
+    pub negative: usize,
+    pub zero: usize,
+}
+
+impl RewardDistribution {
+    /// Compute reward summary statistics over `experiences`. Returns the
+    /// all-zero default for an empty slice.
+    fn from_experiences(experiences: &[Experience]) -> Self {
+        if experiences.is_empty() {
+            return Self::default();
+        }
+        let rewards: Vec<f32> = experiences.iter().map(|e| e.reward).collect();
+        let count = rewards.len();
+        let mut min = f32::INFINITY;
+        let mut max = f32::NEG_INFINITY;
+        let mut sum = 0.0_f64;
+        let (mut positive, mut negative, mut zero) = (0usize, 0usize, 0usize);
+        for &r in &rewards {
+            min = min.min(r);
+            max = max.max(r);
+            sum += r as f64;
+            if r > 0.0 {
+                positive += 1;
+            } else if r < 0.0 {
+                negative += 1;
+            } else {
+                zero += 1;
+            }
+        }
+        let mean = (sum / count as f64) as f32;
+        let var = rewards
+            .iter()
+            .map(|&r| {
+                let d = r as f64 - mean as f64;
+                d * d
+            })
+            .sum::<f64>()
+            / count as f64;
+        Self {
+            count,
+            min,
+            max,
+            mean,
+            std: var.sqrt() as f32,
+            positive,
+            negative,
+            zero,
+        }
+    }
+}
+
+/// Load live-collected experiences from Qdrant and map them into replay-buffer
+/// [`Experience`]s (EXPERIENCE_PIPELINE.md §7 Phase 2 item 2).
+///
+/// Constructs an [`ExperienceStore`] from the process env (`QDRANT_URL` etc.)
+/// and scrolls the newest `qdrant_sample_limit` points (optionally bounded by
+/// `qdrant_since_ms`) via [`ExperienceStore::sample_for_training`]. Any store
+/// or scroll error propagates to the caller, which logs and falls back to the
+/// seed path — a Qdrant outage must never abort a training job.
+async fn load_qdrant_experiences(config: &TrainingConfig) -> Result<Vec<Experience>> {
+    let store_cfg = ExperienceStoreConfig::from_env();
+    let store = ExperienceStore::new(store_cfg)
+        .await
+        .context("connecting to Qdrant for training experiences")?;
+    let samples = store
+        .sample_for_training(config.qdrant_sample_limit, config.qdrant_since_ms)
+        .await
+        .context("sampling experiences from Qdrant")?;
+    Ok(samples
+        .iter()
+        .map(experience_from_training_sample)
+        .collect())
+}
+
 /// Build an [`LstmConfig`] (inference) from a [`TrainingConfig`].
 fn build_inference_config(config: &TrainingConfig) -> LstmConfig {
     LstmConfig::new(
@@ -334,7 +489,11 @@ fn save_checkpoint(
 /// 8. Checkpoint the trained model as an inference predictor
 #[allow(dead_code)]
 pub async fn handle_training(job: TrainJob, notifier: Option<&CheckpointNotifier>) -> Result<()> {
-    let config = TrainingConfig::default();
+    let config = TrainingConfig {
+        // Env-gated Phase 2 path; default OFF leaves the seed path untouched.
+        train_from_qdrant: train_from_qdrant_enabled(),
+        ..TrainingConfig::default()
+    };
 
     info!(
         batch_size = job.batch_size,
@@ -372,6 +531,45 @@ pub async fn handle_training(job: TrainJob, notifier: Option<&CheckpointNotifier
 
     // ── 2. Initialise PER buffer ──────────────────────────────────────────
     let mut replay_buffer = SumTree::new(config.replay_capacity, config.per_alpha, config.per_beta);
+
+    // ── 2b. Optionally fill from live Qdrant experiences (Phase 2) ────────
+    //
+    // Env-gated OFF by default: when `JANUS_TRAIN_FROM_QDRANT` is unset, this
+    // block is skipped entirely and the seed/placeholder path below is the
+    // sole source — live training behaviour is unchanged. When enabled, the
+    // buffer is filled from live-collected experiences *in addition to* the
+    // seed fallback (which still tops up any shortfall to `batch_size`). A
+    // Qdrant error is logged and degrades to the seed path rather than
+    // aborting the job.
+    if config.train_from_qdrant {
+        match load_qdrant_experiences(&config).await {
+            Ok(exps) => {
+                let dist = RewardDistribution::from_experiences(&exps);
+                info!(
+                    loaded = dist.count,
+                    reward_min = dist.min,
+                    reward_max = dist.max,
+                    reward_mean = dist.mean,
+                    reward_std = dist.std,
+                    reward_positive = dist.positive,
+                    reward_negative = dist.negative,
+                    reward_zero = dist.zero,
+                    limit = config.qdrant_sample_limit,
+                    since_ms = config.qdrant_since_ms,
+                    "Loaded live experiences from Qdrant for training"
+                );
+                for exp in exps {
+                    replay_buffer.add(exp, 1.0);
+                }
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "Failed to load experiences from Qdrant — falling back to seed path"
+                );
+            }
+        }
+    }
 
     let buffer_size = replay_buffer.len();
     if buffer_size < job.batch_size {
@@ -764,6 +962,103 @@ mod tests {
     fn test_experiences_from_series_handles_short_input() {
         let exps = experiences_from_series(&[1.0, 2.0, 3.0], 16, 16, "X").unwrap();
         assert!(exps.is_empty());
+    }
+
+    // ── Phase 2: Qdrant training path (env-gated OFF) ─────────────────────
+
+    #[test]
+    fn test_train_from_qdrant_default_off() {
+        // The gate must default OFF so live training behaviour is unchanged
+        // unless the operator opts in.
+        assert!(!TrainingConfig::default().train_from_qdrant);
+    }
+
+    #[test]
+    fn test_parse_train_from_qdrant_gate() {
+        // Unset / empty / arbitrary values leave the gate OFF.
+        assert!(!parse_train_from_qdrant(None));
+        assert!(!parse_train_from_qdrant(Some("")));
+        assert!(!parse_train_from_qdrant(Some("0")));
+        assert!(!parse_train_from_qdrant(Some("false")));
+        assert!(!parse_train_from_qdrant(Some("nope")));
+        // Only the canonical truthy tokens enable it (case/whitespace tolerant).
+        assert!(parse_train_from_qdrant(Some("1")));
+        assert!(parse_train_from_qdrant(Some("true")));
+        assert!(parse_train_from_qdrant(Some(" TRUE ")));
+        assert!(parse_train_from_qdrant(Some("Yes")));
+        assert!(parse_train_from_qdrant(Some("on")));
+    }
+
+    #[test]
+    fn test_action_from_index_round_trips_action_to_index() {
+        for at in [
+            ActionType::Buy,
+            ActionType::Sell,
+            ActionType::Hold,
+            ActionType::Close,
+        ] {
+            let idx = action_to_index(&at) as u8;
+            assert_eq!(action_from_index(idx), at);
+        }
+        // Out-of-range indices fall back to the neutral Hold action.
+        assert_eq!(action_from_index(9), ActionType::Hold);
+    }
+
+    #[test]
+    fn test_experience_from_training_sample_maps_replay_tuple() {
+        let sample = TrainingSample {
+            state_vector: vec![0.1, 0.2, 0.3],
+            action: 1, // Sell
+            reward: -0.0007,
+            next_state_vector: vec![0.4, 0.5, 0.6],
+            done: true,
+        };
+        let exp = experience_from_training_sample(&sample);
+
+        assert_eq!(exp.state.gaf_features_flat, vec![0.1, 0.2, 0.3]);
+        assert_eq!(exp.next_state.gaf_features_flat, vec![0.4, 0.5, 0.6]);
+        assert_eq!(exp.action.action_type, ActionType::Sell);
+        assert_eq!(exp.reward, -0.0007);
+        assert!(exp.done);
+        // The mapped experience must feed the model without a shape panic: the
+        // features pad/truncate to model_input_size.
+        let feats = state_to_features(&exp.state, 9);
+        assert_eq!(feats.len(), 9);
+        assert_eq!(&feats[0..3], &[0.1, 0.2, 0.3]);
+    }
+
+    #[test]
+    fn test_reward_distribution_summary() {
+        let make = |reward: f32| {
+            let meta = StateMetadata::new("T".to_string());
+            let s = State::from_flat_gaf(vec![0.0; 9], vec![], meta.clone());
+            let ns = State::from_flat_gaf(vec![0.0; 9], vec![], meta);
+            let a = Action::new(ActionType::Hold, "T".to_string(), 0.0);
+            Experience::new(s, a, reward, ns, false)
+        };
+        let exps = vec![make(1.0), make(-1.0), make(0.0), make(2.0)];
+        let dist = RewardDistribution::from_experiences(&exps);
+        assert_eq!(dist.count, 4);
+        assert_eq!(dist.positive, 2);
+        assert_eq!(dist.negative, 1);
+        assert_eq!(dist.zero, 1);
+        assert_eq!(dist.min, -1.0);
+        assert_eq!(dist.max, 2.0);
+        assert!((dist.mean - 0.5).abs() < 1e-6);
+        assert!(dist.std.is_finite() && dist.std > 0.0);
+
+        // Empty input is the all-zero default (no NaNs).
+        let empty = RewardDistribution::from_experiences(&[]);
+        assert_eq!(empty, RewardDistribution::default());
+    }
+
+    #[test]
+    fn test_seed_path_unchanged_when_qdrant_off() {
+        // With the gate off (default) and no seed_closes, seeding still yields
+        // an empty vec so the placeholder fallback path is untouched.
+        let cfg = TrainingConfig::default();
+        assert!(!cfg.train_from_qdrant);
+        assert!(build_seed_experiences(&cfg).unwrap().is_empty());
     }
 
     #[test]
