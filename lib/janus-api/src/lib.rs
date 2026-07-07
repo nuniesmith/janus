@@ -9,6 +9,7 @@
 
 pub mod bars;
 pub mod config_api;
+pub mod indicators;
 mod param_updates;
 pub mod position_store;
 pub mod sse_bars;
@@ -195,6 +196,10 @@ fn create_router(
         // columnar for the trading page, flat ms-timestamps for MiniChart/charts.
         .route("/bars/{symbol}", get(bars::bars_history_handler))
         .route("/bars/{symbol}/candles", get(bars::bars_candles_handler))
+        // Indicator catalog + compute for the chart page's Rust-computed
+        // indicator picker (roadmap P2): metadata dropdown + on-demand series.
+        .route("/api/indicators/catalog", get(indicators::catalog_handler))
+        .route("/api/indicators/compute", get(indicators::compute_handler))
         // FKS WebUI front-page contract (Track D): per-asset scores, open
         // trades, and data/runtime health — served truthfully from janus state.
         .route(
@@ -1436,6 +1441,26 @@ mod tests {
     async fn test_router_creation() {
         let state = test_state().await;
         let _router = test_router(state);
+    }
+
+    #[tokio::test]
+    async fn catalog_endpoint_returns_21_descriptors() {
+        let router = test_router(test_state().await);
+        let (status, body) = get_json(&router, "/api/indicators/catalog").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["count"], 21);
+        let indicators = body["indicators"].as_array().expect("indicators array");
+        assert_eq!(indicators.len(), 21);
+        // Descriptor field names are emitted verbatim; enums as PascalCase.
+        let rsi = indicators
+            .iter()
+            .find(|d| d["id"] == "rsi")
+            .expect("rsi descriptor present");
+        assert_eq!(rsi["display_name"], "RSI");
+        assert_eq!(rsi["category"], "Oscillator");
+        assert_eq!(rsi["params"][0]["name"], "period");
+        assert_eq!(rsi["params"][0]["kind"], "Integer");
+        assert_eq!(rsi["params"][0]["default"], 14.0);
     }
 
     #[test]
