@@ -60,6 +60,8 @@ dashboard/control API (and the closest successor to Ruby's API surface).
 | GET | `/bars/{symbol}` | **WebUI chart history** (columnar `{columns, data}`; `?interval=&days_back=&limit=`) from `candles_crypto` |
 | GET | `/bars/{symbol}/candles` | chart history, flat shape (`{candles: [{timestamp(ms), o,h,l,c,v}]}`) |
 | GET (SSE) | `/sse/bars/{symbol}` | live closed-candle stream (`event: bar`; `?interval=`, default `1m`) |
+| GET | `/api/indicators/catalog` | indicator metadata for the chart picker: `{count, indicators:[{id, display_name, category, params}]}` (from `indicators-ta`'s descriptor layer) |
+| GET | `/api/indicators/compute` | Rust-computed indicator series over `candles_crypto`: `?symbol=&interval=&indicator=<id>&<param>=<val>…` → `{symbol, interval, indicator, series:{<line>:[{time(sec), value}]}, count}` |
 | GET | `/api/pipeline/scores/json` | `{assets:[…]}` — per-asset signal scores (latest signal per symbol: confidence→`score`, type→`cnn_signal`) |
 | GET | `/api/trades/open` | `{trades:[…]}` — currently-tracked open positions (from the `PositionTracker`) |
 | GET | `/factory/status` | data/runtime module health: per-module worker map + uptime |

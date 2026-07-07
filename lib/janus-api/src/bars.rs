@@ -253,7 +253,10 @@ fn http_client() -> &'static reqwest::Client {
 }
 
 /// Validate inputs, run the QuestDB query, and parse the rows.
-async fn fetch_bars(
+///
+/// Shared with [`crate::compute`], which reuses the exact QuestDB candle path
+/// so a Rust-computed indicator sees the same bars the chart renders.
+pub(crate) async fn fetch_bars(
     symbol: &str,
     query: &HistoryQuery,
 ) -> Result<Vec<BarRow>, (StatusCode, Json<Value>)> {

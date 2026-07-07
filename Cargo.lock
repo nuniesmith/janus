@@ -5495,9 +5495,9 @@ dependencies = [
 
 [[package]]
 name = "indicators-ta"
-version = "0.2.1"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "093a52a2d6bc6614a58b81a98279c974f1ebba568c77a7c8bd0b3d95ffb5da63"
+checksum = "c1a52250dc6258711742e238c3a29d7d8051318f16a18df6a9621225d64764bb"
 dependencies = [
  "chrono",
  "indexmap 2.13.0",
@@ -5972,6 +5972,7 @@ dependencies = [
  "futures-util",
  "http 1.4.0",
  "http-body-util",
+ "indicators-ta",
  "jflow-core",
  "prometheus",
  "redis",
