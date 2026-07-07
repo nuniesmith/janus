@@ -180,6 +180,30 @@ impl HistoricalCandleFetcher {
         Ok(all_candles)
     }
 
+    /// Fetch a single page of klines (one REST request, with the configured
+    /// retries) ending at `end_time` (Binance's inclusive `endTime`, unix ms),
+    /// oldest-first. `limit` is capped at Binance's 1000-per-request maximum.
+    ///
+    /// Unlike [`fetch_candles`](Self::fetch_candles) this never paginates
+    /// internally, so callers (the range backfiller) control memory and
+    /// pacing one page at a time.
+    pub async fn fetch_candles_page(
+        &self,
+        symbol: &str,
+        timeframe: &str,
+        limit: usize,
+        end_time: Option<i64>,
+    ) -> Result<Vec<CandleInput>> {
+        let interval = Self::normalize_interval(timeframe);
+        self.fetch_batch(
+            symbol,
+            &interval,
+            limit.min(MAX_CANDLES_PER_REQUEST),
+            end_time,
+        )
+        .await
+    }
+
     /// Fetch a batch of candles from Binance
     async fn fetch_batch(
         &self,
