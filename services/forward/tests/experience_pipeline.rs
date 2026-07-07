@@ -39,15 +39,17 @@ async fn producer_batches_ingest_through_the_real_consumer() {
                 action: janus_core::SignalType::Buy,
                 confidence: 0.9,
                 blocked: None,
+                regime: None,
             }
         } else if i == GAF_WINDOW + 4 {
             DecisionCtx {
                 action: janus_core::SignalType::Sell,
                 confidence: 0.8,
                 blocked: Some("gate: test-block".to_string()),
+                regime: None,
             }
         } else {
-            DecisionCtx::hold()
+            DecisionCtx::hold(None)
         };
         rec.observe(key, "BTCUSDT", "1m", t, close, ctx);
         t += MIN_MS;

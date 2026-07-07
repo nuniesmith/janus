@@ -185,15 +185,19 @@ pub struct DecisionCtx {
     pub action: janus_core::SignalType,
     pub confidence: f64,
     pub blocked: Option<String>,
+    /// Live market regime at the decision bar (side-channel for the UMAP
+    /// view's coloring — travels in file metadata, not the Arrow schema).
+    pub regime: Option<String>,
 }
 
 impl DecisionCtx {
     /// The overwhelmingly common case: janus decided not to act.
-    pub fn hold() -> Self {
+    pub fn hold(regime: Option<String>) -> Self {
         Self {
             action: janus_core::SignalType::Hold,
             confidence: 0.0,
             blocked: None,
+            regime,
         }
     }
 }
@@ -216,6 +220,7 @@ pub struct ExperienceRow {
     pub interval: String,
     pub confidence: f64,
     pub blocked: Option<String>,
+    pub regime: Option<String>,
 }
 
 struct Pending {
@@ -338,6 +343,7 @@ impl ExperienceRecorder {
                     timestamp_ms: p.close_time_ms,
                     interval: p.interval,
                     confidence: p.ctx.confidence,
+                    regime: p.ctx.regime,
                     blocked: p.ctx.blocked,
                 };
                 match self.tx.try_send(row) {
@@ -555,6 +561,8 @@ struct RowMeta<'a> {
     confidence: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     blocked: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    regime: Option<&'a str>,
 }
 
 fn write_ipc(path: &std::path::Path, rows: &[ExperienceRow]) -> anyhow::Result<()> {
@@ -566,6 +574,7 @@ fn write_ipc(path: &std::path::Path, rows: &[ExperienceRow]) -> anyhow::Result<(
             interval: &r.interval,
             confidence: r.confidence,
             blocked: r.blocked.as_deref(),
+            regime: r.regime.as_deref(),
         })
         .collect();
     let mut meta = HashMap::new();
@@ -688,7 +697,7 @@ mod tests {
                 "1m",
                 t,
                 100.0 + (i as f64 % 7.0),
-                DecisionCtx::hold(),
+                DecisionCtx::hold(None),
             );
             t += MIN;
         }
@@ -740,9 +749,17 @@ mod tests {
                 action: SignalType::Buy,
                 confidence: 0.9,
                 blocked: None,
+                regime: None,
             },
         );
-        rec.observe("K:1m", "BTCUSDT", "1m", t + MIN, 110.0, DecisionCtx::hold());
+        rec.observe(
+            "K:1m",
+            "BTCUSDT",
+            "1m",
+            t + MIN,
+            110.0,
+            DecisionCtx::hold(None),
+        );
         // Drain: the warmup itself completed pendings too — take the last row.
         let mut last = None;
         while let Ok(r) = rx.try_recv() {
@@ -773,9 +790,17 @@ mod tests {
                 action: SignalType::Sell,
                 confidence: 0.8,
                 blocked: Some("gate: test".to_string()),
+                regime: None,
             },
         );
-        rec.observe("K:1m", "BTCUSDT", "1m", t + MIN, 110.0, DecisionCtx::hold());
+        rec.observe(
+            "K:1m",
+            "BTCUSDT",
+            "1m",
+            t + MIN,
+            110.0,
+            DecisionCtx::hold(None),
+        );
         let mut last = None;
         while let Ok(r) = rx.try_recv() {
             last = Some(r);
@@ -798,7 +823,7 @@ mod tests {
             "1m",
             t + 8 * MIN,
             101.0,
-            DecisionCtx::hold(),
+            DecisionCtx::hold(None),
         );
         let mut last = None;
         while let Ok(r) = rx.try_recv() {
@@ -822,7 +847,7 @@ mod tests {
             "1m",
             t + 11 * MIN,
             101.0,
-            DecisionCtx::hold(),
+            DecisionCtx::hold(None),
         );
         assert!(
             rx.try_recv().is_err(),
@@ -842,7 +867,7 @@ mod tests {
                 "1m",
                 t,
                 100.0 + i as f64,
-                DecisionCtx::hold(),
+                DecisionCtx::hold(None),
             );
             rec.observe(
                 "BTCUSDT:5m",
@@ -850,7 +875,7 @@ mod tests {
                 "5m",
                 t * 5,
                 200.0 + i as f64,
-                DecisionCtx::hold(),
+                DecisionCtx::hold(None),
             );
             t += MIN;
         }
@@ -887,6 +912,7 @@ mod tests {
                 interval: "1m".to_string(),
                 confidence: 0.5,
                 blocked: None,
+                regime: None,
             })
             .await
             .expect("send row");

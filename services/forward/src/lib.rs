@@ -1646,7 +1646,11 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                                             &kline.interval,
                                             exp_close_ms,
                                             close,
-                                            crate::experience::DecisionCtx::hold(),
+                                            crate::experience::DecisionCtx::hold(
+                                                regime_manager
+                                                    .current_regime(&symbol_str)
+                                                    .map(|r| r.to_string()),
+                                            ),
                                         );
                                     }
                                     continue;
@@ -1715,7 +1719,11 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                                                 &kline.interval,
                                                 exp_close_ms,
                                                 close,
-                                                crate::experience::DecisionCtx::hold(),
+                                                crate::experience::DecisionCtx::hold(
+                                                regime_manager
+                                                    .current_regime(&symbol_str)
+                                                    .map(|r| r.to_string()),
+                                            ),
                                             );
                                         }
                                         continue;
@@ -1966,7 +1974,11 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                                             &kline.interval,
                                             exp_close_ms,
                                             close,
-                                            crate::experience::DecisionCtx::hold(),
+                                            crate::experience::DecisionCtx::hold(
+                                                regime_manager
+                                                    .current_regime(&symbol_str)
+                                                    .map(|r| r.to_string()),
+                                            ),
                                         );
                                     }
                                     continue;
@@ -2011,7 +2023,11 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                                                         &kline.interval,
                                                         exp_close_ms,
                                                         close,
-                                                        crate::experience::DecisionCtx::hold(),
+                                                        crate::experience::DecisionCtx::hold(
+                                                regime_manager
+                                                    .current_regime(&symbol_str)
+                                                    .map(|r| r.to_string()),
+                                            ),
                                                     );
                                                 }
                                                 continue;
@@ -2034,7 +2050,11 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                                                         &kline.interval,
                                                         exp_close_ms,
                                                         close,
-                                                        crate::experience::DecisionCtx::hold(),
+                                                        crate::experience::DecisionCtx::hold(
+                                                regime_manager
+                                                    .current_regime(&symbol_str)
+                                                    .map(|r| r.to_string()),
+                                            ),
                                                     );
                                                 }
                                                 continue;
@@ -2056,7 +2076,11 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                                             &kline.interval,
                                             exp_close_ms,
                                             close,
-                                            crate::experience::DecisionCtx::hold(),
+                                            crate::experience::DecisionCtx::hold(
+                                                regime_manager
+                                                    .current_regime(&symbol_str)
+                                                    .map(|r| r.to_string()),
+                                            ),
                                         );
                                     }
                                     continue;
@@ -2319,6 +2343,9 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                                             action: final_type,
                                             confidence: avg_confidence,
                                             blocked: exp_blocked,
+                                            regime: regime_manager
+                                                .current_regime(&symbol_str)
+                                                .map(|r| r.to_string()),
                                         },
                                     );
                                 }

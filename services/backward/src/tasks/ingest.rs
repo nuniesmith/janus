@@ -42,6 +42,7 @@ use std::path::Path;
 use tracing::{debug, error, info, warn};
 
 use crate::persistence::ExperienceStore;
+use crate::persistence::experience_store::RowSideMeta;
 use crate::worker::IngestJob;
 
 /// Expected schema for experience Arrow IPC files.
@@ -70,6 +71,29 @@ fn expected_schema() -> Schema {
         Field::new("done", DataType::Boolean, false),
         Field::new("timestamp_ms", DataType::Int64, false),
     ])
+}
+
+/// One entry of the producer's `rows_meta` file metadata: the absolute row
+/// index within the file plus the side-channel fields.
+#[derive(serde::Deserialize)]
+struct RowMetaEntry {
+    i: usize,
+    #[serde(flatten)]
+    meta: RowSideMeta,
+}
+
+/// Parse the optional `rows_meta` schema metadata (EXPERIENCE_PIPELINE.md §3
+/// side-channel). Absent or malformed metadata degrades to `None` — older
+/// producers must keep ingesting exactly as before.
+fn parse_rows_meta(schema: &Schema) -> Option<std::collections::HashMap<usize, RowSideMeta>> {
+    let raw = schema.metadata().get("rows_meta")?;
+    match serde_json::from_str::<Vec<RowMetaEntry>>(raw) {
+        Ok(entries) => Some(entries.into_iter().map(|e| (e.i, e.meta)).collect()),
+        Err(e) => {
+            warn!("rows_meta file metadata unparseable — ingesting without side-channel: {e}");
+            None
+        }
+    }
 }
 
 /// Metrics collected during an ingest run.
@@ -159,6 +183,10 @@ pub async fn handle_ingest(
     metrics.schema_fields_expected = expected.fields().len();
     metrics.schema_fields_matched = validate_schema(&file_schema, &expected);
 
+    // Producer side-channel (confidence / blocked / interval / regime) for
+    // the Qdrant payload; None for older producers.
+    let rows_meta = parse_rows_meta(&file_schema);
+
     if metrics.schema_fields_matched < metrics.schema_fields_expected {
         warn!(
             batch_id = %job.batch_id,
@@ -220,7 +248,15 @@ pub async fn handle_ingest(
 
                         // ── 5. Persist to vector database ─────────────
                         if let Some(s) = store {
-                            match s.persist_batch(&batch, &job.batch_id, row_offset).await {
+                            match s
+                                .persist_batch_with_meta(
+                                    &batch,
+                                    &job.batch_id,
+                                    row_offset,
+                                    rows_meta.as_ref(),
+                                )
+                                .await
+                            {
                                 Ok(persisted) => {
                                     metrics.rows_persisted += persisted;
                                     debug!(

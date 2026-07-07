@@ -139,6 +139,22 @@ pub struct PersistenceMetrics {
 
 /// A single experience extracted from an Arrow record batch, ready for
 /// Qdrant upsert.
+/// Per-row side-channel parsed from the producer's `rows_meta` file metadata
+/// (EXPERIENCE_PIPELINE.md §3): fields that don't fit the frozen Arrow schema
+/// but belong in the Qdrant payload for the UMAP view. All optional — absent
+/// for older producers, and absence must never fail an ingest.
+#[derive(Debug, Clone, Default, Serialize, serde::Deserialize)]
+pub struct RowSideMeta {
+    #[serde(default)]
+    pub interval: Option<String>,
+    #[serde(default)]
+    pub confidence: Option<f64>,
+    #[serde(default)]
+    pub blocked: Option<String>,
+    #[serde(default)]
+    pub regime: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExperienceRow {
     /// The GAF state vector (f32 values decoded from binary).
@@ -161,6 +177,8 @@ pub struct ExperienceRow {
     pub done: bool,
     /// Unix epoch milliseconds.
     pub timestamp_ms: i64,
+    /// Side-channel payload fields (rows_meta), when the producer sent them.
+    pub meta: Option<RowSideMeta>,
 }
 
 // ─── Mock in-memory store ─────────────────────────────────────────────────────
@@ -358,6 +376,7 @@ impl ExperienceStore {
                 collection = %self.config.collection_name,
                 "Experience collection already exists"
             );
+            self.ensure_payload_indexes(client).await;
             return Ok(());
         }
 
@@ -384,7 +403,122 @@ impl ExperienceStore {
             "Experience collection created"
         );
 
+        self.ensure_payload_indexes(client).await;
         Ok(())
+    }
+
+    /// Payload indexes for filtered/ordered sampling (design §5 Phase 1.5).
+    /// Best-effort and idempotent: Qdrant treats re-creation as a no-op, and
+    /// an index failure must never block ingestion — sampling just degrades.
+    async fn ensure_payload_indexes(&self, client: &Qdrant) {
+        use qdrant_client::qdrant::{CreateFieldIndexCollectionBuilder, FieldType};
+        for (field, ftype) in [
+            ("action_symbol", FieldType::Keyword),
+            ("action_type", FieldType::Integer),
+            ("timestamp_ms", FieldType::Integer),
+        ] {
+            if let Err(e) = client
+                .create_field_index(CreateFieldIndexCollectionBuilder::new(
+                    &self.config.collection_name,
+                    field,
+                    ftype,
+                ))
+                .await
+            {
+                debug!(field, "payload index create skipped/failed: {e}");
+            }
+        }
+    }
+
+    // ── Sampling (UMAP view / read API — EXPERIENCE_PIPELINE.md §8) ───────
+
+    /// Sample recent experience points (newest-first by `timestamp_ms`) with
+    /// optional payload filters. Returns `(points, total_in_collection)`.
+    /// Mock mode returns an honest empty result.
+    pub async fn sample(
+        &self,
+        limit: usize,
+        symbol: Option<&str>,
+        action: Option<u8>,
+        since_ms: Option<i64>,
+    ) -> Result<(Vec<SamplePoint>, u64)> {
+        if self.is_mock {
+            return Ok((Vec::new(), 0));
+        }
+        let client = self
+            .client
+            .as_ref()
+            .context("Qdrant client not initialised")?;
+
+        use qdrant_client::qdrant::{
+            Condition, CountPointsBuilder, Direction, Filter, OrderBy, Range, ScrollPointsBuilder,
+            r#match::MatchValue,
+        };
+
+        let mut conditions: Vec<Condition> = Vec::new();
+        if let Some(sym) = symbol {
+            conditions.push(Condition::matches(
+                "action_symbol",
+                MatchValue::Keyword(sym.to_string()),
+            ));
+        }
+        if let Some(a) = action {
+            conditions.push(Condition::matches("action_type", a as i64));
+        }
+        if let Some(since) = since_ms {
+            conditions.push(Condition::range(
+                "timestamp_ms",
+                Range {
+                    gte: Some(since as f64),
+                    ..Default::default()
+                },
+            ));
+        }
+
+        let mut scroll = ScrollPointsBuilder::new(&self.config.collection_name)
+            .limit(limit as u32)
+            .with_payload(true)
+            .with_vectors(true)
+            .order_by(OrderBy {
+                key: "timestamp_ms".to_string(),
+                direction: Some(Direction::Desc.into()),
+                ..Default::default()
+            });
+        if !conditions.is_empty() {
+            scroll = scroll.filter(Filter::must(conditions));
+        }
+
+        let scrolled = client
+            .scroll(scroll)
+            .await
+            .context("Qdrant scroll failed")?;
+
+        let total = client
+            .count(CountPointsBuilder::new(&self.config.collection_name).exact(false))
+            .await
+            .map(|r| r.result.map(|c| c.count).unwrap_or(0))
+            .unwrap_or(0);
+
+        let points = scrolled
+            .result
+            .into_iter()
+            .filter_map(|p| {
+                let id = p.id.as_ref().map(point_id_string)??;
+                let vector = extract_vector(p.vectors.as_ref())?;
+                let payload = p
+                    .payload
+                    .into_iter()
+                    .map(|(k, v)| (k, qdrant_value_to_json(v)))
+                    .collect();
+                Some(SamplePoint {
+                    id,
+                    vector,
+                    payload,
+                })
+            })
+            .collect();
+
+        Ok((points, total))
     }
 
     // ── Batch persistence ─────────────────────────────────────────────────
@@ -407,6 +541,20 @@ impl ExperienceStore {
         batch: &RecordBatch,
         batch_id: &str,
         row_offset: usize,
+    ) -> Result<usize> {
+        self.persist_batch_with_meta(batch, batch_id, row_offset, None)
+            .await
+    }
+
+    /// [`Self::persist_batch`] with the producer's per-row side-channel
+    /// (`rows_meta` file metadata, keyed by absolute row index within the
+    /// file) threaded into the Qdrant payload.
+    pub async fn persist_batch_with_meta(
+        &self,
+        batch: &RecordBatch,
+        batch_id: &str,
+        row_offset: usize,
+        rows_meta: Option<&HashMap<usize, RowSideMeta>>,
     ) -> Result<usize> {
         let rows = self.extract_rows(batch)?;
 
@@ -434,7 +582,12 @@ impl ExperienceStore {
         let total = rows.len();
         let points: Vec<(String, ExperienceRow)> = rows
             .into_iter()
-            .map(|(row_idx, row)| (experience_point_id(batch_id, row_offset + row_idx), row))
+            .map(|(row_idx, mut row)| {
+                row.meta = rows_meta
+                    .and_then(|m| m.get(&(row_offset + row_idx)))
+                    .cloned();
+                (experience_point_id(batch_id, row_offset + row_idx), row)
+            })
             .collect();
 
         let mut persisted = 0;
@@ -587,6 +740,49 @@ impl ExperienceStore {
                 kind: Some(Kind::IntegerValue(row.timestamp_ms)),
             },
         );
+
+        // Side-channel payload (UMAP view coloring — design §5 Phase 1.5).
+        // Absent fields are simply omitted; readers get null.
+        if let Some(meta) = &row.meta {
+            if let Some(c) = meta.confidence {
+                payload.insert(
+                    "confidence".into(),
+                    Value {
+                        kind: Some(Kind::DoubleValue(c)),
+                    },
+                );
+            }
+            payload.insert(
+                "blocked".into(),
+                Value {
+                    kind: Some(Kind::BoolValue(meta.blocked.is_some())),
+                },
+            );
+            if let Some(b) = &meta.blocked {
+                payload.insert(
+                    "blocked_reason".into(),
+                    Value {
+                        kind: Some(Kind::StringValue(b.clone())),
+                    },
+                );
+            }
+            if let Some(iv) = &meta.interval {
+                payload.insert(
+                    "interval".into(),
+                    Value {
+                        kind: Some(Kind::StringValue(iv.clone())),
+                    },
+                );
+            }
+            if let Some(rg) = &meta.regime {
+                payload.insert(
+                    "regime".into(),
+                    Value {
+                        kind: Some(Kind::StringValue(rg.clone())),
+                    },
+                );
+            }
+        }
 
         // Encode next_state_vector as a JSON string in the payload so it can
         // be recovered during training without a separate lookup.
@@ -769,6 +965,7 @@ impl ExperienceStore {
                     next_state_raw,
                     done: done_arr.value(i),
                     timestamp_ms: timestamp_arr.value(i),
+                    meta: None,
                 },
             ));
         }
@@ -792,6 +989,42 @@ impl ExperienceStore {
 }
 
 // ─── Utility functions ────────────────────────────────────────────────────────
+
+/// One sampled experience point for the read API.
+#[derive(Debug, Serialize)]
+pub struct SamplePoint {
+    pub id: String,
+    pub vector: Vec<f32>,
+    pub payload: serde_json::Map<String, serde_json::Value>,
+}
+
+fn point_id_string(id: &qdrant_client::qdrant::PointId) -> Option<String> {
+    use qdrant_client::qdrant::point_id::PointIdOptions;
+    match id.point_id_options.as_ref()? {
+        PointIdOptions::Uuid(u) => Some(u.clone()),
+        PointIdOptions::Num(n) => Some(n.to_string()),
+    }
+}
+
+fn extract_vector(vectors: Option<&qdrant_client::qdrant::VectorsOutput>) -> Option<Vec<f32>> {
+    use qdrant_client::qdrant::vectors_output::VectorsOptions;
+    match vectors?.vectors_options.as_ref()? {
+        VectorsOptions::Vector(v) => Some(v.data.clone()),
+        VectorsOptions::Vectors(_) => None, // named vectors are not used here
+    }
+}
+
+/// Minimal qdrant→JSON conversion for the payload kinds this store writes.
+fn qdrant_value_to_json(v: qdrant_client::qdrant::Value) -> serde_json::Value {
+    use qdrant_client::qdrant::value::Kind;
+    match v.kind {
+        Some(Kind::IntegerValue(i)) => serde_json::json!(i),
+        Some(Kind::DoubleValue(d)) => serde_json::json!(d),
+        Some(Kind::StringValue(s)) => serde_json::json!(s),
+        Some(Kind::BoolValue(b)) => serde_json::json!(b),
+        _ => serde_json::Value::Null,
+    }
+}
 
 /// Deterministic Qdrant point ID: UUIDv5 of `(batch_id, row_index)` under a
 /// janus-experience namespace. At-least-once delivery (queue entry + sweep)
@@ -1046,6 +1279,7 @@ mod tests {
                 next_state_raw: None,
                 done: false,
                 timestamp_ms: 1_700_000_000_000,
+                meta: None,
             },
             ExperienceRow {
                 state_vector: vec![3.0; 9],
@@ -1058,6 +1292,7 @@ mod tests {
                 next_state_raw: Some(vec![0.3, 0.4]),
                 done: true,
                 timestamp_ms: 1_700_000_001_000,
+                meta: None,
             },
         ];
 
@@ -1120,6 +1355,7 @@ mod tests {
             next_state_raw: None,
             done: false,
             timestamp_ms: 1_700_000_000_000,
+            meta: None,
         };
 
         let point = store.row_to_point(experience_point_id("batch-p", 0), &row);
@@ -1150,6 +1386,7 @@ mod tests {
             next_state_raw: None,
             done: true,
             timestamp_ms: 123_456_789,
+            meta: None,
         };
 
         let json = serde_json::to_string(&row).unwrap();
