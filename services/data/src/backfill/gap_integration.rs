@@ -160,7 +160,11 @@ impl GapIntegrationManager {
         }
     }
 
-    /// Handle a detected gap from the gap detection system
+    /// Handle a detected gap from the gap detection system.
+    ///
+    /// `interval` is `Some(timeframe)` for candle gaps (candle-scan
+    /// reconciler) and `None` for trade-stream gaps; it rides on the
+    /// [`GapInfo`] so the scheduler routes candle gaps to its candle filler.
     pub async fn handle_gap(
         &self,
         exchange: String,
@@ -168,6 +172,7 @@ impl GapIntegrationManager {
         start_time: DateTime<Utc>,
         end_time: DateTime<Utc>,
         estimated_trades: u64,
+        interval: Option<String>,
     ) {
         // Record gap detection
         GAPS_DETECTED.with_label_values(&[&exchange, &symbol]).inc();
@@ -181,6 +186,7 @@ impl GapIntegrationManager {
             start_time,
             end_time,
             estimated_trades,
+            interval,
         };
 
         // Check if we should process this gap
@@ -246,6 +252,7 @@ impl GapIntegrationManager {
         &self,
         exchange: &str,
         symbol: &str,
+        interval: &str,
         timestamps_ms: &[i64],
         interval_ms: i64,
         plan: &ReconcilePlan,
@@ -270,6 +277,7 @@ impl GapIntegrationManager {
                 start_time,
                 end_time,
                 estimated_trades,
+                Some(interval.to_string()),
             )
             .await;
         }
@@ -529,6 +537,7 @@ mod tests {
                 now - Duration::seconds(5), // Only 5 seconds
                 now,
                 50, // Only 50 trades
+                None,
             )
             .await;
 
@@ -556,6 +565,7 @@ mod tests {
                 now - Duration::minutes(60),
                 now,
                 100_000, // Too many trades
+                None,
             )
             .await;
 
@@ -579,6 +589,7 @@ mod tests {
                 now - Duration::minutes(10),
                 now,
                 1000,
+                None,
             )
             .await;
 
@@ -609,6 +620,7 @@ mod tests {
                 start,
                 end,
                 1000,
+                None,
             )
             .await;
 
@@ -619,6 +631,7 @@ mod tests {
                 start,
                 end,
                 1000,
+                None,
             )
             .await;
 
@@ -649,6 +662,7 @@ mod tests {
                 now - Duration::minutes(10),
                 now,
                 1000,
+                None,
             )
             .await;
 
@@ -714,6 +728,7 @@ mod tests {
             .handle_candle_scan(
                 "binance",
                 "BTCUSD",
+                "1m",
                 &timestamps,
                 min_ms,
                 &ReconcilePlan::default(),
@@ -724,5 +739,35 @@ mod tests {
         let stats = manager.get_stats().await;
         assert_eq!(stats.submitted, 1);
         assert_eq!(scheduler.queue_size().await, 1);
+    }
+
+    /// The same wall-clock window tagged with different candle intervals is
+    /// two distinct gaps (gap ids include the interval), while re-submitting
+    /// with the same interval is a dedup hit.
+    #[tokio::test]
+    async fn test_interval_participates_in_dedup() {
+        let scheduler = create_test_scheduler();
+        let manager =
+            GapIntegrationManager::new(GapIntegrationConfig::default(), scheduler.clone());
+
+        let now = Utc::now();
+        let start = now - Duration::minutes(10);
+        for interval in [Some("1m"), Some("5m"), Some("1m")] {
+            manager
+                .handle_gap(
+                    "binance".to_string(),
+                    "BTCUSD".to_string(),
+                    start,
+                    now,
+                    1000,
+                    interval.map(str::to_string),
+                )
+                .await;
+        }
+
+        let stats = manager.get_stats().await;
+        assert_eq!(stats.submitted, 2, "1m and 5m are distinct gaps");
+        assert_eq!(stats.duplicates, 1, "second 1m submission is a dup");
+        assert_eq!(scheduler.queue_size().await, 2);
     }
 }

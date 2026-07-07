@@ -71,7 +71,7 @@ pub trait CandleTimestampSource: Send + Sync {
 /// Convert a timeframe string (`"1m"`, `"15m"`, `"1h"`, `"4h"`, `"1d"`, `"1w"`)
 /// to its width in milliseconds. Returns `None` for an unparseable or
 /// unsupported unit (e.g. `"1M"` months, which is not a fixed grid). Pure.
-fn timeframe_to_ms(tf: &str) -> Option<i64> {
+pub fn timeframe_to_ms(tf: &str) -> Option<i64> {
     let tf = tf.trim();
     let split = tf.find(|c: char| c.is_ascii_alphabetic())?;
     if split == 0 {
@@ -225,6 +225,7 @@ pub async fn run_scan_once<S: CandleTimestampSource>(
                     .handle_candle_scan(
                         &config.exchange,
                         symbol,
+                        &config.interval,
                         &timestamps,
                         interval_ms,
                         &config.plan,
@@ -298,6 +299,12 @@ impl QuestDbCandleSource {
     pub fn from_env() -> Self {
         let http_url =
             std::env::var("QUESTDB_HTTP_URL").unwrap_or_else(|_| "http://questdb:9000".to_string());
+        Self::with_url(http_url)
+    }
+
+    /// Build against an explicit QuestDB HTTP endpoint (e.g. derived from the
+    /// unified binary's `JanusState` config rather than the env default).
+    pub fn with_url(http_url: String) -> Self {
         Self {
             http_url,
             client: reqwest::Client::new(),

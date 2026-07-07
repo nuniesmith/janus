@@ -12,6 +12,7 @@ pub mod lock;
 pub mod scheduler;
 pub mod signal_backtest;
 pub mod throttle;
+pub mod unified;
 
 pub use candle_scan::{
     CandleScanConfig, CandleTimestampSource, QuestDbCandleSource, ScanReport, run_scan_once,
@@ -28,4 +29,8 @@ pub use signal_backtest::{BacktestConfig, BacktestResults, SignalBacktest, Signa
 pub use throttle::{
     BackfillThrottle, DiskUsage, ThrottleConfig, ThrottleError, calculate_batches, get_disk_usage,
     should_batch,
+};
+pub use unified::{
+    CandleRangeBackfiller, DeepBackfillConfig, UnifiedBackfillParams, make_candle_gap_filler,
+    run_deep_backfill, spawn_backfill_and_scan,
 };

@@ -29,6 +29,16 @@
 //! | `DATA_RECONNECT_DELAY_SECS` | `5` | Delay between reconnection attempts |
 //! | `DATA_MAX_RECONNECT_ATTEMPTS` | `50` | Max consecutive reconnect failures |
 //! | `DATA_HEALTH_POLL_SECS` | `10` | Health reporter tick interval |
+//! | `DATA_PERSIST_CANDLES` | `true` | Write closed klines (and backfill) to QuestDB |
+//! | `JANUS_BACKFILL_DAYS` | `30` | One-shot deep backfill depth in days (`0` = off) |
+//! | `JANUS_CANDLE_SCAN` | on | Periodic candle gap scan/repair (`0` = off; standalone binary keeps its opt-in default) |
+//! | `QUESTDB_HTTP_URL` | from config | QuestDB HTTP endpoint for coverage/scan reads |
+//!
+//! The `JANUS_CANDLE_SCAN_*` tuning knobs (symbols, interval, lookback,
+//! cadence, window caps) from the standalone data binary are honoured
+//! unchanged; unset ones default to the live config (symbols/exchange) and
+//! one scan loop per `DATA_KLINE_INTERVALS` entry. See
+//! [`backfill::unified`].
 
 pub mod actors;
 pub mod backfill;
@@ -566,6 +576,40 @@ async fn run_live_mode(state: Arc<janus_core::JanusState>) -> janus_core::Result
         tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
     }
 
+    // ── Historical backfill + gap scan (roadmap P1) ──────────────────
+    // With live ingestion up, run the one-shot deep backfill
+    // (`JANUS_BACKFILL_DAYS`, default 30, 0 = off) and then the periodic
+    // candle-scan → scheduler loop (`JANUS_CANDLE_SCAN`, default ON here).
+    // Everything runs in its own tasks; errors are logged and counted on
+    // the backfill metrics, never propagated into the WS ingestion path.
+    // Gated on the same switch as the live sink: with persistence off there
+    // is no candle store to deepen.
+    let backfill_handle = if candle_sink::persist_enabled() {
+        let symbols: Vec<String> = config
+            .assets
+            .iter()
+            .map(|a| format!("{}{}", a.to_uppercase(), config.quote.to_uppercase()))
+            .collect();
+        let questdb_http_url = std::env::var("QUESTDB_HTTP_URL").unwrap_or_else(|_| {
+            format!(
+                "http://{}:{}",
+                state.config.questdb.host, state.config.questdb.http_port
+            )
+        });
+        backfill::unified::spawn_backfill_and_scan(backfill::unified::UnifiedBackfillParams {
+            exchange: config.exchange.clone(),
+            symbols,
+            intervals: config.kline_intervals.clone(),
+            questdb_host: state.config.questdb.host.clone(),
+            ilp_port: state.config.questdb.ilp_port,
+            questdb_http_url,
+            redis_url: state.config.redis.url.clone(),
+        })
+    } else {
+        info!("Backfill: skipped (DATA_PERSIST_CANDLES=false — no candle store)");
+        None
+    };
+
     // ── Health reporter ──────────────────────────────────────────────
     let state_health = state.clone();
     let stats_health = stats.clone();
@@ -673,9 +717,13 @@ async fn run_live_mode(state: Arc<janus_core::JanusState>) -> janus_core::Result
 
     info!("Data module shutting down (live mode)...");
 
-    // Cancel all tasks
+    // Cancel all tasks. (The backfill orchestrator's inner scan/scheduler
+    // tasks are detached fire-and-forget loops — the process is exiting.)
     health_handle.abort();
     if let Some(handle) = candle_sink_handle {
+        handle.abort();
+    }
+    if let Some(handle) = backfill_handle {
         handle.abort();
     }
     for handle in task_handles {

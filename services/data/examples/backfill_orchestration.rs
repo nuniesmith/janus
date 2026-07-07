@@ -168,7 +168,14 @@ async fn main() -> Result<()> {
         );
 
         gap_manager
-            .handle_gap(exchange.to_string(), symbol.to_string(), start, end, trades)
+            .handle_gap(
+                exchange.to_string(),
+                symbol.to_string(),
+                start,
+                end,
+                trades,
+                None,
+            )
             .await;
     }
 
@@ -217,6 +224,7 @@ async fn main() -> Result<()> {
         start_time: now - Duration::minutes(20),
         end_time: now - Duration::minutes(10),
         estimated_trades: 800,
+        interval: None,
     };
     scheduler.submit_gap(manual_gap).await;
     info!("   ✅ Manually submitted ADA gap");

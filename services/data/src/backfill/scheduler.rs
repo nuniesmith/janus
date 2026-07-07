@@ -78,6 +78,7 @@
 //!     start_time: chrono::Utc::now() - chrono::Duration::hours(1),
 //!     end_time: chrono::Utc::now(),
 //!     estimated_trades: 5000,
+//!     interval: None,
 //! };
 //! scheduler.submit_gap(gap).await;
 //!
@@ -185,6 +186,13 @@ pub struct GapInfo {
 
     /// Estimated number of trades in the gap
     pub estimated_trades: u64,
+
+    /// Candle interval (timeframe string, e.g. `"1m"`) when this gap is a
+    /// *candle* gap detected by the candle-scan reconciler. `None` for
+    /// trade-stream gaps. Candle gaps are routed to the scheduler's
+    /// [`CandleGapFiller`] instead of the trade-fetch path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval: Option<String>,
 }
 
 impl GapInfo {
@@ -199,14 +207,27 @@ impl GapInfo {
     }
 
     /// Get unique identifier for this gap (for locking)
+    ///
+    /// Candle gaps include their interval so the same wall-clock window on
+    /// two different candle grids never dedupes or locks as one gap.
     pub fn gap_id(&self) -> String {
-        format!(
-            "{}:{}:{}-{}",
-            self.exchange,
-            self.symbol,
-            self.start_time.timestamp(),
-            self.end_time.timestamp()
-        )
+        match &self.interval {
+            Some(interval) => format!(
+                "{}:{}:{}:{}-{}",
+                self.exchange,
+                self.symbol,
+                interval,
+                self.start_time.timestamp(),
+                self.end_time.timestamp()
+            ),
+            None => format!(
+                "{}:{}:{}-{}",
+                self.exchange,
+                self.symbol,
+                self.start_time.timestamp(),
+                self.end_time.timestamp()
+            ),
+        }
     }
 }
 
@@ -285,6 +306,16 @@ impl Eq for ScheduledGap {}
 // Backfill Scheduler
 // ============================================================================
 
+/// Boxed future returned by a [`CandleGapFiller`]: number of candles written.
+pub type CandleGapFillFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64>> + Send>>;
+
+/// Callback that fills one *candle* gap (a [`GapInfo`] whose `interval` is
+/// set): fetch the missing klines and persist them. Installed with
+/// [`BackfillScheduler::with_candle_filler`]; without one, candle gaps fall
+/// through to the trade-fetch path (which cannot persist candles) and fail.
+pub type CandleGapFiller = Arc<dyn Fn(GapInfo) -> CandleGapFillFuture + Send + Sync>;
+
 /// Automatic backfill scheduler with priority queue
 pub struct BackfillScheduler {
     /// Configuration
@@ -298,6 +329,9 @@ pub struct BackfillScheduler {
 
     /// Lock for distributed coordination
     lock: Arc<BackfillLock>,
+
+    /// Filler for candle gaps (gaps carrying an `interval`).
+    candle_filler: Option<CandleGapFiller>,
 
     /// Notification for new gaps added
     notify: Arc<Notify>,
@@ -318,9 +352,17 @@ impl BackfillScheduler {
             queue: Arc::new(Mutex::new(BinaryHeap::new())),
             throttle,
             lock,
+            candle_filler: None,
             notify: Arc::new(Notify::new()),
             shutdown: Arc::new(Mutex::new(false)),
         }
+    }
+
+    /// Install the candle-gap filler that candle gaps (those with an
+    /// `interval`) are routed to instead of the trade-fetch path.
+    pub fn with_candle_filler(mut self, filler: CandleGapFiller) -> Self {
+        self.candle_filler = Some(filler);
+        self
     }
 
     /// Submit a gap for backfilling
@@ -573,12 +615,36 @@ impl BackfillScheduler {
 
     /// Execute the actual backfill for a detected gap.
     ///
-    /// Pipeline:
+    /// Candle gaps (a set `interval`) are routed to the installed
+    /// [`CandleGapFiller`], which fetches the missing klines and persists
+    /// them to the candle store. Trade gaps run the trade pipeline:
     /// 1. Fetch historical trades from the exchange REST API in pages
     /// 2. Validate and deduplicate against existing data
     /// 3. Write validated trades to QuestDB via ILP
     /// 4. Verify the gap has been filled
     async fn execute_backfill(&self, gap: &GapInfo) -> Result<()> {
+        if let Some(interval) = &gap.interval {
+            let Some(filler) = &self.candle_filler else {
+                anyhow::bail!(
+                    "candle gap ({}:{} {}) but no candle filler installed",
+                    gap.exchange,
+                    gap.symbol,
+                    interval
+                );
+            };
+            let written = filler(gap.clone()).await?;
+            info!(
+                exchange = %gap.exchange,
+                symbol = %gap.symbol,
+                interval = %interval,
+                start = %gap.start_time,
+                end = %gap.end_time,
+                written,
+                "Candle gap backfill completed"
+            );
+            return Ok(());
+        }
+
         info!(
             exchange = %gap.exchange,
             symbol = %gap.symbol,
@@ -1100,7 +1166,40 @@ mod tests {
             start_time: now - chrono::Duration::minutes(age_mins + 10),
             end_time: now - chrono::Duration::minutes(age_mins),
             estimated_trades: trades,
+            interval: None,
         }
+    }
+
+    #[test]
+    fn test_gap_id_includes_interval_for_candle_gaps() {
+        let trade_gap = create_test_gap("binance", "BTCUSDT", 5, 1000);
+        let candle_gap = GapInfo {
+            interval: Some("1m".to_string()),
+            ..trade_gap.clone()
+        };
+        let candle_gap_5m = GapInfo {
+            interval: Some("5m".to_string()),
+            ..trade_gap.clone()
+        };
+
+        // Same window on different grids must never share an id (dedup/lock).
+        assert_ne!(candle_gap.gap_id(), trade_gap.gap_id());
+        assert_ne!(candle_gap.gap_id(), candle_gap_5m.gap_id());
+        assert!(candle_gap.gap_id().contains(":1m:"));
+    }
+
+    #[test]
+    fn test_gap_info_deserializes_without_interval() {
+        // Pre-P1 serialized gaps have no `interval` field; must still load.
+        let json = r#"{
+            "exchange": "binance",
+            "symbol": "BTCUSDT",
+            "start_time": "2026-01-01T00:00:00Z",
+            "end_time": "2026-01-01T01:00:00Z",
+            "estimated_trades": 100
+        }"#;
+        let gap: GapInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(gap.interval, None);
     }
 
     #[test]
