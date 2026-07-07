@@ -297,8 +297,31 @@ impl BackfillThrottle {
             }
         }
 
-        // Perform actual disk check
-        let usage = get_disk_usage(&self.config.questdb_data_dir).await?;
+        // Perform actual disk check. FAIL OPEN: janus runs in a separate
+        // container from QuestDB, so its data dir (default /var/lib/questdb)
+        // is usually not visible here — statting it hard-errors. A missing
+        // dir must NOT fail every backfill (it did: deep backfill + every gap
+        // fill returned DiskCheckFailed, 100% failure tripping the alert).
+        // When the dir isn't statable we proceed ungated (0% usage) and warn;
+        // mount the volume + set JANUS_QUESTDB_DATA_DIR to re-enable the gate.
+        let usage = match get_disk_usage(&self.config.questdb_data_dir).await {
+            Ok(u) => u,
+            Err(e) => {
+                warn!(
+                    path = %self.config.questdb_data_dir,
+                    error = %e,
+                    "Disk gate failing OPEN — QuestDB data dir not statable from \
+                     this process (separate container?); backfills proceed ungated. \
+                     Mount the volume and set JANUS_QUESTDB_DATA_DIR to re-enable."
+                );
+                DiskUsage {
+                    total: 0,
+                    used: 0,
+                    available: 0,
+                    usage_percent: 0.0,
+                }
+            }
+        };
 
         // Update cache
         {
