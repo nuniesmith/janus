@@ -499,6 +499,48 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
         })
     };
 
+    // Backward HTTP API (health + /api/v1/experiences/sample for the UMAP
+    // view — EXPERIENCE_PIPELINE.md §8). The unified binary never calls
+    // BackwardService::start(), so like the intake worker this is served
+    // from here. Port = janus http + 200 (8280 with the default 8080).
+    // Fire-and-forget: the server lives for the process lifetime; a failed
+    // store just degrades the sample endpoint to empty.
+    {
+        let http_port = state.config.ports.http + 200;
+        let store = match tokio::time::timeout(
+            tokio::time::Duration::from_secs(30),
+            crate::persistence::ExperienceStore::new(
+                crate::persistence::experience_store::ExperienceStoreConfig::from_env(),
+            ),
+        )
+        .await
+        {
+            Ok(Ok(s)) => Some(std::sync::Arc::new(s)),
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    "experience sample store unavailable ({e:#}) — /experiences/sample serves empty"
+                );
+                None
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "experience sample store connect timed out — /experiences/sample serves empty"
+                );
+                None
+            }
+        };
+        let http_state = http::HttpState::with_store(store);
+        tokio::spawn(async move {
+            if let Err(e) = http::start_http_server(http_port, http_state).await {
+                tracing::warn!("backward HTTP server exited: {e:#}");
+            }
+        });
+        info!(
+            port = http_port,
+            "backward HTTP API serving (experiences sample)"
+        );
+    }
+
     // Subscribe to signals from signal bus
     let mut signal_rx = state.signal_bus.subscribe();
     let signal_repo = service.signal_repository();
