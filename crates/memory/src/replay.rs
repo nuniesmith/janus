@@ -103,6 +103,24 @@ impl SumTree {
         self.size
     }
 
+    /// Read-only view of the most recently written experiences, returned in
+    /// insertion order (oldest-first, newest-last).
+    ///
+    /// Returns at most `min(n, len())` items and correctly honours the ring
+    /// wrap once the buffer is full. Used to greedily evaluate a freshly
+    /// trained model on a recent slice of the buffer.
+    pub fn recent(&self, n: usize) -> Vec<&Experience> {
+        let take = n.min(self.size);
+        let mut out = Vec::with_capacity(take);
+        // Walk from the oldest of the last `take` writes to the newest,
+        // mapping each position through the ring so wraparound is respected.
+        for i in (0..take).rev() {
+            let idx = (self.write_index + self.capacity - 1 - i) % self.capacity;
+            out.push(&self.data[idx]);
+        }
+        out
+    }
+
     /// Check if empty
     pub fn is_empty(&self) -> bool {
         self.size == 0
@@ -175,5 +193,43 @@ mod tests {
         }
         let samples = tree.sample(5).unwrap();
         assert_eq!(samples.len(), 5);
+    }
+
+    /// Build an experience whose `reward` encodes its identity, so `recent`
+    /// ordering can be asserted precisely.
+    fn exp_with_reward(reward: f32) -> Experience {
+        let mut exp = create_test_experience();
+        exp.reward = reward;
+        exp
+    }
+
+    #[test]
+    fn test_recent_returns_newest_last_no_wrap() {
+        let mut tree = SumTree::new(100, 0.6, 0.4);
+        for r in 0..5 {
+            tree.add(exp_with_reward(r as f32), 1.0);
+        }
+        // Oldest-first, newest-last over the last 3 writes.
+        let last3: Vec<f32> = tree.recent(3).iter().map(|e| e.reward).collect();
+        assert_eq!(last3, vec![2.0, 3.0, 4.0]);
+        // Requesting more than present clamps to size.
+        assert_eq!(tree.recent(100).len(), 5);
+        // Zero-length slice is empty.
+        assert!(tree.recent(0).is_empty());
+    }
+
+    #[test]
+    fn test_recent_honours_ring_wrap() {
+        // Capacity 3, six writes → the buffer holds only the last three
+        // (rewards 3, 4, 5) and `recent` must return them in insertion order.
+        let mut tree = SumTree::new(3, 0.6, 0.4);
+        for r in 0..6 {
+            tree.add(exp_with_reward(r as f32), 1.0);
+        }
+        assert_eq!(tree.len(), 3);
+        let all: Vec<f32> = tree.recent(3).iter().map(|e| e.reward).collect();
+        assert_eq!(all, vec![3.0, 4.0, 5.0]);
+        let last2: Vec<f32> = tree.recent(2).iter().map(|e| e.reward).collect();
+        assert_eq!(last2, vec![4.0, 5.0]);
     }
 }
