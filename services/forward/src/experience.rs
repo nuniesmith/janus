@@ -231,8 +231,11 @@ impl RewardConfig {
         let vol_norm = std::env::var("JANUS_EXPERIENCE_REWARD_VOL_NORM")
             .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
             .unwrap_or(true);
-        let vol_floor =
-            parse::<f64>("JANUS_EXPERIENCE_REWARD_VOL_FLOOR", 1e-4).max(f64::MIN_POSITIVE);
+        // Clamp to a *real* floor (1e-8), not f64::MIN_POSITIVE (~2e-308): the
+        // latter is effectively zero, so a `VOL_FLOOR=0` config + a flat window
+        // (σ=0) would divide the reward by ~0 and yield ±inf, corrupting the
+        // training signal. 1e-8 keeps the normaliser finite for any input.
+        let vol_floor = parse::<f64>("JANUS_EXPERIENCE_REWARD_VOL_FLOOR", 1e-4).max(1e-8);
         Self {
             horizon,
             fee,
@@ -295,7 +298,11 @@ fn compute_reward(
         let sigma_h = sigma1.unwrap_or(0.0).max(cfg.vol_floor) * n.sqrt();
         r /= sigma_h;
     }
-    r as f32
+    // Final safety net: a degenerate config/input must never inject a non-finite
+    // reward into the replay buffer (the DQN reads it straight into its TD
+    // target). Fall back to a neutral 0.0.
+    let out = r as f32;
+    if out.is_finite() { out } else { 0.0 }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1143,6 +1150,26 @@ mod tests {
         let expected = ((110.0f64 / 100.0).ln() / 0.01) as f32;
         assert!(r.is_finite());
         assert!((r - expected).abs() < 1e-4);
+    }
+
+    #[test]
+    fn degenerate_vol_floor_never_yields_non_finite_reward() {
+        // A pathological config (near-zero floor) + a flat window must NOT inject
+        // ±inf/NaN into the replay buffer — the finite guard falls back to 0.0.
+        let cfg = RewardConfig {
+            horizon: 1,
+            fee: 0.0,
+            vol_norm: true,
+            vol_floor: 0.0, // as if an operator set VOL_FLOOR=0
+        };
+        let r = compute_reward(SignalType::Buy, 100.0, 110.0, 1, Some(0.0), &cfg);
+        assert!(r.is_finite(), "reward must stay finite, got {r}");
+        // Also verify from_env clamps to a real floor (>= 1e-8), never ~0.
+        let parsed = RewardConfig::from_env();
+        assert!(
+            parsed.vol_floor >= 1e-8,
+            "vol_floor must clamp to a real floor"
+        );
     }
 
     #[test]
