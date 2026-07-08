@@ -2,4 +2,5 @@
 
 pub mod ingest;
 pub mod intake;
+pub mod promote;
 pub mod train;
