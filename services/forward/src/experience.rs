@@ -231,8 +231,8 @@ impl RewardConfig {
         let vol_norm = std::env::var("JANUS_EXPERIENCE_REWARD_VOL_NORM")
             .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
             .unwrap_or(true);
-        let vol_floor = parse::<f64>("JANUS_EXPERIENCE_REWARD_VOL_FLOOR", 1e-4)
-            .max(f64::MIN_POSITIVE);
+        let vol_floor =
+            parse::<f64>("JANUS_EXPERIENCE_REWARD_VOL_FLOOR", 1e-4).max(f64::MIN_POSITIVE);
         Self {
             horizon,
             fee,
@@ -534,15 +534,18 @@ impl ExperienceRecorder {
 
         // Arm the new decision once warm.
         if !gaf_now.is_empty() {
-            self.pending.entry(key.to_string()).or_default().push_back(Pending {
-                close_time_ms,
-                close,
-                state_gaf: gaf_now,
-                interval: interval.to_string(),
-                ctx,
-                symbol: symbol.to_string(),
-                bars_elapsed: 0,
-            });
+            self.pending
+                .entry(key.to_string())
+                .or_default()
+                .push_back(Pending {
+                    close_time_ms,
+                    close,
+                    state_gaf: gaf_now,
+                    interval: interval.to_string(),
+                    ctx,
+                    symbol: symbol.to_string(),
+                    bars_elapsed: 0,
+                });
         }
     }
 }
@@ -1103,7 +1106,10 @@ mod tests {
         let buy = compute_reward(SignalType::Buy, 100.0, 110.0, 1, None, &cfg);
         assert!((buy - ((110.0f64 / 100.0).ln() - 0.001) as f32).abs() < 1e-6);
         // Hold pays no fee and earns nothing.
-        assert_eq!(compute_reward(SignalType::Hold, 100.0, 110.0, 1, None, &cfg), 0.0);
+        assert_eq!(
+            compute_reward(SignalType::Hold, 100.0, 110.0, 1, None, &cfg),
+            0.0
+        );
         // A losing Sell still pays the fee (fee is a cost, not a sign flip).
         let sell = compute_reward(SignalType::Sell, 100.0, 110.0, 1, None, &cfg);
         assert!(sell < 0.0);
@@ -1151,14 +1157,28 @@ mod tests {
         let t = warm(&mut rec, "K:1m", GAF_WINDOW, 0);
         while rx.try_recv().is_ok() {} // drain warmup completions
         // Buy at close=100, then three more bars up to 130.
-        rec.observe("K:1m", "BTCUSDT", "1m", t, 100.0, DecisionCtx {
-            action: SignalType::Buy,
-            confidence: 0.9,
-            blocked: None,
-            regime: None,
-        });
+        rec.observe(
+            "K:1m",
+            "BTCUSDT",
+            "1m",
+            t,
+            100.0,
+            DecisionCtx {
+                action: SignalType::Buy,
+                confidence: 0.9,
+                blocked: None,
+                regime: None,
+            },
+        );
         for (i, px) in [110.0, 120.0, 130.0].into_iter().enumerate() {
-            rec.observe("K:1m", "BTCUSDT", "1m", t + (i as i64 + 1) * MIN, px, DecisionCtx::hold(None));
+            rec.observe(
+                "K:1m",
+                "BTCUSDT",
+                "1m",
+                t + (i as i64 + 1) * MIN,
+                px,
+                DecisionCtx::hold(None),
+            );
         }
         // Find the Buy row (the one non-Hold decision).
         let mut buy = None;
@@ -1174,7 +1194,10 @@ mod tests {
             row.reward
         );
         assert_eq!(row.timestamp_ms, t, "reward attributed to the decision bar");
-        assert!(!row.done, "natural horizon completion is not an episode end");
+        assert!(
+            !row.done,
+            "natural horizon completion is not an episode end"
+        );
     }
 
     #[test]
@@ -1191,11 +1214,21 @@ mod tests {
         while rx.try_recv().is_ok() {}
         // Drive 6 more warm bars; after the horizon fills, expect ~one row each.
         for i in 0..6 {
-            rec.observe("K:1m", "BTCUSDT", "1m", t, 100.0 + i as f64, DecisionCtx::hold(None));
+            rec.observe(
+                "K:1m",
+                "BTCUSDT",
+                "1m",
+                t,
+                100.0 + i as f64,
+                DecisionCtx::hold(None),
+            );
             t += MIN;
         }
         let count = std::iter::from_fn(|| rx.try_recv().ok()).count();
-        assert!(count >= 4, "steady-state emits ~one row per bar, got {count}");
+        assert!(
+            count >= 4,
+            "steady-state emits ~one row per bar, got {count}"
+        );
     }
 
     #[test]
@@ -1210,14 +1243,31 @@ mod tests {
         while rx.try_recv().is_ok() {}
         // Arm two decisions one bar apart, both still inside the 5-bar horizon.
         rec.observe("K:1m", "BTCUSDT", "1m", t, 100.0, DecisionCtx::hold(None));
-        rec.observe("K:1m", "BTCUSDT", "1m", t + MIN, 101.0, DecisionCtx::hold(None));
+        rec.observe(
+            "K:1m",
+            "BTCUSDT",
+            "1m",
+            t + MIN,
+            101.0,
+            DecisionCtx::hold(None),
+        );
         while rx.try_recv().is_ok() {}
         // A 6-minute gap (> done floor, < drop factor) ends the episode: both
         // open decisions realize with done = true even though horizon < 5.
-        rec.observe("K:1m", "BTCUSDT", "1m", t + 7 * MIN, 102.0, DecisionCtx::hold(None));
+        rec.observe(
+            "K:1m",
+            "BTCUSDT",
+            "1m",
+            t + 7 * MIN,
+            102.0,
+            DecisionCtx::hold(None),
+        );
         let rows: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         assert!(!rows.is_empty(), "episode boundary flushes open decisions");
-        assert!(rows.iter().all(|r| r.done), "all flushed rows are episode ends");
+        assert!(
+            rows.iter().all(|r| r.done),
+            "all flushed rows are episode ends"
+        );
     }
 
     #[tokio::test]
