@@ -173,6 +173,132 @@ impl ExperienceConfig {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Reward scheme (Phase 2.5)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// How the per-decision reward is computed (design §7 Phase-2 point 4, the
+/// writer-side "honest upgrade"). Phase-1 used a single-bar log return; this
+/// makes it a **multi-bar holding return, fee-aware and volatility-normalized**
+/// — the reward a trade held for `horizon` bars would realize, risk-adjusted so
+/// magnitudes are comparable across regimes/symbols (the DQN reads `reward`
+/// directly into its TD target, so scale matters).
+///
+/// [`RewardConfig::legacy`] reproduces the exact Phase-1 single-bar return
+/// (horizon 1, no fee, no normalization) and is what [`ExperienceRecorder::new`]
+/// uses — keeping the frozen behavior for callers/tests that want it. Production
+/// wires [`RewardConfig::from_env`], whose defaults turn the upgrade ON.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RewardConfig {
+    /// Bars a decision is "held" before its reward is realized (≥ 1). The
+    /// reward is the signed log return from the decision close to the close
+    /// `horizon` bars later. `1` = the Phase-1 next-bar return.
+    pub horizon: usize,
+    /// Round-trip fee as a fraction of notional (e.g. `0.0004` = 4 bps),
+    /// subtracted from every non-Hold reward as a fixed cost — so Buy/Sell are
+    /// not friction-free. Hold pays nothing.
+    pub fee: f64,
+    /// Divide the (fee-adjusted) return by a rolling volatility estimate so
+    /// rewards are ~unit-scale and comparable across regimes. Off = raw return.
+    pub vol_norm: bool,
+    /// Volatility floor (per-bar σ) so a flat window can't blow the reward up.
+    pub vol_floor: f64,
+}
+
+impl RewardConfig {
+    /// The frozen Phase-1 scheme: single-bar signed log return, no fee, no
+    /// normalization. Bit-for-bit compatible with the original recorder.
+    pub const fn legacy() -> Self {
+        Self {
+            horizon: 1,
+            fee: 0.0,
+            vol_norm: false,
+            vol_floor: 1e-4,
+        }
+    }
+
+    /// Production scheme from the environment. Defaults turn Phase 2.5 ON:
+    /// a 5-bar horizon, volatility-normalized, no fee (operator opts into a
+    /// fee that matches the venue). All values clamp to safe ranges.
+    pub fn from_env() -> Self {
+        fn parse<T: std::str::FromStr>(key: &str, default: T) -> T {
+            std::env::var(key)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default)
+        }
+        let horizon = parse::<usize>("JANUS_EXPERIENCE_REWARD_HORIZON", 5).max(1);
+        let fee = parse::<f64>("JANUS_EXPERIENCE_REWARD_FEE_BPS", 0.0).max(0.0) / 10_000.0;
+        let vol_norm = std::env::var("JANUS_EXPERIENCE_REWARD_VOL_NORM")
+            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+            .unwrap_or(true);
+        let vol_floor = parse::<f64>("JANUS_EXPERIENCE_REWARD_VOL_FLOOR", 1e-4)
+            .max(f64::MIN_POSITIVE);
+        Self {
+            horizon,
+            fee,
+            vol_norm,
+            vol_floor,
+        }
+    }
+}
+
+impl Default for RewardConfig {
+    fn default() -> Self {
+        Self::legacy()
+    }
+}
+
+/// Sample standard deviation of the one-bar log returns of `closes` (the σ used
+/// to risk-normalize rewards). Returns `None` with < 2 usable returns.
+fn rolling_sigma(closes: &VecDeque<f32>) -> Option<f64> {
+    if closes.len() < 3 {
+        return None;
+    }
+    let rets: Vec<f64> = closes
+        .iter()
+        .zip(closes.iter().skip(1))
+        .filter_map(|(a, b)| {
+            let (a, b) = (*a as f64, *b as f64);
+            (a > 0.0 && b > 0.0).then(|| (b / a).ln())
+        })
+        .collect();
+    if rets.len() < 2 {
+        return None;
+    }
+    let mean = rets.iter().sum::<f64>() / rets.len() as f64;
+    let var = rets.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / (rets.len() - 1) as f64;
+    Some(var.sqrt())
+}
+
+/// Compute a completed decision's reward under `cfg`. `bars_held` is how many
+/// bars actually elapsed (≤ horizon; less only when an episode boundary closes
+/// the position early), used to scale the volatility normalizer (σ over N bars
+/// ≈ σ₁ × √N). `sigma1` is the per-bar σ from [`rolling_sigma`].
+fn compute_reward(
+    action: janus_core::SignalType,
+    entry_close: f64,
+    exit_close: f64,
+    bars_held: usize,
+    sigma1: Option<f64>,
+    cfg: &RewardConfig,
+) -> f32 {
+    let dir = match action {
+        janus_core::SignalType::Buy => 1.0_f64,
+        janus_core::SignalType::Sell => -1.0_f64,
+        _ => return 0.0, // Hold (and anything non-directional) earns nothing.
+    };
+    let mut r = dir * (exit_close / entry_close).ln();
+    // Round-trip fee is a fixed cost on any directional action.
+    r -= cfg.fee;
+    if cfg.vol_norm {
+        let n = bars_held.max(1) as f64;
+        let sigma_h = sigma1.unwrap_or(0.0).max(cfg.vol_floor) * n.sqrt();
+        r /= sigma_h;
+    }
+    r as f32
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Records
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -229,8 +355,9 @@ struct Pending {
     state_gaf: Vec<f32>,
     ctx: DecisionCtx,
     interval: String,
-    interval_secs: i64,
     symbol: String,
+    /// Bars elapsed since this decision was armed. Realized at `horizon`.
+    bars_elapsed: usize,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -262,29 +389,50 @@ pub fn interval_secs(interval: &str) -> i64 {
     }
 }
 
-/// Per-`SYMBOL:interval` close windows + pending-decision slots. Owned by
+/// Per-`SYMBOL:interval` close windows + pending-decision queues. Owned by
 /// the live-loop task; all methods are synchronous and allocation-light.
+///
+/// With `reward.horizon > 1`, up to `horizon` decisions per key are in flight
+/// at once (each realizes `horizon` bars after it was armed), so the queue is
+/// a `VecDeque` — one completed row is still emitted per bar per key once the
+/// pipeline is past its initial horizon fill.
 pub struct ExperienceRecorder {
     windows: HashMap<String, VecDeque<f32>>,
-    pending: HashMap<String, Pending>,
+    pending: HashMap<String, VecDeque<Pending>>,
+    /// Last observed close time per key, for detecting stream gaps.
+    last_close_ms: HashMap<String, i64>,
     tx: mpsc::Sender<ExperienceRow>,
     scratch: Vec<f32>,
+    reward: RewardConfig,
 }
 
 impl ExperienceRecorder {
+    /// Recorder with the frozen Phase-1 reward (single-bar log return). Kept
+    /// for tests and any caller wanting the original behavior.
     pub fn new(tx: mpsc::Sender<ExperienceRow>) -> Self {
+        Self::with_reward(tx, RewardConfig::legacy())
+    }
+
+    /// Recorder with an explicit reward scheme (Phase 2.5). Production passes
+    /// [`RewardConfig::from_env`].
+    pub fn with_reward(tx: mpsc::Sender<ExperienceRow>, reward: RewardConfig) -> Self {
         Self {
             windows: HashMap::new(),
             pending: HashMap::new(),
+            last_close_ms: HashMap::new(),
             tx,
             scratch: Vec::with_capacity(GAF_WINDOW),
+            reward,
         }
     }
 
-    /// Observe one closed candle for `key` (= "SYMBOL:interval"). Completes
-    /// the previous pending decision for the key (reward = signed next-bar
-    /// log return, §3.3) and arms a new one with `ctx`, once the GAF window
-    /// is warm. Never blocks: the row is `try_send`-ed to the writer.
+    /// Observe one closed candle for `key` (= "SYMBOL:interval"). Advances the
+    /// pending decisions for the key: any that reached `reward.horizon` bars
+    /// realizes its reward (the fee-aware, vol-normalized holding return, §7),
+    /// and a fresh decision is armed with `ctx`, once the GAF window is warm.
+    /// A stream gap past the done floor closes all open decisions early
+    /// (`done = true`); a gap past the drop factor discards them. Never blocks:
+    /// rows are `try_send`-ed to the writer.
     #[allow(clippy::too_many_arguments)]
     pub fn observe(
         &mut self,
@@ -314,22 +462,53 @@ impl ExperienceRecorder {
         } else {
             Vec::new()
         };
+        // Per-bar σ for risk normalization (computed once, shared by every
+        // decision realized on this bar).
+        let sigma1 = rolling_sigma(window);
 
-        // Complete the previous pending decision, if any.
-        if let Some(p) = self.pending.remove(key) {
-            let dt_ms = close_time_ms.saturating_sub(p.close_time_ms);
-            let drop_ms = p.interval_secs.saturating_mul(PENDING_DROP_FACTOR) * 1000;
-            if dt_ms > drop_ms {
-                metrics().pending_gap_dropped.inc();
-            } else if !gaf_now.is_empty() {
-                let done_ms = (2 * p.interval_secs).max(PENDING_DONE_FLOOR_SECS) * 1000;
-                let done = dt_ms > done_ms;
-                let dir: f32 = match p.ctx.action {
-                    janus_core::SignalType::Buy => 1.0,
-                    janus_core::SignalType::Sell => -1.0,
-                    _ => 0.0,
-                };
-                let reward = dir * ((close / p.close).ln() as f32);
+        let ivl_secs = interval_secs(interval);
+        let prev_close_ms = self.last_close_ms.insert(key.to_string(), close_time_ms);
+        let step_gap_ms = prev_close_ms.map(|t| close_time_ms.saturating_sub(t));
+        let drop_ms = ivl_secs.saturating_mul(PENDING_DROP_FACTOR) * 1000;
+        let done_ms = (2 * ivl_secs).max(PENDING_DONE_FLOOR_SECS) * 1000;
+
+        let queue = self.pending.entry(key.to_string()).or_default();
+
+        // A large gap between consecutive closes breaks the holding window:
+        // drop everything in flight (the return across the gap is meaningless).
+        if step_gap_ms.is_some_and(|g| g > drop_ms) {
+            if !queue.is_empty() {
+                metrics().pending_gap_dropped.inc_by(queue.len() as u64);
+                queue.clear();
+            }
+        } else {
+            // A moderate gap is an episode boundary: realize every open
+            // decision now with done = true. Otherwise, realize only those
+            // that have reached the horizon (done = false, continuous).
+            let episode_end = step_gap_ms.is_some_and(|g| g > done_ms);
+            for p in queue.iter_mut() {
+                p.bars_elapsed += 1;
+            }
+            // Front of the queue is the oldest decision (largest bars_elapsed).
+            while let Some(front) = queue.front() {
+                let mature = front.bars_elapsed >= self.reward.horizon;
+                if !(episode_end || mature) {
+                    break;
+                }
+                // Once warm the window never goes cold; guard anyway — without a
+                // next-state we can't emit a valid transition, so drop it.
+                let Some(p) = queue.pop_front() else { break };
+                if gaf_now.is_empty() {
+                    continue;
+                }
+                let reward = compute_reward(
+                    p.ctx.action,
+                    p.close,
+                    close,
+                    p.bars_elapsed,
+                    sigma1,
+                    &self.reward,
+                );
                 let row = ExperienceRow {
                     state_gaf: p.state_gaf,
                     state_raw: None,
@@ -339,7 +518,7 @@ impl ExperienceRecorder {
                     reward,
                     next_state_gaf: gaf_now.clone(),
                     next_state_raw: None,
-                    done,
+                    done: episode_end,
                     timestamp_ms: p.close_time_ms,
                     interval: p.interval,
                     confidence: p.ctx.confidence,
@@ -351,24 +530,19 @@ impl ExperienceRecorder {
                     Err(_) => metrics().rows_dropped_channel.inc(),
                 }
             }
-            // If the window went cold (shouldn't happen once warm), the
-            // pending decision is silently superseded below.
         }
 
-        // Arm the new pending decision once warm.
+        // Arm the new decision once warm.
         if !gaf_now.is_empty() {
-            self.pending.insert(
-                key.to_string(),
-                Pending {
-                    close_time_ms,
-                    close,
-                    state_gaf: gaf_now,
-                    interval_secs: interval_secs(interval),
-                    interval: interval.to_string(),
-                    ctx,
-                    symbol: symbol.to_string(),
-                },
-            );
+            self.pending.entry(key.to_string()).or_default().push_back(Pending {
+                close_time_ms,
+                close,
+                state_gaf: gaf_now,
+                interval: interval.to_string(),
+                ctx,
+                symbol: symbol.to_string(),
+                bars_elapsed: 0,
+            });
         }
     }
 }
@@ -884,6 +1058,166 @@ mod tests {
             count += 1;
         }
         assert_eq!(count, 2, "one completed row per key");
+    }
+
+    // ── Phase 2.5 reward scheme ──────────────────────────────────────────────
+
+    fn recorder_with(cfg: RewardConfig) -> (ExperienceRecorder, mpsc::Receiver<ExperienceRow>) {
+        let (tx, rx) = mpsc::channel(256);
+        (ExperienceRecorder::with_reward(tx, cfg), rx)
+    }
+
+    #[test]
+    fn legacy_config_matches_frozen_phase1() {
+        // `new` must be exactly the legacy single-bar scheme.
+        let cfg = RewardConfig::legacy();
+        assert_eq!(cfg.horizon, 1);
+        assert_eq!(cfg.fee, 0.0);
+        assert!(!cfg.vol_norm);
+        // compute_reward under legacy == signed single-bar log return.
+        let r = compute_reward(SignalType::Buy, 100.0, 110.0, 1, Some(0.01), &cfg);
+        assert!((r - (110.0f64 / 100.0).ln() as f32).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rolling_sigma_of_known_series() {
+        // Flat series → zero σ.
+        let flat: VecDeque<f32> = std::iter::repeat_n(100.0, 8).collect();
+        assert_eq!(rolling_sigma(&flat), Some(0.0));
+        // Too few points → None.
+        let short: VecDeque<f32> = [100.0, 101.0].into_iter().collect();
+        assert_eq!(rolling_sigma(&short), None);
+        // A varying series → strictly positive σ.
+        let vary: VecDeque<f32> = [100.0, 102.0, 101.0, 104.0, 103.0].into_iter().collect();
+        assert!(rolling_sigma(&vary).unwrap() > 0.0);
+    }
+
+    #[test]
+    fn fee_is_subtracted_from_directional_reward_only() {
+        let cfg = RewardConfig {
+            horizon: 1,
+            fee: 0.001,
+            vol_norm: false,
+            vol_floor: 1e-4,
+        };
+        let buy = compute_reward(SignalType::Buy, 100.0, 110.0, 1, None, &cfg);
+        assert!((buy - ((110.0f64 / 100.0).ln() - 0.001) as f32).abs() < 1e-6);
+        // Hold pays no fee and earns nothing.
+        assert_eq!(compute_reward(SignalType::Hold, 100.0, 110.0, 1, None, &cfg), 0.0);
+        // A losing Sell still pays the fee (fee is a cost, not a sign flip).
+        let sell = compute_reward(SignalType::Sell, 100.0, 110.0, 1, None, &cfg);
+        assert!(sell < 0.0);
+        assert!((sell - (-(110.0f64 / 100.0).ln() - 0.001) as f32).abs() < 1e-6);
+    }
+
+    #[test]
+    fn vol_norm_divides_by_sigma_scaled_by_horizon() {
+        let cfg = RewardConfig {
+            horizon: 4,
+            fee: 0.0,
+            vol_norm: true,
+            vol_floor: 1e-6,
+        };
+        // sigma_h = 0.01 * sqrt(4) = 0.02 ⇒ reward = ln(1.1)/0.02.
+        let r = compute_reward(SignalType::Buy, 100.0, 110.0, 4, Some(0.01), &cfg);
+        let expected = ((110.0f64 / 100.0).ln() / (0.01 * 4.0_f64.sqrt())) as f32;
+        assert!((r - expected).abs() < 1e-4, "got {r}, want {expected}");
+    }
+
+    #[test]
+    fn vol_floor_bounds_a_flat_window() {
+        let cfg = RewardConfig {
+            horizon: 1,
+            fee: 0.0,
+            vol_norm: true,
+            vol_floor: 0.01,
+        };
+        // σ=0 (flat) must fall back to the floor, keeping the reward finite.
+        let r = compute_reward(SignalType::Buy, 100.0, 110.0, 1, Some(0.0), &cfg);
+        let expected = ((110.0f64 / 100.0).ln() / 0.01) as f32;
+        assert!(r.is_finite());
+        assert!((r - expected).abs() < 1e-4);
+    }
+
+    #[test]
+    fn horizon_reward_spans_multiple_bars() {
+        // horizon 3, no fee/norm ⇒ reward is the 3-bar holding return.
+        let (mut rec, mut rx) = recorder_with(RewardConfig {
+            horizon: 3,
+            fee: 0.0,
+            vol_norm: false,
+            vol_floor: 1e-4,
+        });
+        let t = warm(&mut rec, "K:1m", GAF_WINDOW, 0);
+        while rx.try_recv().is_ok() {} // drain warmup completions
+        // Buy at close=100, then three more bars up to 130.
+        rec.observe("K:1m", "BTCUSDT", "1m", t, 100.0, DecisionCtx {
+            action: SignalType::Buy,
+            confidence: 0.9,
+            blocked: None,
+            regime: None,
+        });
+        for (i, px) in [110.0, 120.0, 130.0].into_iter().enumerate() {
+            rec.observe("K:1m", "BTCUSDT", "1m", t + (i as i64 + 1) * MIN, px, DecisionCtx::hold(None));
+        }
+        // Find the Buy row (the one non-Hold decision).
+        let mut buy = None;
+        while let Ok(r) = rx.try_recv() {
+            if r.action_type == SignalType::Buy.to_u8() {
+                buy = Some(r);
+            }
+        }
+        let row = buy.expect("buy row realized after horizon");
+        assert!(
+            (row.reward - (130.0f64 / 100.0).ln() as f32).abs() < 1e-6,
+            "3-bar holding return ln(130/100), got {}",
+            row.reward
+        );
+        assert_eq!(row.timestamp_ms, t, "reward attributed to the decision bar");
+        assert!(!row.done, "natural horizon completion is not an episode end");
+    }
+
+    #[test]
+    fn horizon_pipeline_emits_one_row_per_bar_once_filled() {
+        // With horizon 3, after the horizon fills, every bar realizes exactly
+        // one decision (row volume is preserved, not divided by the horizon).
+        let (mut rec, mut rx) = recorder_with(RewardConfig {
+            horizon: 3,
+            fee: 0.0,
+            vol_norm: false,
+            vol_floor: 1e-4,
+        });
+        let mut t = warm(&mut rec, "K:1m", GAF_WINDOW, 0);
+        while rx.try_recv().is_ok() {}
+        // Drive 6 more warm bars; after the horizon fills, expect ~one row each.
+        for i in 0..6 {
+            rec.observe("K:1m", "BTCUSDT", "1m", t, 100.0 + i as f64, DecisionCtx::hold(None));
+            t += MIN;
+        }
+        let count = std::iter::from_fn(|| rx.try_recv().ok()).count();
+        assert!(count >= 4, "steady-state emits ~one row per bar, got {count}");
+    }
+
+    #[test]
+    fn episode_boundary_closes_all_open_horizon_decisions() {
+        let (mut rec, mut rx) = recorder_with(RewardConfig {
+            horizon: 5,
+            fee: 0.0,
+            vol_norm: false,
+            vol_floor: 1e-4,
+        });
+        let t = warm(&mut rec, "K:1m", GAF_WINDOW, 0);
+        while rx.try_recv().is_ok() {}
+        // Arm two decisions one bar apart, both still inside the 5-bar horizon.
+        rec.observe("K:1m", "BTCUSDT", "1m", t, 100.0, DecisionCtx::hold(None));
+        rec.observe("K:1m", "BTCUSDT", "1m", t + MIN, 101.0, DecisionCtx::hold(None));
+        while rx.try_recv().is_ok() {}
+        // A 6-minute gap (> done floor, < drop factor) ends the episode: both
+        // open decisions realize with done = true even though horizon < 5.
+        rec.observe("K:1m", "BTCUSDT", "1m", t + 7 * MIN, 102.0, DecisionCtx::hold(None));
+        let rows: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(!rows.is_empty(), "episode boundary flushes open decisions");
+        assert!(rows.iter().all(|r| r.done), "all flushed rows are episode ends");
     }
 
     #[tokio::test]
