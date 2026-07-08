@@ -81,6 +81,7 @@ rayon = { workspace = true }
 
 [dev-dependencies]
 tokio-test = "0.4.4"
+tempfile = "3.13"
 
 [features]
 default = []
