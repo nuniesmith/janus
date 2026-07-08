@@ -939,10 +939,20 @@ fn compute_challenger_eval(
     let mut reward_sum = 0.0_f64;
     for i in 0..n {
         reward_sum += rewards[i];
+        let q = &q_values[i];
+        // A Q-vector carries an honest greedy signal only if it is finite and
+        // non-degenerate. A diverged model yields NaN/Inf, and `batch_predict`
+        // emits `vec![0.0; output_size]` (all-equal) on a forward-pass failure;
+        // in both cases `argmax` collapses to index 0, which would otherwise
+        // credit a spurious "win" for every index-0 sample with reward ≥ 0 and
+        // silently inflate the winrate during divergence/failure. Skip those so
+        // the metric stays the documented conservative lower bound.
+        let has_signal =
+            q.iter().all(|v| v.is_finite()) && q.len() > 1 && q.iter().any(|v| *v != q[0]);
         // Greedy action agrees with the log AND its realized reward is
         // non-negative → credit a win (honest: we only have a realized reward
         // for the recorded action).
-        if argmax(&q_values[i]) == recorded_actions[i] && rewards[i] >= 0.0 {
+        if has_signal && argmax(q) == recorded_actions[i] && rewards[i] >= 0.0 {
             wins += 1;
         }
     }
@@ -2117,6 +2127,36 @@ mod tests {
             "mean_reward = {}",
             eval.mean_reward
         );
+    }
+
+    #[test]
+    fn test_compute_challenger_eval_degenerate_rows_never_win() {
+        // Rows that carry no honest greedy signal must NOT be credited as wins,
+        // even when their (spurious) argmax==0 matches the recorded action and
+        // the reward is non-negative:
+        //   0: NaN row (diverged model)                     → not win
+        //   1: all-zero row (batch_predict forward failure) → not win
+        //   2: +Inf row (diverged model)                    → not win
+        //   3: honest row, greedy==recorded, reward>=0      → win
+        let q_values = vec![
+            vec![f64::NAN, 0.0, 0.0, 0.0],      // argmax would be 0
+            vec![0.0, 0.0, 0.0, 0.0],           // forward-failure sentinel
+            vec![f64::INFINITY, 1.0, 2.0, 3.0], // non-finite
+            vec![0.9, 0.1, 0.0, 0.0],           // argmax = 0, honest
+        ];
+        let recorded_actions = vec![0usize, 0, 0, 0];
+        let rewards = vec![1.0_f64, 1.0, 1.0, 1.0];
+
+        let eval = compute_challenger_eval(&q_values, &recorded_actions, &rewards);
+        assert_eq!(eval.samples, 4);
+        // Only the single honest row counts → 1/4.
+        assert!(
+            (eval.winrate - 0.25).abs() < 1e-12,
+            "degenerate rows must not inflate the winrate, got {}",
+            eval.winrate
+        );
+        // mean_reward is independent of the greedy signal.
+        assert!((eval.mean_reward - 1.0).abs() < 1e-12);
     }
 
     #[test]
