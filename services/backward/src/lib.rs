@@ -548,7 +548,9 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
     // affect the live signal model (see run_training_scheduler docs).
     let train_cancel = tokio_util::sync::CancellationToken::new();
     tokio::spawn(crate::tasks::train::run_training_scheduler(train_cancel));
-    info!("challenger training scheduler task spawned (self-gates via JANUS_TRAIN_SCHEDULE_ENABLED)");
+    info!(
+        "challenger training scheduler task spawned (self-gates via JANUS_TRAIN_SCHEDULE_ENABLED)"
+    );
 
     // Subscribe to signals from signal bus
     let mut signal_rx = state.signal_bus.subscribe();
