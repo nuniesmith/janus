@@ -151,6 +151,9 @@ impl ExecutionGate {
     ///
     /// `is_add` marks a stack-add (not a first entry): the entry-only `quality`
     /// and `ao_divergence` gates are skipped for adds, matching the Python chain.
+    /// The `ao_divergence` gate is additionally skipped for mean-reversion
+    /// entries (`ctx.mean_reversion`) and when disabled via
+    /// `ctx.ao_divergence_enabled` (`JANUS_GATE_AO_DIVERGENCE`).
     /// `now_secs` is the current unix time (for the circuit-breaker cooldown).
     pub fn evaluate(
         &mut self,
@@ -183,9 +186,16 @@ impl ExecutionGate {
             if v.is_block() {
                 return self.blocked(asset, v, r);
             }
-            let (v, r) = check_ao_divergence(signal, ctx);
-            if v.is_block() {
-                return self.blocked(asset, v, r);
+            // AO-divergence is trend-following (block a Buy when AO<0). Skip it
+            // for mean-reversion decisions — janus's dominant regime, whose core
+            // setups (RSI-reversal buys of oversold dips) enter *against* AO by
+            // design — and when disabled via the `JANUS_GATE_AO_DIVERGENCE`
+            // kill-switch. Still applied on trend entries with the gate enabled.
+            if ctx.ao_divergence_enabled && !ctx.mean_reversion {
+                let (v, r) = check_ao_divergence(signal, ctx);
+                if v.is_block() {
+                    return self.blocked(asset, v, r);
+                }
             }
         }
         // 6. fee viability
@@ -323,13 +333,13 @@ fn check_quality(ctx: &GateContext) -> (GateVerdict, String) {
 
 fn check_ao_divergence(signal: Side, ctx: &GateContext) -> (GateVerdict, String) {
     match signal {
-        Side::Buy if ctx.ao <= 0.0 => (
+        Side::Buy if ctx.ao < 0.0 => (
             GateVerdict::BlockAoDivergence,
-            format!("AO={:.4} <= 0 for buy signal", ctx.ao),
+            format!("AO={:.4} < 0 for buy signal", ctx.ao),
         ),
-        Side::Sell if ctx.ao >= 0.0 => (
+        Side::Sell if ctx.ao > 0.0 => (
             GateVerdict::BlockAoDivergence,
-            format!("AO={:.4} >= 0 for sell signal", ctx.ao),
+            format!("AO={:.4} > 0 for sell signal", ctx.ao),
         ),
         _ => (GateVerdict::Pass, String::new()),
     }
@@ -499,6 +509,63 @@ mod tests {
         // AO gate skipped on adds even when divergent.
         assert_eq!(
             g.evaluate("btc", Side::Buy, true, &buy_bad, NOW).0,
+            GateVerdict::Pass
+        );
+    }
+
+    #[test]
+    fn ao_divergence_skipped_for_mean_reversion() {
+        let mut g = gate();
+        // A Buy with AO<0 blocks on the trend path (gate enabled, not reversion).
+        let trend = GateContext {
+            ao: -0.5,
+            ..passing_ctx()
+        };
+        assert_eq!(
+            g.evaluate("btc", Side::Buy, false, &trend, NOW).0,
+            GateVerdict::BlockAoDivergence
+        );
+        // The same setup as a mean-reversion decision skips the AO gate → passes.
+        let reversion = GateContext {
+            ao: -0.5,
+            mean_reversion: true,
+            ..passing_ctx()
+        };
+        assert_eq!(
+            g.evaluate("btc", Side::Buy, false, &reversion, NOW).0,
+            GateVerdict::Pass
+        );
+    }
+
+    #[test]
+    fn ao_divergence_kill_switch_disables_gate() {
+        let mut g = gate();
+        // Divergent Buy that would block, but the gate is disabled → passes.
+        let disabled = GateContext {
+            ao: -0.5,
+            ao_divergence_enabled: false,
+            ..passing_ctx()
+        };
+        assert_eq!(
+            g.evaluate("btc", Side::Buy, false, &disabled, NOW).0,
+            GateVerdict::Pass
+        );
+    }
+
+    #[test]
+    fn ao_flat_zero_does_not_block_either_side() {
+        let mut g = gate();
+        // A flat AO (exactly 0) must not block a Buy or a Sell.
+        let flat = GateContext {
+            ao: 0.0,
+            ..passing_ctx()
+        };
+        assert_eq!(
+            g.evaluate("btc", Side::Buy, false, &flat, NOW).0,
+            GateVerdict::Pass
+        );
+        assert_eq!(
+            g.evaluate("btc", Side::Sell, false, &flat, NOW).0,
             GateVerdict::Pass
         );
     }

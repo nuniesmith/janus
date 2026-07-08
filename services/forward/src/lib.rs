@@ -2245,10 +2245,21 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                                                 open_assets,
                                                 producers,
                                             );
-                                        // Overlay the gate's configured round-trip
-                                        // fees (JANUS_GATE_FEE_*) before evaluating.
+                                        // Mean-reversion decisions (janus's dominant
+                                        // regime) skip the trend-following AO-divergence
+                                        // gate, which otherwise rejects their core
+                                        // against-AO setups. Regime comes from the same
+                                        // live detector used for the `regime` metadata.
+                                        ctx.mean_reversion = matches!(
+                                            regime_manager.current_regime(&symbol_str),
+                                            Some(janus_regime::MarketRegime::MeanReverting)
+                                        );
+                                        // Overlay the gate's configured round-trip fees
+                                        // (JANUS_GATE_FEE_*), quality floor
+                                        // (JANUS_GATE_QUAL_MIN) and AO-divergence
+                                        // kill-switch (JANUS_GATE_AO_DIVERGENCE).
                                         let mut gate_guard = forward_gate.write().await;
-                                        gate_guard.apply_fees(&mut ctx);
+                                        gate_guard.apply_config(&mut ctx);
                                         Some(gate_guard.evaluate_entry(
                                             &gate_asset,
                                             side,

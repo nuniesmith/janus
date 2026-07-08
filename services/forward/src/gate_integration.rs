@@ -56,6 +56,19 @@ fn env_f64(name: &str) -> Option<f64> {
         .filter(|v| v.is_finite() && *v >= 0.0)
 }
 
+/// Parse a boolean env var that defaults to **enabled**. Set it to a false-y
+/// value (`0`, `false`, `no`, `off`; case-insensitive) to disable; unset or any
+/// other value leaves it enabled. Used for gate kill-switches.
+fn env_flag_default_true(name: &str) -> bool {
+    match env::var(name) {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        ),
+        Err(_) => true,
+    }
+}
+
 /// Outcome of evaluating one prospective entry through the gate.
 #[derive(Debug, Clone)]
 pub struct GateOutcome {
@@ -198,6 +211,12 @@ pub struct ForwardGate {
     /// Round-trip fee inputs (per-side fractions) for the fee-viability gate.
     fee_taker: f64,
     fee_slip: f64,
+    /// Signal-quality floor for the quality gate (`JANUS_GATE_QUAL_MIN`,
+    /// default 50). Stamped onto the context via [`apply_config`](Self::apply_config).
+    qual_min: f64,
+    /// Whether the AO-divergence gate is active (`JANUS_GATE_AO_DIVERGENCE`,
+    /// default enabled). Stamped onto the context via [`apply_config`](Self::apply_config).
+    ao_divergence_enabled: bool,
 }
 
 impl Default for ForwardGate {
@@ -227,15 +246,19 @@ impl ForwardGate {
             enforce,
             fee_taker: defaults.fee_taker,
             fee_slip: defaults.fee_slip,
+            qual_min: defaults.qual_min,
+            ao_divergence_enabled: defaults.ao_divergence_enabled,
         }
     }
 
     /// Build from the environment. `JANUS_GATE_ENFORCE=1` makes a blocking
     /// verdict suppress the execution submit; otherwise the gate is advisory.
     pub fn from_env() -> Self {
-        let gate = Self::new(env_flag("JANUS_GATE_ENFORCE"));
+        let mut gate = Self::new(env_flag("JANUS_GATE_ENFORCE"));
         let fee_taker = env_f64("JANUS_GATE_FEE_TAKER").unwrap_or(gate.fee_taker);
         let fee_slip = env_f64("JANUS_GATE_FEE_SLIP").unwrap_or(gate.fee_slip);
+        gate.qual_min = env_f64("JANUS_GATE_QUAL_MIN").unwrap_or(gate.qual_min);
+        gate.ao_divergence_enabled = env_flag_default_true("JANUS_GATE_AO_DIVERGENCE");
         gate.with_fees(fee_taker, fee_slip)
     }
 
@@ -261,6 +284,17 @@ impl ForwardGate {
     pub fn apply_fees(&self, ctx: &mut GateContext) {
         ctx.fee_taker = self.fee_taker;
         ctx.fee_slip = self.fee_slip;
+    }
+
+    /// Stamp all gate-instance config onto a context before evaluation: the
+    /// round-trip fees (see [`apply_fees`](Self::apply_fees)), the quality floor
+    /// (`JANUS_GATE_QUAL_MIN`, default 50), and the AO-divergence kill-switch
+    /// (`JANUS_GATE_AO_DIVERGENCE`, default enabled). The live loop separately
+    /// sets `ctx.mean_reversion` from the current market regime.
+    pub fn apply_config(&self, ctx: &mut GateContext) {
+        self.apply_fees(ctx);
+        ctx.qual_min = self.qual_min;
+        ctx.ao_divergence_enabled = self.ao_divergence_enabled;
     }
 
     /// Snapshot the gate's block/eval counters for export (Redis/Grafana).
@@ -335,7 +369,8 @@ impl ForwardGate {
             // Engine producers, with inert pass-throughs when not yet warmed:
             // vol mid-band, quality clears qual_min, AO matches the side, TP
             // viable. Fees stay at the GateContext defaults here; the live loop
-            // overlays the configured fees via `apply_fees` before evaluating.
+            // overlays the configured fees / quality floor / AO kill-switch via
+            // `apply_config` before evaluating.
             ao: producers.ao.unwrap_or(ao_passthrough),
             vol_pct: producers.vol_pct.unwrap_or(0.5),
             quality: producers.quality.unwrap_or(100.0),
@@ -626,5 +661,59 @@ mod tests {
         gate.apply_fees(&mut ctx);
         assert_eq!(ctx.fee_taker, 0.001);
         assert_eq!(ctx.fee_slip, 0.0005);
+    }
+
+    #[test]
+    fn apply_config_stamps_qual_min_and_ao_switch() {
+        // Defaults (no env): quality floor 50, AO-divergence gate enabled.
+        // Start from clobbered values and prove apply_config restores config.
+        let gate = ForwardGate::new(false);
+        let mut ctx = GateContext {
+            qual_min: 0.0,
+            ao_divergence_enabled: false,
+            ..Default::default()
+        };
+        gate.apply_config(&mut ctx);
+        assert_eq!(ctx.qual_min, 50.0);
+        assert!(ctx.ao_divergence_enabled);
+    }
+
+    #[test]
+    fn from_env_reads_qual_min_and_ao_switch() {
+        // These env vars are read only by `from_env`, which no other test uses,
+        // so this single serial test can safely mutate + restore them.
+        //
+        // Unset → defaults preserved (qual_min 50, AO gate enabled).
+        unsafe {
+            env::remove_var("JANUS_GATE_QUAL_MIN");
+            env::remove_var("JANUS_GATE_AO_DIVERGENCE");
+        }
+        let g = ForwardGate::from_env();
+        assert_eq!(g.qual_min, 50.0, "unset JANUS_GATE_QUAL_MIN keeps 50");
+        assert!(
+            g.ao_divergence_enabled,
+            "unset JANUS_GATE_AO_DIVERGENCE keeps the gate enabled"
+        );
+
+        // Set → override the quality floor and disable the AO-divergence gate.
+        unsafe {
+            env::set_var("JANUS_GATE_QUAL_MIN", "70");
+            env::set_var("JANUS_GATE_AO_DIVERGENCE", "off");
+        }
+        let g = ForwardGate::from_env();
+        assert_eq!(
+            g.qual_min, 70.0,
+            "JANUS_GATE_QUAL_MIN overrides the default"
+        );
+        assert!(
+            !g.ao_divergence_enabled,
+            "JANUS_GATE_AO_DIVERGENCE=off disables the gate"
+        );
+
+        // Restore the environment for any later readers.
+        unsafe {
+            env::remove_var("JANUS_GATE_QUAL_MIN");
+            env::remove_var("JANUS_GATE_AO_DIVERGENCE");
+        }
     }
 }
