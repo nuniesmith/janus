@@ -159,7 +159,7 @@ impl DqnOnlineModel {
         // to load the predictor's weights into a new inference model and
         // re-init the online model from that weight map.
         let weight_map = predictor.extract_weights_pub();
-        online.apply_inference_weights(&weight_map);
+        online.apply_inference_weights(&weight_map)?;
 
         Ok(online)
     }
@@ -353,7 +353,21 @@ impl DqnOnlineModel {
     /// This converts the online model to an inference predictor, applies the
     /// weight map, then extracts and re-applies back to the trainable model.
     /// It's used when bootstrapping from a saved checkpoint.
-    fn apply_inference_weights(&mut self, weight_map: &WeightMap) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MLError::ModelLoadError`] if a required weight tensor is
+    /// absent from the checkpoint (e.g. the checkpoint has fewer LSTM layers
+    /// than the current config) and [`MLError::InvalidShape`] if a checkpoint
+    /// tensor's element count does not match the current model's target shape
+    /// (e.g. a differing hidden/input size). Every tensor is validated
+    /// **before** any `TensorData` is constructed so a stale / architecture-
+    /// mismatched checkpoint degrades cleanly instead of panicking inside
+    /// burn's `check_data_len` assertion.
+    ///
+    /// [`MLError::ModelLoadError`]: crate::error::MLError::ModelLoadError
+    /// [`MLError::InvalidShape`]: crate::error::MLError::InvalidShape
+    fn apply_inference_weights(&mut self, weight_map: &WeightMap) -> Result<()> {
         use burn::module::Module;
         use std::collections::HashMap;
 
@@ -365,87 +379,109 @@ impl DqnOnlineModel {
 
         // --- Helpers for loading records ---
 
-        // Helper: load a raw tensor from the map
-        let load_tensor_2d = |name: &str, shape: &[usize]| -> Tensor<AutodiffCpuBackend, 2> {
-            let t = weight_dict
-                .get(name)
-                .unwrap_or_else(|| panic!("Missing 2D weight in checkpoint: {}", name));
-            // Verify shape consistency if needed, but for now trust the config match
-            let data = TensorData::new(t.data.clone(), shape);
-            Tensor::from_data(data, &device)
+        // Look up a checkpoint tensor by name and validate that its element
+        // count matches the target `shape` BEFORE any `TensorData` is built.
+        // A missing name or a length mismatch (differing layer count / hidden
+        // / input size) returns an `Err` rather than panicking downstream.
+        let lookup = |name: &str, shape: &[usize]| -> Result<&crate::models::SerializedTensor> {
+            let t = weight_dict.get(name).copied().ok_or_else(|| {
+                crate::error::MLError::ModelLoadError(format!(
+                    "Missing weight in checkpoint: {name}"
+                ))
+            })?;
+            let expected: usize = shape.iter().product();
+            if t.data.len() != expected {
+                return Err(crate::error::MLError::invalid_shape(
+                    format!("{name}: {expected} elements {shape:?}"),
+                    format!("{} elements {:?}", t.data.len(), t.shape),
+                ));
+            }
+            Ok(t)
         };
 
-        let load_tensor_1d = |name: &str, shape: &[usize]| -> Tensor<AutodiffCpuBackend, 1> {
-            let t = weight_dict
-                .get(name)
-                .unwrap_or_else(|| panic!("Missing 1D weight in checkpoint: {}", name));
-            let data = TensorData::new(t.data.clone(), shape);
-            Tensor::from_data(data, &device)
-        };
+        // Helper: load a raw tensor from the map
+        let load_tensor_2d =
+            |name: &str, shape: &[usize]| -> Result<Tensor<AutodiffCpuBackend, 2>> {
+                let t = lookup(name, shape)?;
+                let data = TensorData::new(t.data.clone(), shape);
+                Ok(Tensor::from_data(data, &device))
+            };
+
+        let load_tensor_1d =
+            |name: &str, shape: &[usize]| -> Result<Tensor<AutodiffCpuBackend, 1>> {
+                let t = lookup(name, shape)?;
+                let data = TensorData::new(t.data.clone(), shape);
+                Ok(Tensor::from_data(data, &device))
+            };
 
         // Helper: construct a LinearRecord from weights
         let load_linear_record = |prefix: &str,
                                   linear: &burn_nn::Linear<AutodiffCpuBackend>|
-         -> burn_nn::LinearRecord<AutodiffCpuBackend> {
-            let weight_name = format!("{}.weight", prefix);
-            let bias_name = format!("{}.bias", prefix);
+         -> Result<burn_nn::LinearRecord<AutodiffCpuBackend>> {
+            let weight_name = format!("{prefix}.weight");
+            let bias_name = format!("{prefix}.bias");
 
-            let weight = load_tensor_2d(&weight_name, &linear.weight.shape().dims);
+            let weight = load_tensor_2d(&weight_name, &linear.weight.shape().dims)?;
 
-            let bias = linear
-                .bias
-                .as_ref()
-                .map(|b| Param::from_tensor(load_tensor_1d(&bias_name, &b.shape().dims)));
+            let bias = match linear.bias.as_ref() {
+                Some(b) => Some(Param::from_tensor(load_tensor_1d(
+                    &bias_name,
+                    &b.shape().dims,
+                )?)),
+                None => None,
+            };
 
-            burn_nn::LinearRecord {
+            Ok(burn_nn::LinearRecord {
                 weight: Param::from_tensor(weight),
                 bias,
-            }
+            })
         };
 
         // --- Apply Weights ---
 
         // 1. Output Layer
-        let output_record = load_linear_record("output", &self.model.output);
+        let output_record = load_linear_record("output", &self.model.output)?;
         self.model.output = self.model.output.clone().load_record(output_record);
 
         // 2. LSTM Layers
         for (i, lstm) in self.model.lstm_layers.iter_mut().enumerate() {
-            let layer_prefix = format!("lstm_layers.{}", i);
+            let layer_prefix = format!("lstm_layers.{i}");
 
             // Helper to load a specific gate (input/forget/output/cell)
             let load_gate_record =
                 |gate_name: &str,
                  controller: &burn_nn::GateController<AutodiffCpuBackend>|
-                 -> burn_nn::GateControllerRecord<AutodiffCpuBackend> {
-                    let gate_prefix = format!("{}.{}", layer_prefix, gate_name);
+                 -> Result<burn_nn::GateControllerRecord<AutodiffCpuBackend>> {
+                    let gate_prefix = format!("{layer_prefix}.{gate_name}");
 
                     let input_transform = load_linear_record(
-                        &format!("{}.input_transform", gate_prefix),
+                        &format!("{gate_prefix}.input_transform"),
                         &controller.input_transform,
-                    );
+                    )?;
 
                     let hidden_transform = load_linear_record(
-                        &format!("{}.hidden_transform", gate_prefix),
+                        &format!("{gate_prefix}.hidden_transform"),
                         &controller.hidden_transform,
-                    );
+                    )?;
 
-                    burn_nn::GateControllerRecord {
+                    Ok(burn_nn::GateControllerRecord {
                         input_transform,
                         hidden_transform,
-                    }
+                    })
                 };
 
             let record = burn_nn::lstm::LstmRecord {
-                input_gate: load_gate_record("input_gate", &lstm.input_gate),
-                forget_gate: load_gate_record("forget_gate", &lstm.forget_gate),
-                output_gate: load_gate_record("output_gate", &lstm.output_gate),
-                cell_gate: load_gate_record("cell_gate", &lstm.cell_gate),
+                input_gate: load_gate_record("input_gate", &lstm.input_gate)?,
+                forget_gate: load_gate_record("forget_gate", &lstm.forget_gate)?,
+                output_gate: load_gate_record("output_gate", &lstm.output_gate)?,
+                cell_gate: load_gate_record("cell_gate", &lstm.cell_gate)?,
                 d_hidden: burn_core::module::ConstantRecord,
             };
 
             *lstm = lstm.clone().load_record(record);
         }
+
+        Ok(())
     }
 }
 
@@ -664,6 +700,64 @@ mod tests {
         assert_eq!(predictor.config().input_size, 4);
         assert_eq!(predictor.config().hidden_size, 8);
         assert_eq!(predictor.config().output_size, 3);
+    }
+
+    #[test]
+    fn test_from_predictor_same_arch_succeeds() {
+        // Sanity: resuming into an identically-shaped model still works.
+        let cfg = small_config();
+        let checkpoint = LstmPredictor::new(
+            trainable_lstm_config_to_inference(&cfg),
+            BackendDevice::cpu(),
+        );
+
+        let result = DqnOnlineModel::from_predictor(&checkpoint, cfg, 1e-3, 1e-5);
+        assert!(
+            result.is_ok(),
+            "same-arch resume must succeed: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_from_predictor_hidden_size_mismatch_returns_err_not_panic() {
+        // A checkpoint saved with hidden_size 8 must NOT be force-loaded into a
+        // model configured with hidden_size 16: the per-tensor element counts
+        // differ, so `from_predictor` must return `Err` (so the caller degrades
+        // to a fresh init) rather than panic inside burn's tensor-length
+        // assertion. `release` builds are `panic = abort`, so a panic here would
+        // crash-loop the backward process.
+        let ckpt_cfg = TrainableLstmConfig::new(4, 8, 3).with_num_layers(1);
+        let checkpoint = LstmPredictor::new(
+            trainable_lstm_config_to_inference(&ckpt_cfg),
+            BackendDevice::cpu(),
+        );
+
+        let current_cfg = TrainableLstmConfig::new(4, 16, 3).with_num_layers(1);
+        let result = DqnOnlineModel::from_predictor(&checkpoint, current_cfg, 1e-3, 1e-5);
+        assert!(
+            result.is_err(),
+            "hidden-size-mismatched resume must return Err, not panic"
+        );
+    }
+
+    #[test]
+    fn test_from_predictor_fewer_layers_returns_err_not_panic() {
+        // The checkpoint has a single LSTM layer, but the current config wants
+        // two — `lstm_layers.1.*` is absent from the checkpoint. The missing
+        // weight must surface as `Err`, not a panic.
+        let ckpt_cfg = TrainableLstmConfig::new(4, 8, 3).with_num_layers(1);
+        let checkpoint = LstmPredictor::new(
+            trainable_lstm_config_to_inference(&ckpt_cfg),
+            BackendDevice::cpu(),
+        );
+
+        let current_cfg = TrainableLstmConfig::new(4, 8, 3).with_num_layers(2);
+        let result = DqnOnlineModel::from_predictor(&checkpoint, current_cfg, 1e-3, 1e-5);
+        assert!(
+            result.is_err(),
+            "missing-layer resume must return Err, not panic"
+        );
     }
 
     #[test]
