@@ -1512,7 +1512,9 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                     "experience pipeline: ENABLED (recording decision transitions; \
                      Phase 2.5 reward — horizon holding return, fee-aware, vol-normalized)"
                 );
-                Some(crate::experience::ExperienceRecorder::with_reward(tx, reward_cfg))
+                Some(crate::experience::ExperienceRecorder::with_reward(
+                    tx, reward_cfg,
+                ))
             } else {
                 None
             };
