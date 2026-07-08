@@ -332,7 +332,17 @@ async fn poll_queue(
                 c.brpop(INGEST_QUEUE_KEY, BRPOP_TIMEOUT_SECS).await;
             match res {
                 Ok(Some((_key, payload))) => Some(payload),
-                Ok(None) => None, // timeout, queue empty
+                Ok(None) => None, // server-side timeout, queue empty
+                // A *client-side* timeout on an empty BRPOP window is benign:
+                // no doorbell arrived within BRPOP_TIMEOUT_SECS. The
+                // ConnectionManager stays healthy and reconnects transparently
+                // on the next command, so keep it rather than dropping +
+                // reconnecting (and WARN-spamming) on every idle poll — which,
+                // on an idle queue, churned the connection roughly every 5 s.
+                Err(e) if e.is_timeout() => {
+                    debug!("BRPOP window elapsed with an empty queue (benign timeout)");
+                    None
+                }
                 Err(e) => {
                     warn!(error = %e, "BRPOP failed — dropping Redis connection");
                     *conn = None;
