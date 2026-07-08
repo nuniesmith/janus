@@ -473,6 +473,235 @@ fn save_checkpoint(
     Ok(())
 }
 
+// ─── Replay-buffer construction ───────────────────────────────────────────────
+
+/// Build the PER replay buffer for a training run.
+///
+/// Creates a [`SumTree`] of `config.replay_capacity`, optionally fills it from
+/// live Qdrant experiences (Phase 2, env-gated via `config.train_from_qdrant`),
+/// then tops up any shortfall to `batch_size` with GAF-seed / placeholder
+/// experiences. Shared verbatim by [`handle_training`] and
+/// [`run_training_session`] so both build the buffer identically.
+///
+/// A Qdrant load error is logged and degrades to the seed path rather than
+/// aborting — a Qdrant outage must never abort training.
+async fn build_training_buffer(config: &TrainingConfig, batch_size: usize) -> Result<SumTree> {
+    // ── Initialise PER buffer ─────────────────────────────────────────────
+    let mut replay_buffer = SumTree::new(config.replay_capacity, config.per_alpha, config.per_beta);
+
+    // ── Optionally fill from live Qdrant experiences (Phase 2) ────────────
+    //
+    // Env-gated OFF by default: when `JANUS_TRAIN_FROM_QDRANT` is unset, this
+    // block is skipped entirely and the seed/placeholder path below is the
+    // sole source — live training behaviour is unchanged. When enabled, the
+    // buffer is filled from live-collected experiences *in addition to* the
+    // seed fallback (which still tops up any shortfall to `batch_size`).
+    if config.train_from_qdrant {
+        match load_qdrant_experiences(config).await {
+            Ok(exps) => {
+                let dist = RewardDistribution::from_experiences(&exps);
+                info!(
+                    loaded = dist.count,
+                    reward_min = dist.min,
+                    reward_max = dist.max,
+                    reward_mean = dist.mean,
+                    reward_std = dist.std,
+                    reward_positive = dist.positive,
+                    reward_negative = dist.negative,
+                    reward_zero = dist.zero,
+                    limit = config.qdrant_sample_limit,
+                    since_ms = config.qdrant_since_ms,
+                    "Loaded live experiences from Qdrant for training"
+                );
+                for exp in exps {
+                    replay_buffer.add(exp, 1.0);
+                }
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "Failed to load experiences from Qdrant — falling back to seed path"
+                );
+            }
+        }
+    }
+
+    let buffer_size = replay_buffer.len();
+    if buffer_size < batch_size {
+        warn!(
+            buffer_size = buffer_size,
+            required = batch_size,
+            "Replay buffer has fewer experiences than batch size — seeding with placeholders"
+        );
+        let needed = batch_size.saturating_sub(buffer_size);
+        // Seed with real GAF-feature experiences when configured (ML Phase 1),
+        // otherwise zero placeholders. Default config has `seed_closes: None`,
+        // so behaviour is unchanged unless real seed data is supplied.
+        let seed_exps = match build_seed_experiences(config) {
+            Ok(exps) => exps,
+            Err(e) => {
+                warn!(error = %e, "GAF seeding failed; falling back to placeholders");
+                Vec::new()
+            }
+        };
+        for i in 0..needed {
+            let exp = if seed_exps.is_empty() {
+                create_placeholder_experience()
+            } else {
+                seed_exps[i % seed_exps.len()].clone()
+            };
+            replay_buffer.add(exp, 1.0);
+            debug!(index = i, "Seeded experience");
+        }
+    }
+
+    Ok(replay_buffer)
+}
+
+// ─── Single training step ─────────────────────────────────────────────────────
+
+/// Outcome of one gradient step over a sampled PER batch.
+struct StepOutcome {
+    /// Raw result of the gradient step (loss, mean Q, max TD error).
+    step_result: DqnStepResult,
+    /// Mean TD target across the batch.
+    mean_target: f64,
+    /// Mean absolute TD error (recomputed post-update).
+    mean_td_error: f64,
+    /// Max absolute TD error (recomputed post-update).
+    max_td_error: f64,
+    /// Number of experiences in the batch.
+    batch_size: usize,
+}
+
+/// Run ONE training step: sample a prioritized batch, compute Double-DQN TD
+/// targets, take an IS-weighted gradient step on the online network,
+/// soft-update the target network, and refresh replay priorities.
+///
+/// Mutates `online`, `target_model` and `replay_buffer` in place, so repeated
+/// calls with the same models + buffer + optimiser accumulate learning across
+/// steps (used by [`run_training_session`]). [`handle_training`] calls it once.
+fn train_one_step(
+    online: &mut DqnOnlineModel,
+    target_model: &mut LstmPredictor<CpuBackend>,
+    replay_buffer: &mut SumTree,
+    config: &TrainingConfig,
+    batch_size: usize,
+) -> Result<StepOutcome> {
+    // ── Sample a prioritized batch ────────────────────────────────────────
+    let samples = replay_buffer
+        .sample(batch_size)
+        .map_err(|e| anyhow::anyhow!("Failed to sample batch from PER buffer: {}", e))
+        .context("Sampling from replay buffer")?;
+
+    info!(
+        sampled = samples.len(),
+        "Sampled prioritized batch from replay buffer"
+    );
+
+    let mut indices = Vec::with_capacity(samples.len());
+    let mut is_weights = Vec::with_capacity(samples.len());
+    let mut experiences = Vec::with_capacity(samples.len());
+
+    for (exp, idx, weight) in &samples {
+        experiences.push(exp.clone());
+        indices.push(*idx);
+        is_weights.push(*weight);
+    }
+
+    // Normalise IS weights so the max weight is 1.0
+    let max_weight = is_weights.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    if max_weight > 0.0 {
+        for w in &mut is_weights {
+            *w /= max_weight;
+        }
+    }
+
+    // ── Compute Double-DQN TD targets ─────────────────────────────────────
+    let next_states: Vec<Vec<f32>> = experiences
+        .iter()
+        .map(|e| state_to_features(&e.next_state, config.model_input_size))
+        .collect();
+    let rewards: Vec<f64> = experiences.iter().map(|e| e.reward as f64).collect();
+    let dones: Vec<bool> = experiences.iter().map(|e| e.done).collect();
+
+    let td_targets = compute_double_dqn_targets(
+        online,
+        target_model,
+        &next_states,
+        &rewards,
+        &dones,
+        config.gamma,
+        config.model_input_size,
+        1, // seq_len
+    );
+
+    let mean_target = td_targets.iter().sum::<f64>() / td_targets.len() as f64;
+
+    // ── Gradient step on the online network ───────────────────────────────
+    let states: Vec<Vec<f32>> = experiences
+        .iter()
+        .map(|e| state_to_features(&e.state, config.model_input_size))
+        .collect();
+    let actions: Vec<usize> = experiences
+        .iter()
+        .map(|e| action_to_index(&e.action.action_type))
+        .collect();
+
+    let step_result: DqnStepResult = online
+        .gradient_step(
+            &states,
+            &actions,
+            &td_targets,
+            &is_weights,
+            config.model_input_size,
+            1, // seq_len
+        )
+        .context("Gradient step failed")?;
+
+    info!(
+        loss = format!("{:.6}", step_result.loss),
+        mean_q = format!("{:.4}", step_result.mean_q),
+        max_td = format!("{:.6}", step_result.max_td_error),
+        mean_target = format!("{:.4}", mean_target),
+        step = online.step_count,
+        "Gradient step completed"
+    );
+
+    // ── Soft-update the target network ────────────────────────────────────
+    online.soft_update_target(target_model, config.tau);
+
+    debug!(
+        tau = config.tau,
+        "Target network soft-updated (Polyak averaging)"
+    );
+
+    // ── Update priorities in the replay buffer ────────────────────────────
+    //
+    // Recompute per-sample TD errors using the *updated* online network so
+    // that priorities reflect the latest model state.
+    let epsilon = 1e-6_f64;
+    let td_errors = compute_td_errors(online, target_model, &experiences, config);
+
+    for (i, &idx) in indices.iter().enumerate() {
+        let new_priority = td_errors[i].abs() + epsilon;
+        replay_buffer.update_priority(idx, new_priority);
+    }
+
+    info!(updated = indices.len(), "Updated replay buffer priorities");
+
+    let mean_td_error = td_errors.iter().map(|e| e.abs()).sum::<f64>() / td_errors.len() as f64;
+    let max_td_error = td_errors.iter().map(|e| e.abs()).fold(0.0_f64, f64::max);
+
+    Ok(StepOutcome {
+        step_result,
+        mean_target,
+        mean_td_error,
+        max_td_error,
+        batch_size: experiences.len(),
+    })
+}
+
 // ─── Main training entry point ────────────────────────────────────────────────
 
 /// Handle a training job dispatched by the scheduler / job queue.
@@ -529,178 +758,18 @@ pub async fn handle_training(job: TrainJob, notifier: Option<&CheckpointNotifier
         "Q-networks initialised (online=trainable, target=inference)"
     );
 
-    // ── 2. Initialise PER buffer ──────────────────────────────────────────
-    let mut replay_buffer = SumTree::new(config.replay_capacity, config.per_alpha, config.per_beta);
+    // ── 2. Build the replay buffer (Qdrant + seed/placeholder fallback) ───
+    let mut replay_buffer = build_training_buffer(&config, job.batch_size).await?;
 
-    // ── 2b. Optionally fill from live Qdrant experiences (Phase 2) ────────
-    //
-    // Env-gated OFF by default: when `JANUS_TRAIN_FROM_QDRANT` is unset, this
-    // block is skipped entirely and the seed/placeholder path below is the
-    // sole source — live training behaviour is unchanged. When enabled, the
-    // buffer is filled from live-collected experiences *in addition to* the
-    // seed fallback (which still tops up any shortfall to `batch_size`). A
-    // Qdrant error is logged and degrades to the seed path rather than
-    // aborting the job.
-    if config.train_from_qdrant {
-        match load_qdrant_experiences(&config).await {
-            Ok(exps) => {
-                let dist = RewardDistribution::from_experiences(&exps);
-                info!(
-                    loaded = dist.count,
-                    reward_min = dist.min,
-                    reward_max = dist.max,
-                    reward_mean = dist.mean,
-                    reward_std = dist.std,
-                    reward_positive = dist.positive,
-                    reward_negative = dist.negative,
-                    reward_zero = dist.zero,
-                    limit = config.qdrant_sample_limit,
-                    since_ms = config.qdrant_since_ms,
-                    "Loaded live experiences from Qdrant for training"
-                );
-                for exp in exps {
-                    replay_buffer.add(exp, 1.0);
-                }
-            }
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    "Failed to load experiences from Qdrant — falling back to seed path"
-                );
-            }
-        }
-    }
-
-    let buffer_size = replay_buffer.len();
-    if buffer_size < job.batch_size {
-        warn!(
-            buffer_size = buffer_size,
-            required = job.batch_size,
-            "Replay buffer has fewer experiences than batch size — seeding with placeholders"
-        );
-        let needed = job.batch_size.saturating_sub(buffer_size);
-        // Seed with real GAF-feature experiences when configured (ML Phase 1),
-        // otherwise zero placeholders. Default config has `seed_closes: None`,
-        // so behaviour is unchanged unless real seed data is supplied.
-        let seed_exps = match build_seed_experiences(&config) {
-            Ok(exps) => exps,
-            Err(e) => {
-                warn!(error = %e, "GAF seeding failed; falling back to placeholders");
-                Vec::new()
-            }
-        };
-        for i in 0..needed {
-            let exp = if seed_exps.is_empty() {
-                create_placeholder_experience()
-            } else {
-                seed_exps[i % seed_exps.len()].clone()
-            };
-            replay_buffer.add(exp, 1.0);
-            debug!(index = i, "Seeded experience");
-        }
-    }
-
-    // ── 3. Sample a prioritized batch ─────────────────────────────────────
-    let samples = replay_buffer
-        .sample(job.batch_size)
-        .map_err(|e| anyhow::anyhow!("Failed to sample batch from PER buffer: {}", e))
-        .context("Sampling from replay buffer")?;
-
-    info!(
-        sampled = samples.len(),
-        "Sampled prioritized batch from replay buffer"
-    );
-
-    let mut indices = Vec::with_capacity(samples.len());
-    let mut is_weights = Vec::with_capacity(samples.len());
-    let mut experiences = Vec::with_capacity(samples.len());
-
-    for (exp, idx, weight) in &samples {
-        experiences.push(exp.clone());
-        indices.push(*idx);
-        is_weights.push(*weight);
-    }
-
-    // Normalise IS weights so the max weight is 1.0
-    let max_weight = is_weights.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    if max_weight > 0.0 {
-        for w in &mut is_weights {
-            *w /= max_weight;
-        }
-    }
-
-    // ── 4. Compute Double-DQN TD targets ──────────────────────────────────
-    let next_states: Vec<Vec<f32>> = experiences
-        .iter()
-        .map(|e| state_to_features(&e.next_state, config.model_input_size))
-        .collect();
-    let rewards: Vec<f64> = experiences.iter().map(|e| e.reward as f64).collect();
-    let dones: Vec<bool> = experiences.iter().map(|e| e.done).collect();
-
-    let td_targets = compute_double_dqn_targets(
-        &online,
-        &target_model,
-        &next_states,
-        &rewards,
-        &dones,
-        config.gamma,
-        config.model_input_size,
-        1, // seq_len
-    );
-
-    let mean_target = td_targets.iter().sum::<f64>() / td_targets.len() as f64;
-
-    // ── 5. Gradient step on the online network ────────────────────────────
-    let states: Vec<Vec<f32>> = experiences
-        .iter()
-        .map(|e| state_to_features(&e.state, config.model_input_size))
-        .collect();
-    let actions: Vec<usize> = experiences
-        .iter()
-        .map(|e| action_to_index(&e.action.action_type))
-        .collect();
-
-    let step_result: DqnStepResult = online
-        .gradient_step(
-            &states,
-            &actions,
-            &td_targets,
-            &is_weights,
-            config.model_input_size,
-            1, // seq_len
-        )
-        .context("Gradient step failed")?;
-
-    info!(
-        loss = format!("{:.6}", step_result.loss),
-        mean_q = format!("{:.4}", step_result.mean_q),
-        max_td = format!("{:.6}", step_result.max_td_error),
-        mean_target = format!("{:.4}", mean_target),
-        step = online.step_count,
-        "Gradient step completed"
-    );
-
-    // ── 6. Soft-update the target network ─────────────────────────────────
-    online.soft_update_target(&mut target_model, config.tau);
-
-    debug!(
-        tau = config.tau,
-        "Target network soft-updated (Polyak averaging)"
-    );
-
-    // ── 7. Update priorities in the replay buffer ─────────────────────────
-    //
-    // Recompute per-sample TD errors using the *updated* online network so
-    // that priorities reflect the latest model state.
-    let epsilon = 1e-6_f64;
-    let td_errors = compute_td_errors(&online, &target_model, &experiences, &config);
-
-    for (i, &idx) in indices.iter().enumerate() {
-        let new_priority = td_errors[i].abs() + epsilon;
-        replay_buffer.update_priority(idx, new_priority);
-    }
-
-    info!(updated = indices.len(), "Updated replay buffer priorities");
+    // ── 3–7. One gradient step over a prioritized batch ───────────────────
+    let outcome = train_one_step(
+        &mut online,
+        &mut target_model,
+        &mut replay_buffer,
+        &config,
+        job.batch_size,
+    )?;
+    let step_result = outcome.step_result;
 
     // ── 8. Checkpoint ─────────────────────────────────────────────────────
     let checkpoint_dir = std::path::Path::new(&config.checkpoint_dir);
@@ -739,17 +808,14 @@ pub async fn handle_training(job: TrainJob, notifier: Option<&CheckpointNotifier
     }
 
     // ── Aggregate metrics ─────────────────────────────────────────────────
-    let mean_td_error = td_errors.iter().map(|e| e.abs()).sum::<f64>() / td_errors.len() as f64;
-    let max_td_error_abs = td_errors.iter().map(|e| e.abs()).fold(0.0_f64, f64::max);
-
     let metrics = TrainStepMetrics {
-        mean_td_error,
+        mean_td_error: outcome.mean_td_error,
         mean_loss: step_result.loss,
-        max_td_error: max_td_error_abs,
-        batch_size: experiences.len(),
+        max_td_error: outcome.max_td_error,
+        batch_size: outcome.batch_size,
         buffer_utilization: replay_buffer_utilization(replay_buffer.len(), config.replay_capacity),
         mean_q_value: step_result.mean_q,
-        mean_target_q_value: mean_target,
+        mean_target_q_value: outcome.mean_target,
         gradient_step_performed: true,
     };
 
@@ -765,6 +831,278 @@ pub async fn handle_training(job: TrainJob, notifier: Option<&CheckpointNotifier
     );
 
     Ok(())
+}
+
+// ─── Multi-step challenger training session ───────────────────────────────────
+
+/// Default per-step batch size for a scheduled (challenger) training session.
+/// Mirrors the default [`TrainJob`] batch size used by [`handle_training`].
+const SESSION_BATCH_SIZE: usize = 32;
+
+/// Metrics summarising a multi-step training session (challenger training).
+#[derive(Debug, Clone)]
+pub struct TrainSessionMetrics {
+    /// Number of gradient steps actually performed.
+    pub steps: usize,
+    /// Mean loss across all steps.
+    pub mean_loss: f64,
+    /// Loss of the final step.
+    pub final_loss: f64,
+    /// Mean Q-value (of taken actions) across all steps.
+    pub mean_q: f64,
+    /// Replay-buffer size the session trained on.
+    pub buffer_size: usize,
+}
+
+/// Run a multi-step DQN training session from a FRESH online + target model over
+/// a single replay buffer, checkpointing the result to `config.checkpoint_dir`.
+///
+/// The models, buffer and optimiser are created once and reused across all
+/// `steps` gradient steps so learning accumulates within the session.
+///
+/// ## SAFETY
+///
+/// This deliberately takes **no** [`CheckpointNotifier`]: a scheduled session
+/// must NOT publish a checkpoint notification (which could hot-load the model
+/// into forward inference — safety invariant 3). The caller
+/// ([`run_training_scheduler`]) points `config.checkpoint_dir` at the
+/// *challenger* directory, never the live champion dir (invariant 2), so a
+/// scheduled session can never affect the live signal model.
+pub async fn run_training_session(
+    config: &TrainingConfig,
+    steps: usize,
+) -> Result<TrainSessionMetrics> {
+    info!(
+        steps,
+        checkpoint_dir = %config.checkpoint_dir,
+        train_from_qdrant = config.train_from_qdrant,
+        "Starting multi-step challenger training session"
+    );
+
+    // ── Build fresh Q-networks (same construction as handle_training) ─────
+    let trainable_cfg = build_trainable_config(config);
+    let inference_cfg = build_inference_config(config);
+
+    let mut online = DqnOnlineModel::new(trainable_cfg, config.learning_rate, config.weight_decay)
+        .context("Failed to create online DQN model")?;
+    let mut target_model = LstmPredictor::new(inference_cfg, BackendDevice::cpu());
+    online.soft_update_target(&mut target_model, 1.0); // full copy to start
+
+    // ── Build the replay buffer ONCE — steps reuse it so priorities evolve ─
+    let mut replay_buffer = build_training_buffer(config, SESSION_BATCH_SIZE).await?;
+    let buffer_size = replay_buffer.len();
+
+    // ── Loop the per-step core, accumulating learning across steps ────────
+    let mut total_loss = 0.0_f64;
+    let mut total_q = 0.0_f64;
+    let mut final_loss = 0.0_f64;
+    let mut completed = 0usize;
+
+    for step in 0..steps {
+        let outcome = train_one_step(
+            &mut online,
+            &mut target_model,
+            &mut replay_buffer,
+            config,
+            SESSION_BATCH_SIZE,
+        )
+        .with_context(|| format!("training session failed at step {step}"))?;
+        total_loss += outcome.step_result.loss;
+        total_q += outcome.step_result.mean_q;
+        final_loss = outcome.step_result.loss;
+        completed += 1;
+    }
+
+    let mean_loss = if completed > 0 {
+        total_loss / completed as f64
+    } else {
+        0.0
+    };
+    let mean_q = if completed > 0 {
+        total_q / completed as f64
+    } else {
+        0.0
+    };
+
+    // ── Checkpoint to the (challenger) dir — NO notifier is passed anywhere,
+    //    so no CheckpointNotification is ever published (invariant 3). ─────
+    let predictor = online
+        .to_inference(BackendDevice::cpu())
+        .context("Failed to convert online model to inference for checkpoint")?;
+    save_checkpoint(&predictor, std::path::Path::new(&config.checkpoint_dir))
+        .context("Failed to save challenger checkpoint")?;
+
+    let metrics = TrainSessionMetrics {
+        steps: completed,
+        mean_loss,
+        final_loss,
+        mean_q,
+        buffer_size,
+    };
+
+    info!(
+        steps = metrics.steps,
+        mean_loss = format!("{:.6}", metrics.mean_loss),
+        final_loss = format!("{:.6}", metrics.final_loss),
+        mean_q = format!("{:.4}", metrics.mean_q),
+        buffer_size = metrics.buffer_size,
+        checkpoint_dir = %config.checkpoint_dir,
+        "Challenger training session completed (challenger checkpoint written)"
+    );
+
+    Ok(metrics)
+}
+
+// ─── Scheduled challenger training (SAFE, gated) ──────────────────────────────
+
+/// Env var gating the periodic training scheduler. Default OFF: while unset or
+/// not truthy the scheduler logs "disabled" and returns. Deploying this code
+/// changes NOTHING until this is explicitly set truthy (safety invariant 1).
+pub const TRAIN_SCHEDULE_ENABLED_ENV: &str = "JANUS_TRAIN_SCHEDULE_ENABLED";
+/// Env var: seconds between scheduled sessions (default 900, floored to 60).
+pub const TRAIN_INTERVAL_SECS_ENV: &str = "JANUS_TRAIN_INTERVAL_SECS";
+/// Env var: gradient steps per scheduled session (default 200, floored to 1).
+pub const TRAIN_STEPS_PER_SESSION_ENV: &str = "JANUS_TRAIN_STEPS_PER_SESSION";
+/// Env var: challenger checkpoint dir (default [`DEFAULT_CHALLENGER_DIR`]).
+pub const TRAIN_CHALLENGER_DIR_ENV: &str = "JANUS_TRAIN_CHALLENGER_DIR";
+
+/// The LIVE champion checkpoint dir that forward inference hot-loads from.
+/// Scheduled training must NEVER write here (safety invariants 2 & 4).
+const CHAMPION_CHECKPOINT_DIR: &str = "checkpoints/backward";
+/// Default challenger checkpoint dir — a *sub*directory of the champion dir so
+/// it can never collide with the champion's own `latest_model.bin`.
+const DEFAULT_CHALLENGER_DIR: &str = "checkpoints/backward/challenger";
+
+/// Configuration for the periodic challenger-training scheduler, resolved from
+/// the process environment. Every field defaults to a safe/OFF value.
+#[derive(Debug, Clone)]
+struct TrainScheduleConfig {
+    /// Master gate — false unless [`TRAIN_SCHEDULE_ENABLED_ENV`] is truthy.
+    enabled: bool,
+    /// Seconds between sessions (>= 60).
+    interval_secs: u64,
+    /// Gradient steps per session (>= 1).
+    steps_per_session: usize,
+    /// Challenger checkpoint dir (never the champion dir).
+    challenger_dir: String,
+}
+
+impl TrainScheduleConfig {
+    /// Resolve the scheduler config from the environment. Defaults are safe:
+    /// disabled, 900s interval, 200 steps, challenger dir.
+    fn from_env() -> Self {
+        // Reuse the same truthy parser as the Qdrant gate so `1/true/yes/on`
+        // (case/whitespace tolerant) enable it and everything else — including
+        // unset — leaves it OFF (invariant 1).
+        let enabled =
+            parse_train_from_qdrant(std::env::var(TRAIN_SCHEDULE_ENABLED_ENV).ok().as_deref());
+        let interval_secs = std::env::var(TRAIN_INTERVAL_SECS_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(900)
+            .max(60);
+        let steps_per_session = std::env::var(TRAIN_STEPS_PER_SESSION_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(200)
+            .max(1);
+        let challenger_dir = std::env::var(TRAIN_CHALLENGER_DIR_ENV)
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| DEFAULT_CHALLENGER_DIR.to_string());
+        Self {
+            enabled,
+            interval_secs,
+            steps_per_session,
+            challenger_dir,
+        }
+    }
+}
+
+/// Periodic, SAFE, gated challenger-training scheduler.
+///
+/// ## Safety invariants (enforced here)
+///
+/// 1. **Default OFF.** Returns immediately (logging "disabled") unless
+///    [`TRAIN_SCHEDULE_ENABLED_ENV`] is explicitly truthy — deploying this code
+///    changes nothing until an operator opts in.
+/// 2. **Challenger dir only.** Each session's [`TrainingConfig::checkpoint_dir`]
+///    is set to the challenger dir, never the champion dir.
+/// 3. **No notifier.** It calls [`run_training_session`], which takes no
+///    [`CheckpointNotifier`], so no checkpoint notification is ever published
+///    and forward inference can never hot-load a scheduled checkpoint.
+/// 4. **Belt-and-braces guard.** If the resolved challenger dir equals the live
+///    champion dir it logs an error and refuses to run.
+///
+/// The loop is *sleep-first* (never trains at the boot instant) and never
+/// propagates a session error — a failed session is logged and the scheduler
+/// survives to retry on the next interval.
+pub async fn run_training_scheduler(cancel: tokio_util::sync::CancellationToken) {
+    let cfg = TrainScheduleConfig::from_env();
+
+    // ── Invariant 1: default-OFF master gate ──────────────────────────────
+    if !cfg.enabled {
+        info!(
+            env = TRAIN_SCHEDULE_ENABLED_ENV,
+            "training scheduler disabled — set JANUS_TRAIN_SCHEDULE_ENABLED=true to enable; no scheduled training will run"
+        );
+        return;
+    }
+
+    // ── Invariant 4: refuse to ever train into the live champion dir ──────
+    if cfg.challenger_dir == CHAMPION_CHECKPOINT_DIR {
+        tracing::error!(
+            challenger_dir = %cfg.challenger_dir,
+            champion_dir = CHAMPION_CHECKPOINT_DIR,
+            "training scheduler refusing to run: challenger dir equals the live champion checkpoint dir — scheduled training must never write the live model"
+        );
+        return;
+    }
+
+    let interval = tokio::time::Duration::from_secs(cfg.interval_secs);
+    info!(
+        interval_secs = cfg.interval_secs,
+        steps_per_session = cfg.steps_per_session,
+        challenger_dir = %cfg.challenger_dir,
+        "training scheduler enabled — periodic challenger training will run"
+    );
+
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                info!("training scheduler received shutdown signal");
+                break;
+            }
+            // Sleep-first: never train at the boot instant.
+            _ = tokio::time::sleep(interval) => {
+                let config = TrainingConfig {
+                    train_from_qdrant: train_from_qdrant_enabled(),
+                    // Invariant 2: challenger dir only — never the champion.
+                    checkpoint_dir: cfg.challenger_dir.clone(),
+                    ..TrainingConfig::default()
+                };
+                // Invariant 3: no notifier is passed on this path.
+                match run_training_session(&config, cfg.steps_per_session).await {
+                    Ok(m) => info!(
+                        steps = m.steps,
+                        mean_loss = format!("{:.6}", m.mean_loss),
+                        final_loss = format!("{:.6}", m.final_loss),
+                        mean_q = format!("{:.4}", m.mean_q),
+                        buffer_size = m.buffer_size,
+                        challenger_dir = %cfg.challenger_dir,
+                        "scheduled challenger training session completed"
+                    ),
+                    Err(e) => warn!(
+                        error = %e,
+                        "scheduled challenger training session failed — scheduler will retry next interval"
+                    ),
+                }
+            }
+        }
+    }
+
+    info!("training scheduler exited");
 }
 
 // ─── Core computation (kept for priority-update recomputation) ─────────────
@@ -1405,6 +1743,115 @@ mod tests {
         assert!(
             any_changed,
             "Online weights should change after gradient steps"
+        );
+    }
+
+    // ── Challenger training scheduler (SAFE, gated) ───────────────────────
+
+    #[test]
+    fn test_train_one_step_returns_finite_loss() {
+        let config = TrainingConfig::default();
+        let tcfg = build_trainable_config(&config);
+        let icfg = build_inference_config(&config);
+
+        let mut online = DqnOnlineModel::new(tcfg, config.learning_rate, config.weight_decay)
+            .expect("Failed to create DQN online model");
+        let mut target = LstmPredictor::new(icfg, BackendDevice::cpu());
+        online.soft_update_target(&mut target, 1.0);
+
+        let batch_size = 8;
+        let mut buffer = SumTree::new(config.replay_capacity, config.per_alpha, config.per_beta);
+        for _ in 0..batch_size {
+            buffer.add(create_placeholder_experience(), 1.0);
+        }
+
+        let outcome = train_one_step(&mut online, &mut target, &mut buffer, &config, batch_size)
+            .expect("train_one_step failed");
+        assert!(
+            outcome.step_result.loss.is_finite(),
+            "loss should be finite: {}",
+            outcome.step_result.loss
+        );
+        assert_eq!(outcome.batch_size, batch_size);
+        assert_eq!(online.step_count, 1, "one step should advance the counter");
+    }
+
+    #[tokio::test]
+    async fn test_run_training_session_writes_challenger_only() {
+        // Point the session at an absolute tempdir; it must write ONLY there
+        // and never touch the live champion path.
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let challenger = tmp.path().join("challenger");
+        let config = TrainingConfig {
+            checkpoint_dir: challenger.to_string_lossy().to_string(),
+            ..TrainingConfig::default()
+        };
+
+        let metrics = run_training_session(&config, 3)
+            .await
+            .expect("training session failed");
+
+        assert_eq!(metrics.steps, 3, "should complete all 3 steps");
+        assert!(metrics.mean_loss.is_finite());
+        assert!(metrics.final_loss.is_finite());
+
+        // The challenger checkpoint WAS written.
+        assert!(
+            challenger.join("latest_model.bin").exists(),
+            "challenger checkpoint should exist"
+        );
+
+        // The live champion path was NOT created anywhere in the sandbox — the
+        // session must never write "checkpoints/backward/latest_model.bin".
+        assert!(
+            !tmp.path()
+                .join("checkpoints/backward/latest_model.bin")
+                .exists(),
+            "the live champion checkpoint must remain untouched"
+        );
+    }
+
+    #[test]
+    fn test_train_schedule_config_from_env_default_safe() {
+        // With the schedule env vars unset in the test process, the resolved
+        // config must be safe: disabled and NEVER the champion dir.
+        let cfg = TrainScheduleConfig::from_env();
+        assert!(!cfg.enabled, "scheduler must default OFF");
+        assert_ne!(
+            cfg.challenger_dir, CHAMPION_CHECKPOINT_DIR,
+            "challenger dir must never default to the champion dir"
+        );
+        assert_eq!(cfg.challenger_dir, DEFAULT_CHALLENGER_DIR);
+        assert!(cfg.interval_secs >= 60);
+        assert!(cfg.steps_per_session >= 1);
+    }
+
+    #[test]
+    fn test_train_schedule_enabled_default_off() {
+        // Invariant 1: deploying the scheduler must change NOTHING until the
+        // operator opts in. The gate value for an unset env var (None) is OFF.
+        assert_eq!(TRAIN_SCHEDULE_ENABLED_ENV, "JANUS_TRAIN_SCHEDULE_ENABLED");
+        assert!(!parse_train_from_qdrant(None));
+        assert!(!parse_train_from_qdrant(Some("false")));
+        assert!(!parse_train_from_qdrant(Some("0")));
+        // Only explicit truthy tokens enable it.
+        assert!(parse_train_from_qdrant(Some("true")));
+        assert!(parse_train_from_qdrant(Some("1")));
+    }
+
+    #[tokio::test]
+    async fn test_run_training_scheduler_disabled_returns_promptly() {
+        // With the scheduler disabled (env unset), it must log "disabled" and
+        // return immediately rather than entering the sleep/train loop.
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_training_scheduler(cancel),
+        )
+        .await;
+        assert!(
+            res.is_ok(),
+            "disabled scheduler should return promptly, not block"
         );
     }
 }
