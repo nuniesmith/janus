@@ -1504,8 +1504,15 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                 }
                 let (tx, _writer_task) =
                     crate::experience::spawn_writer(experience_cfg.clone(), redis_client);
-                info!("experience pipeline: ENABLED (recording per-bar decision transitions)");
-                Some(crate::experience::ExperienceRecorder::new(tx))
+                let reward_cfg = crate::experience::RewardConfig::from_env();
+                info!(
+                    horizon = reward_cfg.horizon,
+                    fee = reward_cfg.fee,
+                    vol_norm = reward_cfg.vol_norm,
+                    "experience pipeline: ENABLED (recording decision transitions; \
+                     Phase 2.5 reward — horizon holding return, fee-aware, vol-normalized)"
+                );
+                Some(crate::experience::ExperienceRecorder::with_reward(tx, reward_cfg))
             } else {
                 None
             };

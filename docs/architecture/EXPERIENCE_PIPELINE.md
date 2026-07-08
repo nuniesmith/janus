@@ -262,6 +262,19 @@ reorder would otherwise corrupt every stored experience.
 
 ### 3.3 Reward: what is honest today
 
+> **Phase 2.5 update (implemented).** The single-bar return below was the
+> honest Phase-1 baseline. The recorder now computes a **multi-bar holding
+> return, fee-aware and volatility-normalized** (the writer-side upgrade named
+> in §7 Phase-2 point 4) — see `RewardConfig` in `services/forward/src/experience.rs`.
+> `RewardConfig::legacy()` still reproduces the exact single-bar scheme
+> bit-for-bit; production wires `RewardConfig::from_env()`. Env knobs:
+> `JANUS_EXPERIENCE_REWARD_HORIZON` (default `5` bars),
+> `JANUS_EXPERIENCE_REWARD_FEE_BPS` (default `0`),
+> `JANUS_EXPERIENCE_REWARD_VOL_NORM` (default `true`),
+> `JANUS_EXPERIENCE_REWARD_VOL_FLOOR` (default `1e-4`). This needs **no** trade-
+> close feed and improves the signal the DQN trains on directly. The baseline
+> below is retained for context.
+
 Candidates, in decreasing honesty-per-effort:
 
 | Signal | Available? | Verdict for Phase 1 |
@@ -517,7 +530,13 @@ is stored; full GAF images would need a different store layout — open question
    design's Phase 1/2 code. The design degrades gracefully to per-bar rewards.
 4. Reward-scheme experiments per `ML_PHASE1_HANDOFF.md` §A.2 (fees,
    vol-normalization, horizon >1 bar) — all writer-side constants once the
-   pipe exists.
+   pipe exists. **✅ Implemented (Phase 2.5):** `RewardConfig` in
+   `services/forward/src/experience.rs` computes a fee-aware, volatility-
+   normalized, multi-bar (`horizon`) holding return. Overlapping horizon
+   windows keep row volume at ~one per bar per key. This is the honest,
+   self-contained upgrade — unlike point 3 it needs no trade-close feed, so it
+   improves the live DQN's reward signal today. Point 3 (true realized-PnL
+   join) remains the future upgrade *if* something starts POSTing paper closes.
 
 ### Phase 1.5 (parallel, small) — UMAP payload enrichment
 
