@@ -973,6 +973,43 @@ const CHAMPION_CHECKPOINT_DIR: &str = "checkpoints/backward";
 /// it can never collide with the champion's own `latest_model.bin`.
 const DEFAULT_CHALLENGER_DIR: &str = "checkpoints/backward/challenger";
 
+/// Lexically normalize a path (no filesystem access): drop `.`/empty components
+/// and resolve `..`. Enough to fold trailing-slash / `./` / `..` variants that
+/// an exact-string compare would miss.
+fn lexical_normalize(p: &str) -> std::path::PathBuf {
+    use std::path::{Component, PathBuf};
+    let mut out = PathBuf::new();
+    for comp in std::path::Path::new(p).components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// True if scheduled training into `challenger_dir` would write the SAME
+/// `latest_model.bin` as the live champion (safety invariant 4). Compares
+/// lexically-normalized paths — and canonical forms when both resolve on disk —
+/// so a trailing slash, `./`, `..`, or a relative-vs-absolute spelling of the
+/// champion dir cannot slip past what used to be an exact-string guard.
+fn collides_with_champion(challenger_dir: &str) -> bool {
+    let chal = lexical_normalize(challenger_dir);
+    let champ = lexical_normalize(CHAMPION_CHECKPOINT_DIR);
+    if chal == champ {
+        return true;
+    }
+    // Relative-vs-absolute (or symlinked) spellings of the same real directory:
+    // compare canonical forms when both actually exist on disk.
+    match (std::fs::canonicalize(&chal), std::fs::canonicalize(&champ)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
 /// Configuration for the periodic challenger-training scheduler, resolved from
 /// the process environment. Every field defaults to a safe/OFF value.
 #[derive(Debug, Clone)]
@@ -1051,11 +1088,14 @@ pub async fn run_training_scheduler(cancel: tokio_util::sync::CancellationToken)
     }
 
     // ── Invariant 4: refuse to ever train into the live champion dir ──────
-    if cfg.challenger_dir == CHAMPION_CHECKPOINT_DIR {
+    // Path-aware (not exact-string): folds trailing-slash / `./` / `..` /
+    // relative-vs-absolute spellings so a misconfigured challenger dir can't
+    // resolve onto the champion's latest_model.bin.
+    if collides_with_champion(&cfg.challenger_dir) {
         tracing::error!(
             challenger_dir = %cfg.challenger_dir,
             champion_dir = CHAMPION_CHECKPOINT_DIR,
-            "training scheduler refusing to run: challenger dir equals the live champion checkpoint dir — scheduled training must never write the live model"
+            "training scheduler refusing to run: challenger dir resolves onto the live champion checkpoint dir — scheduled training must never write the live model"
         );
         return;
     }
@@ -1824,6 +1864,22 @@ mod tests {
         assert_eq!(cfg.challenger_dir, DEFAULT_CHALLENGER_DIR);
         assert!(cfg.interval_secs >= 60);
         assert!(cfg.steps_per_session >= 1);
+    }
+
+    #[test]
+    fn test_collides_with_champion_folds_path_variants() {
+        // Invariant 4 must be path-aware, not exact-string: every spelling that
+        // resolves onto the champion dir must be rejected.
+        assert!(collides_with_champion(CHAMPION_CHECKPOINT_DIR));
+        assert!(collides_with_champion("checkpoints/backward/")); // trailing slash
+        assert!(collides_with_champion("./checkpoints/backward")); // leading ./
+        assert!(collides_with_champion("checkpoints/./backward")); // interior .
+        assert!(collides_with_champion("checkpoints/backward/../backward")); // ..
+        // The safe default (a subdirectory) and unrelated dirs must NOT collide.
+        assert!(!collides_with_champion(DEFAULT_CHALLENGER_DIR));
+        assert!(!collides_with_champion("checkpoints/backward/challenger/"));
+        assert!(!collides_with_champion("/tmp/janus-challenger"));
+        assert!(!collides_with_champion("checkpoints/forward"));
     }
 
     #[test]
