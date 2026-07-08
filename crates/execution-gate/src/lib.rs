@@ -13,7 +13,7 @@
 //! 2. [`GateVerdict::BlockRisk`] — risk engine forbids trading
 //! 3. [`GateVerdict::BlockVolFilter`] — volatility outside the entry band
 //! 4. [`GateVerdict::BlockQuality`] — signal quality too low *(first entries only)*
-//! 5. [`GateVerdict::BlockAoDivergence`] — Awesome-Oscillator sign disagrees *(first entries only)*
+//! 5. [`GateVerdict::BlockAoDivergence`] — Awesome-Oscillator sign disagrees *(first-entry trend setups only; skipped for mean-reversion or when disabled)*
 //! 6. [`GateVerdict::BlockFeeViability`] — fees too large vs. take-profit
 //! 7. [`GateVerdict::BlockCnnDisagree`] — CNN disagrees with the side
 //! 8. [`GateVerdict::BlockCnnConfidence`] — CNN confidence below threshold

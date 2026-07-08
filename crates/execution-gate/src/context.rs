@@ -76,6 +76,14 @@ pub struct GateContext {
     pub qual_min: f64,
     /// Awesome-Oscillator value (sign used for divergence check).
     pub ao: f64,
+    /// Whether the AO-divergence gate is active. Kill-switch wired from
+    /// `JANUS_GATE_AO_DIVERGENCE` (default enabled); `false` skips the gate.
+    pub ao_divergence_enabled: bool,
+    /// `true` when this entry is a mean-reversion decision (market regime is
+    /// Mean-Reverting, or a mean-reversion strategy). The AO-divergence gate is
+    /// trend-following, so it is skipped for these entries — janus's dominant
+    /// regime enters *against* AO by design (e.g. RSI-reversal oversold buys).
+    pub mean_reversion: bool,
     /// Take-profit target as a fraction (e.g. `0.004` = 0.4%).
     pub tp_pct: f64,
     /// Taker fee as a fraction (per side).
@@ -104,6 +112,8 @@ impl Default for GateContext {
             quality: 0.0,
             qual_min: 50.0,
             ao: 0.0,
+            ao_divergence_enabled: true,
+            mean_reversion: false,
             tp_pct: 0.004,
             fee_taker: 0.0006,
             fee_slip: 0.0001,
