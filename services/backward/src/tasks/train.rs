@@ -839,6 +839,15 @@ pub async fn handle_training(job: TrainJob, notifier: Option<&CheckpointNotifier
 /// Mirrors the default [`TrainJob`] batch size used by [`handle_training`].
 const SESSION_BATCH_SIZE: usize = 32;
 
+/// Number of most-recent experiences the challenger is greedily evaluated on
+/// after a training session (see [`evaluate_challenger`]).
+///
+/// NOTE: this slice currently OVERLAPS the training window — the session
+/// trains on prioritized samples drawn from the same buffer — so the resulting
+/// numbers are in-sample and should be read as a coarse observability signal,
+/// not a clean held-out score. A future change can carve a disjoint holdout.
+const EVAL_SLICE_SIZE: usize = 256;
+
 /// Metrics summarising a multi-step training session (challenger training).
 #[derive(Debug, Clone)]
 pub struct TrainSessionMetrics {
@@ -852,6 +861,129 @@ pub struct TrainSessionMetrics {
     pub mean_q: f64,
     /// Replay-buffer size the session trained on.
     pub buffer_size: usize,
+    /// Greedy-eval winrate over the recent slice: the fraction of eval samples
+    /// where the challenger's greedy action matched the recorded action AND
+    /// that action's realized reward was non-negative (a conservative lower
+    /// bound — see the `evaluate_challenger` / `compute_challenger_eval` docs).
+    pub eval_winrate: f64,
+    /// Mean realized reward over the recent eval slice.
+    pub eval_mean_reward: f64,
+    /// Number of experiences actually evaluated (at most `EVAL_SLICE_SIZE`).
+    pub eval_samples: usize,
+}
+
+/// Outcome of greedily evaluating a trained challenger over a recent slice of
+/// the replay buffer.
+///
+/// ## What the metric measures (and its honest limits)
+///
+/// For each evaluated experience we run the trained model forward on the
+/// recorded `state` and take the argmax (greedy) action. A realized reward is
+/// only ever available for the action that was *actually taken* in the log, so
+/// there is no honest counterfactual reward when the greedy action differs
+/// from the recorded one.
+///
+/// * `winrate` — fraction of eval samples where the greedy action **matched the
+///   recorded action** *and* that action's realized `reward` was non-negative.
+///   Samples where the greedy action disagrees with the log are counted as
+///   non-wins (we have no honest realized reward for the greedy action there),
+///   making this a **conservative lower bound** on greedy-policy quality rather
+///   than a true win-rate.
+/// * `mean_reward` — mean of the recorded `reward` across the slice. This is
+///   independent of the greedy action; it characterises the realized-reward
+///   distribution of the recent buffer the challenger trained against.
+///
+/// This is for observability and a future promotion gate only — it never
+/// auto-promotes and never touches the champion.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ChallengerEval {
+    winrate: f64,
+    mean_reward: f64,
+    samples: usize,
+}
+
+/// Index of the maximum value in `v` (first-max on ties). Empty slice → 0.
+fn argmax(v: &[f64]) -> usize {
+    v.iter()
+        .enumerate()
+        .fold((0usize, f64::NEG_INFINITY), |(best_i, best_v), (i, &x)| {
+            if x > best_v {
+                (i, x)
+            } else {
+                (best_i, best_v)
+            }
+        })
+        .0
+}
+
+/// Pure computation of the challenger eval metric (see [`ChallengerEval`]),
+/// separated from any model/tensor dependency so it is unit-testable.
+///
+/// * `q_values[i]`        – model Q-values per action for eval sample `i`.
+/// * `recorded_actions[i]`– action index actually taken in the log.
+/// * `rewards[i]`         – realized reward recorded for the taken action.
+///
+/// All three slices must be the same length; a zero-length input yields a
+/// zeroed result.
+fn compute_challenger_eval(
+    q_values: &[Vec<f64>],
+    recorded_actions: &[usize],
+    rewards: &[f64],
+) -> ChallengerEval {
+    let n = q_values.len();
+    if n == 0 {
+        return ChallengerEval {
+            winrate: 0.0,
+            mean_reward: 0.0,
+            samples: 0,
+        };
+    }
+
+    let mut wins = 0usize;
+    let mut reward_sum = 0.0_f64;
+    for i in 0..n {
+        reward_sum += rewards[i];
+        // Greedy action agrees with the log AND its realized reward is
+        // non-negative → credit a win (honest: we only have a realized reward
+        // for the recorded action).
+        if argmax(&q_values[i]) == recorded_actions[i] && rewards[i] >= 0.0 {
+            wins += 1;
+        }
+    }
+
+    ChallengerEval {
+        winrate: wins as f64 / n as f64,
+        mean_reward: reward_sum / n as f64,
+        samples: n,
+    }
+}
+
+/// Greedily evaluate a trained challenger `predictor` on the most recent
+/// [`EVAL_SLICE_SIZE`] experiences in `buffer` (see [`ChallengerEval`] for the
+/// precise metric definition and its in-sample caveat).
+fn evaluate_challenger(
+    predictor: &LstmPredictor<CpuBackend>,
+    buffer: &SumTree,
+    config: &TrainingConfig,
+) -> ChallengerEval {
+    let recent = buffer.recent(EVAL_SLICE_SIZE);
+    if recent.is_empty() {
+        return ChallengerEval {
+            winrate: 0.0,
+            mean_reward: 0.0,
+            samples: 0,
+        };
+    }
+
+    let states: Vec<&State> = recent.iter().map(|e| &e.state).collect();
+    let q_values = batch_predict(predictor, &states, config.model_input_size);
+    let recorded_actions: Vec<usize> = recent
+        .iter()
+        .map(|e| action_to_index(&e.action.action_type))
+        .collect();
+    let rewards: Vec<f64> = recent.iter().map(|e| e.reward as f64).collect();
+
+    compute_challenger_eval(&q_values, &recorded_actions, &rewards)
 }
 
 /// Run a multi-step DQN training session from a FRESH online + target model over
@@ -879,12 +1011,58 @@ pub async fn run_training_session(
         "Starting multi-step challenger training session"
     );
 
-    // ── Build fresh Q-networks (same construction as handle_training) ─────
-    let trainable_cfg = build_trainable_config(config);
+    // ── Build the online Q-network, RESUMING from the challenger checkpoint
+    //    when one exists so learning accumulates across sessions. ───────────
+    //
+    // The resume path reads the exact file the session SAVES to
+    // (`<checkpoint_dir>/latest_model.bin`) via the same loader forward
+    // inference uses (`LstmPredictor::load`). Any failure — missing file,
+    // architecture mismatch, corrupt checkpoint — degrades to a fresh init
+    // with a `warn!`; it must NEVER panic or abort the scheduler.
     let inference_cfg = build_inference_config(config);
+    let checkpoint_path = std::path::Path::new(&config.checkpoint_dir).join("latest_model.bin");
 
-    let mut online = DqnOnlineModel::new(trainable_cfg, config.learning_rate, config.weight_decay)
-        .context("Failed to create online DQN model")?;
+    let mut online = if checkpoint_path.exists() {
+        match LstmPredictor::<CpuBackend>::load(&checkpoint_path, BackendDevice::cpu()).and_then(
+            |predictor| {
+                DqnOnlineModel::from_predictor(
+                    &predictor,
+                    build_trainable_config(config),
+                    config.learning_rate,
+                    config.weight_decay,
+                )
+            },
+        ) {
+            Ok(model) => {
+                info!(path = %checkpoint_path.display(), "resumed challenger from checkpoint");
+                model
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    path = %checkpoint_path.display(),
+                    "failed to load challenger checkpoint — falling back to fresh challenger init"
+                );
+                DqnOnlineModel::new(
+                    build_trainable_config(config),
+                    config.learning_rate,
+                    config.weight_decay,
+                )
+                .context("Failed to create online DQN model")?
+            }
+        }
+    } else {
+        info!(path = %checkpoint_path.display(), "fresh challenger init (no checkpoint)");
+        DqnOnlineModel::new(
+            build_trainable_config(config),
+            config.learning_rate,
+            config.weight_decay,
+        )
+        .context("Failed to create online DQN model")?
+    };
+
+    // Target network mirrors the (resumed or fresh) online weights exactly —
+    // unchanged full-copy sync (τ = 1.0) so TD targets start consistent.
     let mut target_model = LstmPredictor::new(inference_cfg, BackendDevice::cpu());
     online.soft_update_target(&mut target_model, 1.0); // full copy to start
 
@@ -932,12 +1110,20 @@ pub async fn run_training_session(
     save_checkpoint(&predictor, std::path::Path::new(&config.checkpoint_dir))
         .context("Failed to save challenger checkpoint")?;
 
+    // ── Greedy eval on a recent slice (observability only — NEVER promotes,
+    //    NEVER touches the champion). See [`ChallengerEval`] / EVAL_SLICE_SIZE
+    //    for the metric definition and its in-sample caveat. ────────────────
+    let eval = evaluate_challenger(&predictor, &replay_buffer, config);
+
     let metrics = TrainSessionMetrics {
         steps: completed,
         mean_loss,
         final_loss,
         mean_q,
         buffer_size,
+        eval_winrate: eval.winrate,
+        eval_mean_reward: eval.mean_reward,
+        eval_samples: eval.samples,
     };
 
     info!(
@@ -946,6 +1132,9 @@ pub async fn run_training_session(
         final_loss = format!("{:.6}", metrics.final_loss),
         mean_q = format!("{:.4}", metrics.mean_q),
         buffer_size = metrics.buffer_size,
+        eval_winrate = format!("{:.4}", metrics.eval_winrate),
+        eval_mean_reward = format!("{:.6}", metrics.eval_mean_reward),
+        eval_samples = metrics.eval_samples,
         checkpoint_dir = %config.checkpoint_dir,
         "Challenger training session completed (challenger checkpoint written)"
     );
@@ -1130,6 +1319,9 @@ pub async fn run_training_scheduler(cancel: tokio_util::sync::CancellationToken)
                         final_loss = format!("{:.6}", m.final_loss),
                         mean_q = format!("{:.4}", m.mean_q),
                         buffer_size = m.buffer_size,
+                        eval_winrate = format!("{:.4}", m.eval_winrate),
+                        eval_mean_reward = format!("{:.6}", m.eval_mean_reward),
+                        eval_samples = m.eval_samples,
                         challenger_dir = %cfg.challenger_dir,
                         "scheduled challenger training session completed"
                     ),
@@ -1835,6 +2027,16 @@ mod tests {
         assert!(metrics.mean_loss.is_finite());
         assert!(metrics.final_loss.is_finite());
 
+        // The eval metric was computed on a non-empty recent slice and is in
+        // its valid range.
+        assert!(metrics.eval_samples > 0, "eval slice must be non-empty");
+        assert!(
+            (0.0..=1.0).contains(&metrics.eval_winrate),
+            "winrate must be a fraction: {}",
+            metrics.eval_winrate
+        );
+        assert!(metrics.eval_mean_reward.is_finite());
+
         // The challenger checkpoint WAS written.
         assert!(
             challenger.join("latest_model.bin").exists(),
@@ -1848,6 +2050,85 @@ mod tests {
                 .join("checkpoints/backward/latest_model.bin")
                 .exists(),
             "the live champion checkpoint must remain untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_training_session_resumes_from_checkpoint() {
+        // Two consecutive sessions into the SAME challenger dir: the first
+        // writes `latest_model.bin`; the second must load it via the resume
+        // path (LstmPredictor::load → DqnOnlineModel::from_predictor) without
+        // erroring, still write only its own dir, and still emit eval metrics.
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let challenger = tmp.path().join("challenger");
+        let config = TrainingConfig {
+            checkpoint_dir: challenger.to_string_lossy().to_string(),
+            ..TrainingConfig::default()
+        };
+
+        // Session 1 — no checkpoint yet → fresh init path.
+        run_training_session(&config, 2)
+            .await
+            .expect("first session failed");
+        assert!(
+            challenger.join("latest_model.bin").exists(),
+            "first session must write the challenger checkpoint"
+        );
+
+        // Session 2 — checkpoint now exists → resume path must succeed.
+        let metrics = run_training_session(&config, 2)
+            .await
+            .expect("resumed session failed");
+        assert_eq!(metrics.steps, 2);
+        assert!(metrics.mean_loss.is_finite());
+        assert!(metrics.eval_samples > 0);
+    }
+
+    #[test]
+    fn test_argmax_first_max_on_ties() {
+        assert_eq!(argmax(&[0.1, 0.9, 0.2, 0.0]), 1);
+        assert_eq!(argmax(&[1.0, 1.0, 0.5]), 0, "ties resolve to first max");
+        assert_eq!(argmax(&[]), 0, "empty slice defaults to 0");
+        assert_eq!(argmax(&[-3.0, -1.0, -2.0]), 1);
+    }
+
+    #[test]
+    fn test_compute_challenger_eval_over_synthetic_slice() {
+        // Four samples exercising every branch:
+        //   0: greedy==recorded, reward>=0            → win
+        //   1: greedy!=recorded (no honest reward)    → not win
+        //   2: greedy==recorded, reward<0             → not win
+        //   3: greedy==recorded, reward==0 (boundary) → win
+        let q_values = vec![
+            vec![0.1, 0.9, 0.0, 0.0], // argmax = 1
+            vec![0.9, 0.1, 0.0, 0.0], // argmax = 0
+            vec![0.0, 0.0, 0.0, 1.0], // argmax = 3
+            vec![0.0, 0.0, 1.0, 0.0], // argmax = 2
+        ];
+        let recorded_actions = vec![1usize, 1, 3, 2];
+        let rewards = vec![0.5_f64, 1.0, -0.2, 0.0];
+
+        let eval = compute_challenger_eval(&q_values, &recorded_actions, &rewards);
+        assert_eq!(eval.samples, 4);
+        assert!((eval.winrate - 0.5).abs() < 1e-12, "winrate = {}", eval.winrate);
+        // mean_reward = (0.5 + 1.0 - 0.2 + 0.0) / 4 = 0.325
+        assert!(
+            (eval.mean_reward - 0.325).abs() < 1e-12,
+            "mean_reward = {}",
+            eval.mean_reward
+        );
+    }
+
+    #[test]
+    fn test_compute_challenger_eval_empty_is_zeroed() {
+        let eval = compute_challenger_eval(&[], &[], &[]);
+        assert_eq!(
+            eval,
+            ChallengerEval {
+                winrate: 0.0,
+                mean_reward: 0.0,
+                samples: 0
+            }
         );
     }
 
