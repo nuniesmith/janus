@@ -24,6 +24,19 @@ async fn main() -> Result<()> {
         .with_line_number(true)
         .init();
 
+    // ── One-shot, explicitly-invoked challenger → champion promotion ──────
+    // `janus-backward promote` runs the gated promotion once and exits. This is
+    // the ONLY entrypoint to promotion: normal startup (no args) never reaches
+    // it, it can never auto-fire, and it still self-gates on
+    // JANUS_PROMOTE_ENABLED inside run_promotion_if_enabled (see tasks::promote).
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("promote") {
+        info!("janus-backward: one-shot challenger → champion promotion requested");
+        let outcome = janus_backward::tasks::promote::run_promotion_if_enabled().await?;
+        info!(?outcome, "promotion subcommand finished");
+        return Ok(());
+    }
+
     info!("╔═══════════════════════════════════════════════════════════╗");
     info!("║       JANUS BACKWARD SERVICE - Historical Analytics      ║");
     info!("║   Database • Performance • Metrics • Scheduled Jobs      ║");

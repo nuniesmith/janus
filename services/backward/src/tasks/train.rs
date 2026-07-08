@@ -1121,6 +1121,20 @@ pub async fn run_training_session(
     //    for the metric definition and its in-sample caveat. ────────────────
     let eval = evaluate_challenger(&predictor, &replay_buffer, config);
 
+    // Persist this session's eval so the SEPARATE, gated promotion tool has a
+    // recorded metric history to read (crate::tasks::promote). This appends ONLY
+    // inside the challenger checkpoint dir (config.checkpoint_dir), never the
+    // champion dir, so the champion-isolation invariant is preserved. Best-effort:
+    // a write failure is logged and never aborts training.
+    if let Err(e) = crate::tasks::promote::append_session_eval(
+        std::path::Path::new(&config.checkpoint_dir),
+        eval.winrate,
+        eval.samples,
+        eval.mean_reward,
+    ) {
+        warn!(error = %e, "failed to append challenger eval history (non-fatal)");
+    }
+
     let metrics = TrainSessionMetrics {
         steps: completed,
         mean_loss,
