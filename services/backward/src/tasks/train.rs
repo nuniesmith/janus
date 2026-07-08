@@ -907,11 +907,7 @@ fn argmax(v: &[f64]) -> usize {
     v.iter()
         .enumerate()
         .fold((0usize, f64::NEG_INFINITY), |(best_i, best_v), (i, &x)| {
-            if x > best_v {
-                (i, x)
-            } else {
-                (best_i, best_v)
-            }
+            if x > best_v { (i, x) } else { (best_i, best_v) }
         })
         .0
 }
@@ -2110,7 +2106,11 @@ mod tests {
 
         let eval = compute_challenger_eval(&q_values, &recorded_actions, &rewards);
         assert_eq!(eval.samples, 4);
-        assert!((eval.winrate - 0.5).abs() < 1e-12, "winrate = {}", eval.winrate);
+        assert!(
+            (eval.winrate - 0.5).abs() < 1e-12,
+            "winrate = {}",
+            eval.winrate
+        );
         // mean_reward = (0.5 + 1.0 - 0.2 + 0.0) / 4 = 0.325
         assert!(
             (eval.mean_reward - 0.325).abs() < 1e-12,
