@@ -5,7 +5,7 @@
 > The workspace is standalone — its own `Dockerfile` + `docker-compose.yml`
 > live here. Unrelated rustcode / claw / RC-CRATES items are **not** tracked
 > here (see "Out of scope" below).
-> **Last synced:** 2026-06-08
+> **Last synced:** 2026-07-09
 >
 > ⭐ **2026-06-07 — janus is now the platform.** `src/ruby/` was deleted from
 > `fks`; the Python data/engine/trainer service is gone. janus no longer
@@ -21,7 +21,7 @@
 
 ---
 
-## Status snapshot (2026-06-08)
+## Status snapshot (2026-07-09)
 
 - **Platform shift (2026-06-07):** `src/ruby/` was deleted from fks —
   **janus is the platform now**, not just the brain. The remaining roadmap is
@@ -42,6 +42,20 @@
   advisory by default** — all 9 gates act on real data, with Redis observability
   + breaker-state persistence; enforcement is one flag away (`JANUS_GATE_ENFORCE`).
   See Track C.
+- **Backward training line (2026-07):** the SAFE challenger scheduler (#146,
+  `JANUS_TRAIN_SCHEDULE_ENABLED`, default off) now **resumes the challenger
+  from its checkpoint** across sessions (fresh-init fallback on any load
+  failure) and records an **honest `eval_winrate`** per session — greedy action
+  vs the recorded action, a conservative lower bound (greedy≠recorded counts
+  as a non-win) (#150/#152). A **guarded challenger→champion promotion** path
+  shipped **DORMANT** (#153): reachable only via the explicit
+  `janus-backward promote` one-shot, gated on `JANUS_PROMOTE_ENABLED`
+  (default off) + N consecutive qualifying evals (each with
+  `eval_samples > 0`), backup-before-overwrite + atomic swap; it is never
+  called by the scheduler or any loop. Experience rewards run the Phase 2.5
+  scheme (#145: multi-bar horizon, volatility-normalized) and are
+  **fee-aware** via `JANUS_EXPERIENCE_REWARD_FEE_BPS` (code default 0; the
+  fks deployment sets 8).
 - **Data factory (2026-06-08):** the gap-scan → reconcile → backfill loop is
   complete in Rust — `plan_candle_backfill` (bounded, newest-first windows),
   `GapIntegrationManager::handle_candle_scan`, and an opt-in periodic
@@ -203,6 +217,15 @@ path to *create* champions from scratch later.
       (applied by `ForwardGate::apply_fees`; defaults match `GateContext`).
       **All 8 entry gates now act on real data** — only the consecutive-loss
       breaker (close-driven) remains.
+- [x] **AO-divergence gate: regime-aware + kill-switch (#154).** The AO gate is
+      trend-following (blocks a Buy when AO<0), which was rejecting
+      mean-reversion's core against-AO setups — janus's dominant regime. The
+      gate is now skipped for mean-reversion entries (`ctx.mean_reversion`, set
+      per-candle from the live `RegimeManager` in the loop) and can be disabled
+      outright via the `JANUS_GATE_AO_DIVERGENCE` kill-switch (default on). The
+      quality floor is also env-tunable now: `JANUS_GATE_QUAL_MIN` (default 50).
+      Both are read in `ForwardGate::from_env`
+      (`services/forward/src/gate_integration.rs`).
 - [ ] **Quality refinement (optional)** — replace the momentum/wave quality
       proxy with `indicators-ta`'s `compute_signal` confluence/`bull_score` once
       the `LiquidityProfile` + `ConfluenceEngine` inputs are assembled per bar.
@@ -239,8 +262,11 @@ path to *create* champions from scratch later.
       (1) run advisory for N days, watch the `gate` metadata + block reasons;
       (2) confirm the block mix looks right (esp. that warmup-empty producers
       aren't over-blocking); (3) flip `JANUS_GATE_ENFORCE=1`. Related tunables:
-      `JANUS_GATE_TP_ATR_MULT` (fee-viability TP target), `ENABLE_CNN_INFERENCE`
-      (CNN gates), `JANUS_PROP_FIRM_ENFORCE` / `JANUS_RISK_ENFORCE` (sibling gates).
+      `JANUS_GATE_TP_ATR_MULT` (fee-viability TP target), `JANUS_GATE_QUAL_MIN`
+      (quality floor, default 50), `JANUS_GATE_AO_DIVERGENCE` (AO-divergence
+      kill-switch, default on; gate is regime-aware — skipped for
+      mean-reversion entries, #154), `ENABLE_CNN_INFERENCE` (CNN gates),
+      `JANUS_PROP_FIRM_ENFORCE` / `JANUS_RISK_ENFORCE` (sibling gates).
 - [ ] **Exit:** order flow gated entirely in Rust; the human-confirmation
       invariant (`EXECUTION_MODE=paper_trading` default) preserved throughout.
 
@@ -372,8 +398,12 @@ janus half of the work.
       (`ML_VISION_SCOPE.md`, #58). **Phase 1 machinery is built + merged (#59–#62):** GAF feature
       extractor → real experience builder → sliding-window batches → opt-in `backward` seeding.
       **Remaining (needs real data + GPU):** run the go/no-go probe (does GAF beat chance?) per
-      `docs/architecture/ML_PHASE1_HANDOFF.md` (#63); enrich the flat features + reward scheme;
-      serve into forward only if it shows edge.
+      `docs/architecture/ML_PHASE1_HANDOFF.md` (#63); enrich the flat features (the reward scheme
+      is done — #145 Phase 2.5: multi-bar, volatility-normalized, fee-aware via
+      `JANUS_EXPERIENCE_REWARD_FEE_BPS`); serve into forward only if it shows edge. The backward
+      training line itself is live: SAFE challenger scheduler with checkpoint resume + honest
+      `eval_winrate` (#146/#150/#152) and a DORMANT guarded promotion gate (#153) — see the
+      status snapshot.
 
 ### Multi-asset breadth
 - [ ] **Futures + equities asset classes.** `crates/optimizer/src/asset.rs`

@@ -97,6 +97,11 @@ Requires Rust stable (edition 2024). GPU features require CUDA toolkit + matchin
 | `QUESTDB_HOST` | `questdb` | QuestDB host (compose-bundled) |
 | `ALERTMANAGER_URL` | `http://fks_alertmanager:9093` | Signal push endpoint — optional; if unreachable (standalone), pushes warn and continue |
 | `JANUS_FORWARD_URL` | `http://fks_janus:8180` | Brain REST URL an external executor calls |
+| `JANUS_TRAIN_SCHEDULE_ENABLED` | off | Backward challenger training scheduler — trains `checkpoints/backward/challenger/` only, never the live champion |
+| `JANUS_PROMOTE_ENABLED` | off | Guarded challenger→champion promotion gate; only acts via the explicit `janus-backward promote` one-shot (dormant until enabled) |
+| `JANUS_GATE_QUAL_MIN` | `50` | Execution-gate signal-quality floor |
+| `JANUS_GATE_AO_DIVERGENCE` | on | AO-divergence gate kill-switch — the gate is regime-aware and already skipped for mean-reversion entries |
+| `JANUS_EXPERIENCE_REWARD_FEE_BPS` | `0` | Round-trip fee (bps) subtracted from non-Hold experience rewards (fee-aware training reward; the fks deployment sets `8`) |
 
 The compose file sets the backing-service URLs above; see `config/janus.toml` and `docker-compose.yml` for the full set.
 
