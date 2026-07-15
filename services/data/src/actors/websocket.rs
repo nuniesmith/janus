@@ -123,21 +123,30 @@ impl WebSocketActor {
 
                     self.reconnect_count += 1;
 
-                    if self.reconnect_count >= self.config.max_reconnect_attempts {
-                        error!(
-                            "WebSocket Actor: Max reconnection attempts reached for {} on {}",
-                            self.config.symbol, self.config.exchange
-                        );
-                        break;
-                    }
-
-                    // Exponential backoff
+                    // Exponential backoff, capped at reconnect_delay_secs * 32.
                     let delay =
                         self.config.reconnect_delay_secs * (2_u64.pow(self.reconnect_count.min(5)));
-                    warn!(
-                        "WebSocket Actor: Reconnecting in {} seconds (attempt {}/{})",
-                        delay, self.reconnect_count, self.config.max_reconnect_attempts
-                    );
+
+                    // Do NOT give up permanently after max_reconnect_attempts:
+                    // a sustained exchange outage must never silently kill this
+                    // asset's ingestion. Past the threshold we keep retrying at
+                    // the capped backoff interval. (Graceful shutdown still
+                    // exits via the Ok branch above.)
+                    if self.reconnect_count >= self.config.max_reconnect_attempts {
+                        warn!(
+                            "WebSocket Actor: {} consecutive reconnect failures for {} on {} (>= max {}); continuing to retry every {}s",
+                            self.reconnect_count,
+                            self.config.symbol,
+                            self.config.exchange,
+                            self.config.max_reconnect_attempts,
+                            delay
+                        );
+                    } else {
+                        warn!(
+                            "WebSocket Actor: Reconnecting in {} seconds (attempt {}/{})",
+                            delay, self.reconnect_count, self.config.max_reconnect_attempts
+                        );
+                    }
 
                     sleep(Duration::from_secs(delay)).await;
                 }
@@ -350,5 +359,56 @@ mod tests {
         assert_eq!(config.reconnect_delay_secs * 2_u64.pow(1), 10);
         assert_eq!(config.reconnect_delay_secs * 2_u64.pow(2), 20);
         assert_eq!(config.reconnect_delay_secs * 2_u64.pow(3), 40);
+    }
+
+    /// A no-op connector; the actor never reaches parsing in these tests
+    /// because the connection is refused, so only the trait bounds matter.
+    struct NoopConnector;
+    impl ExchangeConnector for NoopConnector {
+        fn exchange_name(&self) -> &str {
+            "test"
+        }
+        fn build_ws_config(&self, _symbol: &str) -> WebSocketConfig {
+            WebSocketConfig::default()
+        }
+        fn parse_message(&self, _raw: &str) -> Result<Vec<DataMessage>> {
+            Ok(vec![])
+        }
+        fn ws_url(&self) -> &str {
+            "ws://127.0.0.1:1"
+        }
+        fn subscription_message(&self, _symbol: &str) -> Option<String> {
+            None
+        }
+    }
+
+    /// Regression for the swallowed-giveup finding: after
+    /// `max_reconnect_attempts` consecutive connect failures the actor must
+    /// KEEP retrying (capped backoff) rather than returning permanently.
+    /// Before the fix, `run()` would `break` and return Ok(()) within ~2
+    /// attempts; this test asserts it is still running well past that.
+    #[tokio::test]
+    async fn run_does_not_give_up_after_max_attempts() {
+        // Port 1 on localhost refuses connections ~instantly.
+        let config = WebSocketConfig {
+            url: "ws://127.0.0.1:1".to_string(),
+            exchange: "test".to_string(),
+            symbol: "BTCUSD".to_string(),
+            subscription_msg: None,
+            ping_interval_secs: 20,
+            reconnect_delay_secs: 0, // instant retries → many attempts fast
+            max_reconnect_attempts: 2,
+        };
+        let (router_tx, _router_rx) = mpsc::unbounded_channel();
+        let (_shutdown_tx, shutdown_rx) = broadcast::channel(4);
+        let actor = WebSocketActor::new(config, Arc::new(NoopConnector), router_tx, shutdown_rx);
+
+        // With the old `break`-on-max behavior, run() would complete almost
+        // immediately. With the fix it loops forever, so the timeout elapses.
+        let result = tokio::time::timeout(Duration::from_millis(300), actor.run()).await;
+        assert!(
+            result.is_err(),
+            "actor gave up and returned after max attempts instead of retrying"
+        );
     }
 }

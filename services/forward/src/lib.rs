@@ -1331,8 +1331,15 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
         // ═══════════════════════════════════════════════════════════════
         // LIVE MODE: consume MarketDataEvents, run indicators + strategies
         // ═══════════════════════════════════════════════════════════════
-        let mut market_rx = state_clone.market_data_bus.subscribe();
-        let wd_handle = watchdog_handle.clone();
+        // Supervised live signal-gen: the loop is re-spawned on panic / early
+        // return (until shutdown) so a crash anywhere in the body can never
+        // silently and permanently stop signal generation + execution submit
+        // (the previous behaviour: fully silent if the watchdog wasn't booted,
+        // and never restarted even when it was). Each restart re-subscribes to
+        // the bus and rebuilds all analyzers from scratch — a clean cold start,
+        // never a mid-order resumption — so live-execution behaviour per kline
+        // is byte-for-byte the original happy path.
+        let wd_handle_src = watchdog_handle.clone();
 
         // Read strategy config from JanusState
         let min_confidence = state_clone.config.forward.signals.min_confidence;
@@ -1370,15 +1377,37 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
         let rsi_oversold = state_clone.config.forward.indicators.rsi_oversold;
 
         // Shared RiskManager + live portfolio for the inline risk check (Track 3 Stage 4).
-        let risk_manager = risk_manager_handle.clone();
-        let portfolio = portfolio_handle.clone();
+        let risk_manager_src = risk_manager_handle.clone();
+        let portfolio_src = portfolio_handle.clone();
         // Brain affinity tracker handle for opt-in affinity-driven consensus
         // selection. `None` (flag off, or no booted pipeline) ⇒ the consensus
         // tally never reads affinity and stays byte-for-byte the historical
         // behaviour.
-        let affinity_pipeline = affinity_pipeline.clone();
+        let affinity_pipeline_src = affinity_pipeline.clone();
+
+        // Owned "source" handles the supervisor re-clones into each run.
+        let sup_state = state_clone.clone();
+        let signal_gen_src = signal_gen.clone();
+        let ind_config_src = ind_config.clone();
 
         tokio::spawn(async move {
+            let shutdown_state = sup_state.clone();
+            janus_core::supervisor::supervise(
+                "forward-signal-gen-live",
+                move || shutdown_state.is_shutdown_requested(),
+                move || {
+                    // Fresh per-restart state: re-subscribe to the bus and
+                    // re-clone the shared handles. Everything below is the
+                    // original loop body, unchanged.
+                    let mut market_rx = sup_state.market_data_bus.subscribe();
+                    let state_clone = sup_state.clone();
+                    let signal_gen = signal_gen_src.clone();
+                    let wd_handle = wd_handle_src.clone();
+                    let risk_manager = risk_manager_src.clone();
+                    let portfolio = portfolio_src.clone();
+                    let affinity_pipeline = affinity_pipeline_src.clone();
+                    let ind_config = ind_config_src.clone();
+                    async move {
             use std::collections::HashMap;
 
             // Per-symbol indicator analyzers, keyed by "SYMBOL/QUOTE:interval"
@@ -2411,6 +2440,10 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                 "Live signal generation loop exited — {} klines processed, {} signals generated, {} trades skipped",
                 klines_processed, signals_generated, trades_skipped,
             );
+                    }
+                },
+            )
+            .await;
         })
     } else {
         // ═══════════════════════════════════════════════════════════════

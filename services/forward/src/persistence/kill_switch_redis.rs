@@ -237,6 +237,32 @@ pub struct RedisKillSwitch {
     local_cache: RwLock<bool>,
 }
 
+/// Outcome of a supervised cache-refresh child task finishing.
+#[derive(Debug, PartialEq, Eq)]
+enum RefreshExit {
+    /// The refresher panicked or returned unexpectedly — the cache is no
+    /// longer being kept fresh, so the supervisor must fail closed (force the
+    /// cache to KILLED) and restart the loop.
+    FailClosedRestart,
+    /// The child was aborted (process shutdown) — stop supervising.
+    Stop,
+}
+
+/// Classify how a cache-refresh child task ended.
+///
+/// The refresh loop is infinite, so `Ok(())` (a clean return) only happens if
+/// the loop body was changed to return, and a panic surfaces as a
+/// [`JoinError`](tokio::task::JoinError) with `is_panic()`. Both are treated
+/// as failures that must fail closed and restart. A cancelled join means the
+/// task was aborted on the shutdown path, so we stop.
+fn classify_refresh_exit(exit: Result<(), tokio::task::JoinError>) -> RefreshExit {
+    match exit {
+        Ok(()) => RefreshExit::FailClosedRestart,
+        Err(e) if e.is_panic() => RefreshExit::FailClosedRestart,
+        Err(_) => RefreshExit::Stop,
+    }
+}
+
 impl RedisKillSwitch {
     /// Connect to Redis and create a new shared kill switch.
     pub async fn new(config: RedisKillSwitchConfig) -> Result<Self> {
@@ -639,44 +665,74 @@ impl RedisKillSwitch {
         );
 
         tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(Duration::from_millis(interval_ms));
-            // Skip the first immediate tick — `new()` already seeded the cache.
-            ticker.tick().await;
-
-            let mut consecutive_errors: u32 = 0;
-
+            let ks_outer = ks;
+            // Supervise the refresh loop. If it panics or returns, the cache
+            // would otherwise freeze at its last value — fail-OPEN if that value
+            // is "not killed", so a subsequent Redis kill-switch activation
+            // would never reach the execution choke point. On ANY unexpected
+            // exit we force the cache CLOSED (killed) and restart the loop; the
+            // next successful is_killed() re-reads real Redis state and clears
+            // the forced kill if the switch is actually off.
             loop {
-                ticker.tick().await;
+                let ks = Arc::clone(&ks_outer);
+                let child = tokio::spawn(async move {
+                    let mut ticker = tokio::time::interval(Duration::from_millis(interval_ms));
+                    // Skip the first immediate tick — `new()` already seeded the cache.
+                    ticker.tick().await;
 
-                // `is_killed()` refreshes `local_cache` as a side effect.
-                match ks.is_killed().await {
-                    Ok(_) => consecutive_errors = 0,
-                    Err(e) => {
-                        consecutive_errors += 1;
-                        if consecutive_errors <= 3 {
-                            warn!(
-                                "Kill switch cache-refresh error ({}/3): {}",
-                                consecutive_errors, e,
-                            );
-                        } else if consecutive_errors == 4 {
-                            error!(
-                                "Kill switch cache-refresh: {} consecutive errors. \
-                                 Suppressing further warnings. Last error: {}",
-                                consecutive_errors, e,
-                            );
-                        }
-                        // Fail closed: after sustained Redis failure, force the
-                        // cached state to "killed" so the execution choke point
-                        // halts trading until Redis is reachable again.
-                        if consecutive_errors == 10 {
-                            error!(
-                                "🛑 Kill switch cache-refresh: 10 consecutive Redis failures. \
-                                 Forcing local cache to KILLED as a safety measure."
-                            );
-                            *ks.local_cache.write().await = true;
+                    let mut consecutive_errors: u32 = 0;
+
+                    loop {
+                        ticker.tick().await;
+
+                        // `is_killed()` refreshes `local_cache` as a side effect.
+                        match ks.is_killed().await {
+                            Ok(_) => consecutive_errors = 0,
+                            Err(e) => {
+                                consecutive_errors += 1;
+                                if consecutive_errors <= 3 {
+                                    warn!(
+                                        "Kill switch cache-refresh error ({}/3): {}",
+                                        consecutive_errors, e,
+                                    );
+                                } else if consecutive_errors == 4 {
+                                    error!(
+                                        "Kill switch cache-refresh: {} consecutive errors. \
+                                         Suppressing further warnings. Last error: {}",
+                                        consecutive_errors, e,
+                                    );
+                                }
+                                // Fail closed: after sustained Redis failure, force
+                                // the cached state to "killed" so the execution choke
+                                // point halts trading until Redis is reachable again.
+                                if consecutive_errors == 10 {
+                                    error!(
+                                        "🛑 Kill switch cache-refresh: 10 consecutive Redis failures. \
+                                         Forcing local cache to KILLED as a safety measure."
+                                    );
+                                    *ks.local_cache.write().await = true;
+                                }
+                            }
                         }
                     }
+                });
+
+                match classify_refresh_exit(child.await) {
+                    // The inner loop never returns on its own; a panic or early
+                    // return means the cache is no longer being refreshed, so
+                    // fail closed (force KILLED) and restart.
+                    RefreshExit::FailClosedRestart => {
+                        *ks_outer.local_cache.write().await = true;
+                        error!(
+                            "🛑 Kill switch cache-refresh task exited unexpectedly; \
+                             forced local cache to KILLED and restarting"
+                        );
+                    }
+                    // Aborted (process shutdown) — stop supervising.
+                    RefreshExit::Stop => break,
                 }
+
+                tokio::time::sleep(Duration::from_secs(1)).await;
             }
         })
     }
@@ -811,6 +867,37 @@ mod tests {
         assert!(!config.key.is_empty());
         assert!(config.poll_interval_ms > 0);
         assert!(!config.instance_id.is_empty());
+    }
+
+    /// Regression for the fail-OPEN-on-death finding: a panicking or
+    /// early-returning refresh child must be classified as
+    /// `FailClosedRestart` (so the supervisor forces the cache to KILLED and
+    /// restarts), while an aborted child (shutdown) must `Stop`.
+    #[tokio::test]
+    async fn classify_refresh_exit_fails_closed_on_death_but_stops_on_abort() {
+        // Panic → must fail closed + restart.
+        let panicked = tokio::spawn(async { panic!("simulated refresh death") });
+        assert_eq!(
+            classify_refresh_exit(panicked.await),
+            RefreshExit::FailClosedRestart,
+        );
+
+        // Clean early return → must also fail closed + restart (the loop is
+        // supposed to be infinite).
+        let returned = tokio::spawn(async {});
+        assert_eq!(
+            classify_refresh_exit(returned.await),
+            RefreshExit::FailClosedRestart,
+        );
+
+        // Aborted (shutdown path) → stop supervising, do not fail closed.
+        let aborted = tokio::spawn(async {
+            loop {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+        });
+        aborted.abort();
+        assert_eq!(classify_refresh_exit(aborted.await), RefreshExit::Stop);
     }
 
     #[test]

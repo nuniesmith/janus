@@ -126,17 +126,29 @@ impl Router {
             tokio::select! {
                 // Process incoming messages
                 Some(msg) = rx.recv() => {
-                    match Self::handle_message(
-                        &storage,
-                        &broadcast_tx,
-                        &indicator_tx,
-                        msg,
-                        &mut candles_forwarded,
-                    ).await { Err(e) => {
-                        error!("Router: Failed to handle message: {}", e);
-                    } _ => {
-                        message_count += 1;
-                    }}
+                    // Isolate per-message work: a panic in handle_message /
+                    // store_* (e.g. a prometheus label-count mismatch) must not
+                    // unwind and permanently kill all routing + persistence.
+                    let result = crate::panic_guard::catch_panic(
+                        "router.handle_message",
+                        Self::handle_message(
+                            &storage,
+                            &broadcast_tx,
+                            &indicator_tx,
+                            msg,
+                            &mut candles_forwarded,
+                        ),
+                    ).await;
+                    match result {
+                        Ok(Ok(())) => {
+                            message_count += 1;
+                        }
+                        Ok(Err(e)) => {
+                            error!("Router: Failed to handle message: {}", e);
+                        }
+                        // Panic already logged by catch_panic; keep looping.
+                        Err(()) => {}
+                    }
                 }
 
                 // Print statistics periodically

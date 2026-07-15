@@ -120,17 +120,66 @@ pub async fn start_module(state: Arc<JanusState>) -> janus_core::Result<()> {
             .map_err(|e| tracing::error!("Metrics server error: {}", e))
     });
 
-    // Wait for shutdown signal
-    while !state.is_shutdown_requested() {
-        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-    }
+    // Wait for shutdown — but also watch the server tasks. Previously this
+    // only polled the shutdown flag, so if `axum::serve` returned Err or a
+    // server task panicked, the handle completed unnoticed and the module
+    // looped here forever: the entire live control plane (start ingestion,
+    // position/signal ingress) was permanently down while the process still
+    // reported healthy. Now, if either server exits before shutdown was
+    // requested, we return Err so the supervisor restarts the module (which
+    // re-binds the listeners) instead of hanging silently.
+    let mut http_server = http_server;
+    let mut metrics_server = metrics_server;
+    let outcome =
+        wait_for_shutdown_or_server_death(&state, &mut http_server, &mut metrics_server).await;
 
-    tracing::info!("API module shutting down...");
+    if let Err(ref e) = outcome {
+        tracing::error!("API module server task died: {e}");
+    } else {
+        tracing::info!("API module shutting down...");
+    }
     http_server.abort();
     metrics_server.abort();
     param_updates_task.abort();
 
-    Ok(())
+    outcome
+}
+
+/// Park until shutdown is requested, but return `Err` if either server task
+/// finishes first.
+///
+/// The HTTP/metrics servers are supposed to run for the module's whole life.
+/// If one exits early (bind lost, `axum::serve` error, panic), returning `Err`
+/// lets the supervisor restart the module — which re-binds the listeners —
+/// instead of the old behavior where `start_module` looped forever on the
+/// shutdown flag while the control plane was silently dead.
+async fn wait_for_shutdown_or_server_death<A, B>(
+    state: &Arc<JanusState>,
+    http_server: &mut tokio::task::JoinHandle<A>,
+    metrics_server: &mut tokio::task::JoinHandle<B>,
+) -> janus_core::Result<()>
+where
+    A: std::fmt::Debug,
+    B: std::fmt::Debug,
+{
+    let shutdown_poll = async {
+        while !state.is_shutdown_requested() {
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        }
+    };
+    tokio::pin!(shutdown_poll);
+
+    tokio::select! {
+        _ = &mut shutdown_poll => Ok(()),
+        res = http_server => Err(janus_core::Error::module(
+            "api",
+            format!("HTTP server task exited unexpectedly before shutdown: {res:?}"),
+        )),
+        res = metrics_server => Err(janus_core::Error::module(
+            "api",
+            format!("metrics server task exited unexpectedly before shutdown: {res:?}"),
+        )),
+    }
 }
 
 /// Create the main HTTP API router
@@ -1333,6 +1382,53 @@ mod tests {
     async fn test_state() -> Arc<JanusState> {
         let config = Config::default();
         Arc::new(JanusState::new(config).await.unwrap())
+    }
+
+    /// Regression: a server task dying before shutdown must surface as `Err`
+    /// (so the supervisor restarts the module) rather than hanging silently.
+    #[tokio::test]
+    async fn returns_err_when_a_server_task_dies_before_shutdown() {
+        let state = test_state().await; // shutdown NOT requested
+        // HTTP server "dies" immediately; metrics server stays up.
+        let mut http = tokio::spawn(async {});
+        let mut metrics = tokio::spawn(async {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            }
+        });
+
+        let out = wait_for_shutdown_or_server_death(&state, &mut http, &mut metrics).await;
+        assert!(
+            out.is_err(),
+            "a dead server before shutdown must return Err so the supervisor restarts the module"
+        );
+        metrics.abort();
+    }
+
+    /// The happy path: with shutdown requested, the servers still running,
+    /// the wait returns `Ok` (clean shutdown, no spurious restart).
+    #[tokio::test]
+    async fn returns_ok_on_graceful_shutdown() {
+        let state = test_state().await;
+        state.request_shutdown();
+        let mut http = tokio::spawn(async {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            }
+        });
+        let mut metrics = tokio::spawn(async {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            }
+        });
+
+        let out = wait_for_shutdown_or_server_death(&state, &mut http, &mut metrics).await;
+        assert!(
+            out.is_ok(),
+            "graceful shutdown must not be reported as a failure"
+        );
+        http.abort();
+        metrics.abort();
     }
 
     /// Build the router backed by the given state, with a disabled

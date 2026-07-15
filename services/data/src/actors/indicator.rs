@@ -613,19 +613,28 @@ impl IndicatorActor {
                 Some(msg) = rx.recv() => {
                     match msg {
                         IndicatorMessage::Candle(candle) => {
-                            match Self::process_candle(
-                                &storage,
-                                &state,
-                                &indicator_tx,
-                                candle,
-                            ).await {
-                                Ok(_) => {
+                            // Isolate indicator math: a panic on one bad candle
+                            // must not unwind and permanently freeze the whole
+                            // indicator + downstream signal pipeline.
+                            let result = crate::panic_guard::catch_panic(
+                                "indicator.process_candle",
+                                Self::process_candle(
+                                    &storage,
+                                    &state,
+                                    &indicator_tx,
+                                    candle,
+                                ),
+                            ).await;
+                            match result {
+                                Ok(Ok(_)) => {
                                     candles_processed += 1;
                                     indicators_calculated += 1;
                                 }
-                                Err(e) => {
+                                Ok(Err(e)) => {
                                     error!("IndicatorActor: Failed to process candle: {}", e);
                                 }
+                                // Panic already logged; keep the loop alive.
+                                Err(()) => {}
                             }
                         }
 

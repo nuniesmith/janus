@@ -589,22 +589,49 @@ impl SignalFlowCoordinator {
             info!("Starting fill tracker...");
             tracker.start().await?;
 
-            // Spawn fill event processor
+            // Spawn fill event processor — supervised. If it panics or exits
+            // while the coordinator is still running, re-spawn it (with backoff)
+            // so fills / PnL / pending-signal cleanup can never silently and
+            // permanently stop. process_fill_events re-subscribes to the fill
+            // and order-status channels on each start.
             let tracker_clone = tracker.clone();
             let update_tx = self.update_tx.clone();
             let pending_signals = self.pending_signals.clone();
             let stats = self.stats.clone();
             let metrics = self.metrics.clone();
+            let is_running_flag = self.is_running.clone();
 
             tokio::spawn(async move {
-                Self::process_fill_events(
-                    tracker_clone,
-                    update_tx,
-                    pending_signals,
-                    stats,
-                    metrics,
-                )
-                .await;
+                let mut backoff = std::time::Duration::from_millis(100);
+                let max_backoff = std::time::Duration::from_secs(30);
+                loop {
+                    let child = tokio::spawn(Self::process_fill_events(
+                        tracker_clone.clone(),
+                        update_tx.clone(),
+                        pending_signals.clone(),
+                        stats.clone(),
+                        metrics.clone(),
+                    ));
+                    let exit = child.await;
+
+                    // A graceful stop() sets is_running=false before closing the
+                    // channels, so a normal shutdown exit never restarts.
+                    if !*is_running_flag.read().await {
+                        break;
+                    }
+                    match exit {
+                        Ok(()) => error!(
+                            "Fill event processor exited while running — restarting fill/PnL accounting"
+                        ),
+                        Err(e) if e.is_panic() => error!(
+                            "Fill event processor PANICKED ({e}) — restarting fill/PnL accounting"
+                        ),
+                        // Aborted — treat as shutdown.
+                        Err(_) => break,
+                    }
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(max_backoff);
+                }
             });
         }
 
@@ -1096,71 +1123,106 @@ impl SignalFlowCoordinator {
         stats: Arc<RwLock<SignalFlowStats>>,
         metrics: Arc<SignalFlowMetrics>,
     ) {
+        use tokio::sync::broadcast::error::RecvError;
+
         let mut fill_rx = tracker.subscribe_fills();
         let mut status_rx = tracker.subscribe_order_status();
 
+        // Track per-channel closure so a broadcast lag (recoverable) never
+        // terminates fill/PnL accounting. Previously both arms matched only
+        // `Ok(..)`, so a simultaneous `Lagged` on both receivers disabled
+        // every arm and the `else => break` killed accounting permanently on a
+        // RECOVERABLE lag. We now break only when BOTH channels are truly
+        // Closed.
+        let mut fill_closed = false;
+        let mut status_closed = false;
+
         loop {
             tokio::select! {
-                Ok(fill) = fill_rx.recv() => {
-                    info!(
-                        order_id = %fill.order_id,
-                        quantity = %fill.quantity,
-                        price = %fill.price,
-                        "Fill received from tracker"
-                    );
+                res = fill_rx.recv(), if !fill_closed => match res {
+                    Ok(fill) => {
+                        info!(
+                            order_id = %fill.order_id,
+                            quantity = %fill.quantity,
+                            price = %fill.price,
+                            "Fill received from tracker"
+                        );
 
-                    // Update stats and metrics
-                    {
-                        let mut s = stats.write().await;
-                        s.fills_received += 1;
+                        // Update stats and metrics
+                        {
+                            let mut s = stats.write().await;
+                            s.fills_received += 1;
+                        }
+                        metrics.record_fill_received();
+                        metrics.record_order_filled(fill.quantity * fill.price);
+
+                        // Broadcast fill update
+                        let _ = update_tx.send(ExecutionUpdate::OrderFilled {
+                            order_id: fill.order_id.clone(),
+                            fill: fill.clone(),
+                            remaining: Decimal::ZERO, // Would need to track this
+                            timestamp: Utc::now(),
+                        });
                     }
-                    metrics.record_fill_received();
-                    metrics.record_order_filled(fill.quantity * fill.price);
-
-                    // Broadcast fill update
-                    let _ = update_tx.send(ExecutionUpdate::OrderFilled {
-                        order_id: fill.order_id.clone(),
-                        fill: fill.clone(),
-                        remaining: Decimal::ZERO, // Would need to track this
-                        timestamp: Utc::now(),
-                    });
-                }
-                Ok((order_id, status)) = status_rx.recv() => {
-                    debug!(
-                        order_id = %order_id,
-                        status = ?status,
-                        "Order status update from tracker"
-                    );
-
-                    // Broadcast status update
-                    let _ = update_tx.send(ExecutionUpdate::OrderStatusChanged {
-                        order_id: order_id.clone(),
-                        old_status: OrderStatusEnum::Submitted, // Would need to track previous
-                        new_status: status,
-                        timestamp: Utc::now(),
-                    });
-
-                    // Update metrics based on status
-                    match status {
-                        OrderStatusEnum::Cancelled => metrics.record_order_cancelled(),
-                        OrderStatusEnum::Rejected => metrics.record_order_rejected(),
-                        _ => {}
+                    Err(RecvError::Lagged(n)) => {
+                        warn!(
+                            skipped = n,
+                            "Fill receiver lagged; some fills were skipped — continuing accounting"
+                        );
                     }
-
-                    // Clean up pending signals if order is terminal
-                    if matches!(
-                        status,
-                        OrderStatusEnum::Filled
-                            | OrderStatusEnum::Cancelled
-                            | OrderStatusEnum::Rejected
-                            | OrderStatusEnum::Expired
-                    ) {
-                        let mut pending = pending_signals.write().await;
-                        pending.retain(|_, v| v != &order_id);
+                    Err(RecvError::Closed) => {
+                        warn!("Fill receiver channel closed");
+                        fill_closed = true;
                     }
-                }
+                },
+                res = status_rx.recv(), if !status_closed => match res {
+                    Ok((order_id, status)) => {
+                        debug!(
+                            order_id = %order_id,
+                            status = ?status,
+                            "Order status update from tracker"
+                        );
+
+                        // Broadcast status update
+                        let _ = update_tx.send(ExecutionUpdate::OrderStatusChanged {
+                            order_id: order_id.clone(),
+                            old_status: OrderStatusEnum::Submitted, // Would need to track previous
+                            new_status: status,
+                            timestamp: Utc::now(),
+                        });
+
+                        // Update metrics based on status
+                        match status {
+                            OrderStatusEnum::Cancelled => metrics.record_order_cancelled(),
+                            OrderStatusEnum::Rejected => metrics.record_order_rejected(),
+                            _ => {}
+                        }
+
+                        // Clean up pending signals if order is terminal
+                        if matches!(
+                            status,
+                            OrderStatusEnum::Filled
+                                | OrderStatusEnum::Cancelled
+                                | OrderStatusEnum::Rejected
+                                | OrderStatusEnum::Expired
+                        ) {
+                            let mut pending = pending_signals.write().await;
+                            pending.retain(|_, v| v != &order_id);
+                        }
+                    }
+                    Err(RecvError::Lagged(n)) => {
+                        warn!(
+                            skipped = n,
+                            "Order-status receiver lagged; some updates were skipped — continuing accounting"
+                        );
+                    }
+                    Err(RecvError::Closed) => {
+                        warn!("Order-status receiver channel closed");
+                        status_closed = true;
+                    }
+                },
                 else => {
-                    // Channel closed
+                    // Both channels are closed — nothing left to account for.
                     break;
                 }
             }
@@ -1305,6 +1367,79 @@ impl SignalFlowStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression for the break-on-recoverable finding in `process_fill_events`.
+    ///
+    /// The fill/status loop must treat a broadcast `Lagged` as recoverable and
+    /// keep running — the old code matched only `Ok(..)` in both select arms,
+    /// so a simultaneous `Lagged` on both receivers disabled every arm and the
+    /// `else => break` permanently terminated fill/PnL accounting. This test
+    /// drives the exact select-with-guards structure `process_fill_events` now
+    /// uses and proves: (1) a double-`Lagged` does NOT break the loop, and
+    /// (2) the loop breaks only once BOTH channels are Closed.
+    #[tokio::test]
+    async fn fill_loop_survives_double_lag_and_breaks_only_when_both_closed() {
+        use tokio::sync::broadcast::{self, error::RecvError};
+
+        // Capacity 2; overflow both before the first poll to force `Lagged`.
+        let (fill_tx, mut fill_rx) = broadcast::channel::<u32>(2);
+        let (status_tx, mut status_rx) = broadcast::channel::<u32>(2);
+        for i in 0..5 {
+            let _ = fill_tx.send(i);
+            let _ = status_tx.send(i);
+        }
+        // Hold the senders in Options so we can close the channels mid-loop by
+        // dropping them exactly once (mirrors the tracker being stopped).
+        let mut fill_tx = Some(fill_tx);
+        let mut status_tx = Some(status_tx);
+
+        let mut fill_closed = false;
+        let mut status_closed = false;
+        let mut saw_fill_lag = false;
+        let mut saw_status_lag = false;
+        let mut drained = 0u32;
+        let mut broke = false;
+
+        // Bound iterations so any regression (spurious break OR failure to
+        // break) fails fast instead of hanging.
+        for _ in 0..64 {
+            tokio::select! {
+                res = fill_rx.recv(), if !fill_closed => match res {
+                    Ok(_) => drained += 1,
+                    Err(RecvError::Lagged(_)) => saw_fill_lag = true,
+                    Err(RecvError::Closed) => fill_closed = true,
+                },
+                res = status_rx.recv(), if !status_closed => match res {
+                    Ok(_) => drained += 1,
+                    Err(RecvError::Lagged(_)) => saw_status_lag = true,
+                    Err(RecvError::Closed) => status_closed = true,
+                },
+                else => { broke = true; break; }
+            }
+
+            // Once both lags are observed and the buffered values drained, close
+            // both channels to prove termination happens only when BOTH close.
+            if saw_fill_lag && saw_status_lag && fill_rx.is_empty() && status_rx.is_empty() {
+                fill_tx.take();
+                status_tx.take();
+            }
+        }
+
+        assert!(saw_fill_lag, "fill receiver should have observed a Lagged");
+        assert!(
+            saw_status_lag,
+            "status receiver should have observed a Lagged"
+        );
+        assert!(
+            drained > 0,
+            "the surviving (post-lag) values should be drained"
+        );
+        assert!(broke, "loop should terminate once both channels are closed");
+        assert!(
+            fill_closed && status_closed,
+            "loop must break ONLY after both channels are closed (break-on-recoverable regression)"
+        );
+    }
 
     #[test]
     fn test_config_default() {

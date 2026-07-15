@@ -51,6 +51,7 @@
 pub mod adapters;
 pub mod backoff;
 pub mod lifecycle;
+pub mod respawn;
 pub mod service;
 
 // Re-exports
@@ -59,6 +60,7 @@ pub use backoff::{BackoffAction, BackoffConfig, BackoffState};
 pub use lifecycle::{
     ServiceLifecycle, ServiceLifecycleSnapshot, ServicePhase, TerminationReason, TransitionError,
 };
+pub use respawn::{supervise, supervise_with_backoff};
 pub use service::{JanusService, RestartPolicy};
 
 use std::collections::HashMap;
