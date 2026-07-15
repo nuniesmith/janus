@@ -552,7 +552,10 @@ async fn run_live_mode(state: Arc<janus_core::JanusState>) -> janus_core::Result
             "  Candle persistence: enabled → {}:{} (candles_crypto)",
             state.config.questdb.host, state.config.questdb.ilp_port
         );
-        Some(tokio::spawn(candle_sink::run(state.clone())))
+        // Supervised, not a bare spawn: a single task death (panic/unexpected
+        // exit) previously froze candle persistence permanently (2026-07-11).
+        // run_supervised restarts run() with backoff until shutdown.
+        Some(tokio::spawn(candle_sink::run_supervised(state.clone())))
     } else {
         warn!("  Candle persistence: DISABLED (DATA_PERSIST_CANDLES=false)");
         None
