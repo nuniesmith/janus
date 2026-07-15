@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use janus_core::{KlineEvent, MarketDataEvent};
 use rust_decimal::prelude::ToPrimitive;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::actors::CandleData;
 use crate::metrics::prometheus_exporter::{QUESTDB_WRITE_ERRORS, QUESTDB_WRITES};
@@ -184,6 +184,89 @@ pub async fn run(state: Arc<janus_core::JanusState>) {
     );
 }
 
+/// Restart backoff applied after the sink task exits or panics before a
+/// shutdown was requested. Short enough that a recurrence self-heals within
+/// seconds, long enough that a tight crash loop can't spin the CPU.
+const RESTART_BACKOFF: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Supervise [`run`] so a single task death can no longer permanently stop
+/// candle persistence.
+///
+/// The sink was previously spawned exactly once and unsupervised. On
+/// 2026-07-11 the task terminated (a silent panic is the only such exit
+/// path) and never came back: `questdb_writes_total{candles_crypto}` froze
+/// while WebSocket ingestion kept running, and — because the terminated task
+/// was the bus's only subscriber — `market_data_bus.publish()` began
+/// returning `Err`, freezing the subscriber-gated `klines_published` stat
+/// too. Nothing restarted it, so the freeze lasted until a process restart.
+///
+/// This wrapper runs the sink inside an isolated `tokio::spawn` (so a panic
+/// is caught as a `JoinError` instead of unwinding the supervisor), restarts
+/// it after [`RESTART_BACKOFF`], and stops cleanly once shutdown is
+/// requested. [`run`] re-subscribes to the bus on each start and already
+/// tolerates QuestDB outages internally, so restarting is always safe; the
+/// only cost is that candles emitted during the brief downtime are skipped,
+/// which the backfill/candle-scan gap filler already owns.
+pub async fn run_supervised(state: Arc<janus_core::JanusState>) {
+    let shutdown_state = state.clone();
+    supervise_restartable(
+        "CandleSink",
+        move || run(state.clone()),
+        move || shutdown_state.is_shutdown_requested(),
+        RESTART_BACKOFF,
+    )
+    .await;
+}
+
+/// Generic restart supervisor: run `make_task()` inside an isolated
+/// `tokio::spawn`, restart it after `backoff` whenever it exits (cleanly or
+/// via panic), and stop once `should_stop()` returns true.
+///
+/// Returns the number of times the task was started (used by tests to assert
+/// respawn behaviour). Isolating the task in its own `tokio::spawn` means a
+/// panic surfaces as `JoinError::is_panic()` here rather than tearing down
+/// the supervisor, which is what makes a panicking sink recoverable.
+async fn supervise_restartable<F, Fut, S>(
+    label: &str,
+    mut make_task: F,
+    should_stop: S,
+    backoff: std::time::Duration,
+) -> u64
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+    S: Fn() -> bool,
+{
+    let mut starts: u64 = 0;
+    while !should_stop() {
+        starts += 1;
+        match tokio::spawn(make_task()).await {
+            Ok(()) => {
+                if should_stop() {
+                    break;
+                }
+                warn!(
+                    "{label}: task exited unexpectedly (no shutdown requested); restarting in {:?}",
+                    backoff
+                );
+            }
+            Err(e) if e.is_panic() => {
+                error!("{label}: task panicked ({e}); restarting in {:?}", backoff);
+            }
+            Err(e) => {
+                // Cancelled/aborted (e.g. runtime shutdown): don't restart.
+                info!("{label}: task cancelled ({e}); stopping supervisor");
+                break;
+            }
+        }
+        if should_stop() {
+            break;
+        }
+        tokio::time::sleep(backoff).await;
+    }
+    starts
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,6 +321,50 @@ mod tests {
         assert!(parse_persist_flag(Some("true")));
         assert!(parse_persist_flag(Some("1")));
         assert!(parse_persist_flag(Some("anything-else")));
+    }
+
+    /// Regression for the 2026-07-11 stall: a sink task that exits *and*
+    /// panics must be respawned by the supervisor, not left dead. Also proves
+    /// the supervisor terminates promptly once shutdown is requested (no
+    /// infinite hot loop) and honours the backoff between restarts.
+    #[tokio::test(start_paused = true)]
+    async fn supervisor_restarts_on_exit_and_panic_then_stops_on_shutdown() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+        let invocations = Arc::new(AtomicU64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let inv = invocations.clone();
+        let stop_setter = stop.clone();
+        let stop_reader = stop.clone();
+        let backoff = std::time::Duration::from_secs(5);
+
+        let starts = supervise_restartable(
+            "test-sink",
+            move || {
+                let n = inv.fetch_add(1, Ordering::SeqCst) + 1;
+                let stop_setter = stop_setter.clone();
+                async move {
+                    match n {
+                        // 1st start: exit cleanly and unexpectedly → must restart.
+                        1 => {}
+                        // 2nd start: panic → supervisor must survive and restart.
+                        2 => panic!("simulated sink panic"),
+                        // 3rd start: request shutdown, then exit cleanly → stop.
+                        _ => stop_setter.store(true, Ordering::SeqCst),
+                    }
+                }
+            },
+            move || stop_reader.load(Ordering::SeqCst),
+            backoff,
+        )
+        .await;
+
+        // Started three times: initial + one restart after clean exit + one
+        // restart after the panic. The third start flips the shutdown flag.
+        assert_eq!(starts, 3, "supervisor must respawn after exit and panic");
+        assert_eq!(invocations.load(Ordering::SeqCst), 3);
+        assert!(stop.load(Ordering::SeqCst), "shutdown flag should be set");
     }
 
     #[test]
