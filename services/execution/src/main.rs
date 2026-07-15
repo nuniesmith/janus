@@ -174,7 +174,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("HTTP server starting on {}", http_addr);
 
     // Start both servers concurrently
-    let grpc_handle = tokio::spawn(async move {
+    let mut grpc_handle = tokio::spawn(async move {
         info!("gRPC server listening on {}", grpc_addr);
         if let Err(e) = Server::builder()
             .add_service(grpc_server)
@@ -185,7 +185,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let http_handle = tokio::spawn(async move {
+    let mut http_handle = tokio::spawn(async move {
         info!("HTTP server listening on {}", http_addr);
         let listener = tokio::net::TcpListener::bind(http_addr)
             .await
@@ -204,13 +204,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("  Redis Channels:  janus.state.equity, janus.state.volatility, janus.state.full");
     info!("  State Updates:   Broadcasting at 10Hz (every 100ms)");
 
-    // Wait for shutdown signal
+    // Wait for shutdown signal — OR for a server task to die. Previously the
+    // select only watched OS signals, so if the gRPC order-ingress server (or
+    // the HTTP admin server) returned Err or panicked, the process stayed alive
+    // and blocked here forever with order ingress silently and permanently
+    // dead. Now a server task exiting unblocks us and we exit non-zero so an
+    // orchestrator (docker/systemd) relaunches the service.
+    let mut server_died = false;
     tokio::select! {
         _ = signal::ctrl_c() => {
             info!("Received shutdown signal (Ctrl+C)");
         }
         _ = shutdown_signal() => {
             info!("Received termination signal");
+        }
+        res = &mut grpc_handle => {
+            error!("gRPC server task exited unexpectedly: {res:?} — shutting down for restart");
+            server_died = true;
+        }
+        res = &mut http_handle => {
+            error!("HTTP server task exited unexpectedly: {res:?} — shutting down for restart");
+            server_died = true;
         }
     }
 
@@ -224,6 +238,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     http_handle.abort();
 
     info!("FKS Execution Service stopped");
+
+    if server_died {
+        return Err("execution server task died — exiting for orchestrator restart".into());
+    }
 
     Ok(())
 }

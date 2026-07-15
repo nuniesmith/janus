@@ -47,6 +47,7 @@ pub mod config;
 pub mod connectors;
 pub mod logging;
 pub mod metrics;
+pub mod panic_guard;
 pub mod self_healing;
 pub mod storage;
 
@@ -571,7 +572,18 @@ async fn run_live_mode(state: Arc<janus_core::JanusState>) -> janus_core::Result
         let stats = stats.clone();
 
         let handle = tokio::spawn(async move {
-            run_asset_ws(asset, config, state, stats).await;
+            // Supervise the per-asset ingestion loop: if run_asset_ws gives
+            // up (max reconnect attempts) or panics before shutdown, re-spawn
+            // it with backoff so a sustained exchange outage can never
+            // permanently kill this symbol's ingestion.
+            let sup_name = format!("data-ws-{asset}");
+            let shutdown_state = state.clone();
+            janus_core::supervisor::supervise(
+                &sup_name,
+                move || shutdown_state.is_shutdown_requested(),
+                move || run_asset_ws(asset.clone(), config.clone(), state.clone(), stats.clone()),
+            )
+            .await;
         });
         task_handles.push(handle);
 

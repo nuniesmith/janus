@@ -40,6 +40,7 @@ mod config;
 mod connectors;
 mod logging;
 mod metrics;
+mod panic_guard;
 mod self_healing;
 mod storage;
 

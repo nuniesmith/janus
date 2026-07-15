@@ -208,8 +208,18 @@ impl StorageManager {
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
-                        if let Err(e) = manager.flush().await {
-                            error!("StorageManager: Background flush failed: {}", e);
+                        // Isolate the flush: a panic in the ILP writer must not
+                        // kill the periodic flush task and silently stall
+                        // QuestDB persistence — keep flushing on the next tick.
+                        match crate::panic_guard::catch_panic(
+                            "storage.background_flush",
+                            manager.flush(),
+                        ).await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => {
+                                error!("StorageManager: Background flush failed: {}", e);
+                            }
+                            Err(()) => {}
                         }
                     }
 
