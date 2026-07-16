@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use exchange_apiws::actors::{DataMessage, ExchangeConnector, TradeSide};
-use exchange_apiws::bybit::{BybitConnector, BybitPrivateConnector};
+use exchange_apiws::bybit::{BybitConnector, BybitPrivateConnector, BybitWalletBalance};
 use exchange_apiws::ws::{WsRunnerConfig, run_feed};
 use exchange_apiws::{BybitCategory, BybitOrderRequest, BybitPrivateClient};
 use tokio::sync::{mpsc, watch};
@@ -184,9 +184,11 @@ impl BybitRestClient {
             .await?)
     }
 
-    /// Wallet balance for an account type (raw JSON, as before).
+    /// Wallet balance for an account type. Typed since exchange-apiws 0.9:
+    /// `get_wallet_balance` returns `Vec<BybitWalletBalance>` (one entry per
+    /// account) instead of the raw `serde_json::Value` envelope.
     #[allow(dead_code)]
-    pub async fn get_balance(&self, account_type: &str) -> Result<serde_json::Value> {
+    pub async fn get_balance(&self, account_type: &str) -> Result<Vec<BybitWalletBalance>> {
         Ok(self.inner.get_wallet_balance(account_type).await?)
     }
 }

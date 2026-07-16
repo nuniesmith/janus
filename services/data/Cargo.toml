@@ -25,7 +25,7 @@ janus-core = { workspace = true }
 # Market-data parsing comes from the published exchange-apiws connectors;
 # jflow-exchanges is retained only for its janus-side CNS metrics + health
 # monitoring (its duplicate exchange adapters are no longer used).
-exchange-apiws = { version = "0.8.1", default-features = false, features = ["coinbase", "okx", "kraken"] }
+exchange-apiws = { version = "0.10.1", default-features = false, features = ["coinbase", "okx", "kraken"] }
 janus-exchanges = { path = "../../crates/exchanges", features = ["cns-metrics"], package = "jflow-exchanges" }
 janus-cns = { path = "../../crates/cns", package = "jflow-cns" }
 
