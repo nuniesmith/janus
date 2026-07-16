@@ -34,6 +34,14 @@ use tracing::{error, info, warn};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // TLS crypto provider: the Bybit public feed (exchange_apiws::ws::run_feed →
+    // tokio-tungstenite) builds a rustls ClientConfig, which needs a process-
+    // default CryptoProvider. Only exchange-apiws's REST client constructors
+    // self-install, and the public feed can connect before any of them run, so
+    // install ring explicitly (idempotent) up front instead of relying on
+    // rustls's sole-compiled-provider fallback. Mirrors bin/janus/src/main.rs.
+    exchange_apiws::ensure_crypto_provider();
+
     // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter(

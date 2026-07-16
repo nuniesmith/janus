@@ -426,6 +426,14 @@ impl DataFactory {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // TLS crypto provider: our own wss:// ingestion (tokio-tungstenite) builds a
+    // rustls ClientConfig, which needs a process-default CryptoProvider. Install
+    // ring explicitly (idempotent) rather than relying on rustls's sole-compiled-
+    // provider fallback, which panics at connect time if a second provider ever
+    // enters the dep graph. Mirrors bin/janus/src/main.rs; exchange-apiws only
+    // self-installs in REST client constructors this service never calls.
+    exchange_apiws::ensure_crypto_provider();
+
     // Initialize tracing/logging
     tracing_subscriber::fmt()
         .with_env_filter(
