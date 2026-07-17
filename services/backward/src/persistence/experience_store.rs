@@ -72,6 +72,15 @@ pub struct ExperienceStoreConfig {
 
     /// Connection timeout in seconds.
     pub timeout_secs: u64,
+
+    /// Skip the qdrant-client's client/server version-compatibility check.
+    ///
+    /// The check `println!`s its warning **to stdout** (qdrant-client 1.17,
+    /// `qdrant_client/mod.rs`), which corrupts any consumer that treats
+    /// stdout as machine-readable output — the `gate_a_verdict` binary sets
+    /// this so its JSON report stays parseable. Default `false`: the
+    /// long-running service keeps the check (its stdout is logs anyway).
+    pub skip_compatibility_check: bool,
 }
 
 impl Default for ExperienceStoreConfig {
@@ -83,6 +92,7 @@ impl Default for ExperienceStoreConfig {
             upsert_batch_size: 256,
             use_mock: true,
             timeout_secs: 10,
+            skip_compatibility_check: false,
         }
     }
 }
@@ -116,6 +126,7 @@ impl ExperienceStoreConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(10),
+            skip_compatibility_check: false,
         }
     }
 }
@@ -259,8 +270,14 @@ impl ExperienceStore {
             });
         }
 
-        let client = Qdrant::from_url(&config.qdrant_url)
-            .timeout(std::time::Duration::from_secs(config.timeout_secs))
+        let mut builder = Qdrant::from_url(&config.qdrant_url)
+            .timeout(std::time::Duration::from_secs(config.timeout_secs));
+        if config.skip_compatibility_check {
+            // The version check println!s to STDOUT on mismatch/unreachable —
+            // callers with machine-readable stdout (gate_a_verdict) opt out.
+            builder = builder.skip_compatibility_check();
+        }
+        let client = builder
             .build()
             .with_context(|| {
                 format!(
@@ -519,6 +536,108 @@ impl ExperienceStore {
             .collect();
 
         Ok((points, total))
+    }
+
+    /// Approximate total number of points in the collection (mock mode
+    /// reports the mock store's size).
+    pub async fn collection_count(&self) -> Result<u64> {
+        if self.is_mock {
+            return Ok(self.mock.read().await.len() as u64);
+        }
+        let client = self
+            .client
+            .as_ref()
+            .context("Qdrant client not initialised")?;
+        use qdrant_client::qdrant::CountPointsBuilder;
+        let count = client
+            .count(CountPointsBuilder::new(&self.config.collection_name).exact(false))
+            .await
+            .context("Qdrant count failed")?
+            .result
+            .map(|c| c.count)
+            .unwrap_or(0);
+        Ok(count)
+    }
+
+    /// Scroll EVERY point whose `timestamp_ms` payload falls inside
+    /// `[start_ms, end_ms]`, paginating with Qdrant's `next_page_offset`
+    /// cursor until the window is exhausted (or `max_points` is reached as a
+    /// runaway guard).
+    ///
+    /// This is the full-window read path for the Gate-A verdict script: the
+    /// HTTP sample endpoint caps at 5000 points, and [`Self::sample`]'s
+    /// single `order_by` scroll cannot paginate (Qdrant does not return a
+    /// page cursor for ordered scrolls) — a 2-week window at ~10 rows/min is
+    /// ~200k points, so this scrolls unordered pages and lets the caller sort.
+    /// Vectors are not fetched (payload-only; `SamplePoint::vector` is empty)
+    /// since window statistics only need the payload.
+    ///
+    /// Mock mode returns an honest empty result, mirroring [`Self::sample`].
+    pub async fn scroll_window(
+        &self,
+        start_ms: i64,
+        end_ms: i64,
+        page_size: usize,
+        max_points: usize,
+    ) -> Result<Vec<SamplePoint>> {
+        if self.is_mock {
+            return Ok(Vec::new());
+        }
+        let client = self
+            .client
+            .as_ref()
+            .context("Qdrant client not initialised")?;
+
+        use qdrant_client::qdrant::{Condition, Filter, PointId, Range, ScrollPointsBuilder};
+
+        let filter = Filter::must([Condition::range(
+            "timestamp_ms",
+            Range {
+                gte: Some(start_ms as f64),
+                lte: Some(end_ms as f64),
+                ..Default::default()
+            },
+        )]);
+
+        let mut out: Vec<SamplePoint> = Vec::new();
+        let mut offset: Option<PointId> = None;
+        loop {
+            let mut scroll = ScrollPointsBuilder::new(&self.config.collection_name)
+                .limit(page_size.clamp(1, 10_000) as u32)
+                .with_payload(true)
+                .with_vectors(false)
+                .filter(filter.clone());
+            if let Some(off) = offset.take() {
+                scroll = scroll.offset(off);
+            }
+            let scrolled = client
+                .scroll(scroll)
+                .await
+                .context("Qdrant window scroll failed")?;
+
+            let page_len = scrolled.result.len();
+            for p in scrolled.result {
+                let Some(id) = p.id.as_ref().and_then(point_id_string) else {
+                    continue;
+                };
+                let payload = p
+                    .payload
+                    .into_iter()
+                    .map(|(k, v)| (k, qdrant_value_to_json(v)))
+                    .collect();
+                out.push(SamplePoint {
+                    id,
+                    vector: Vec::new(),
+                    payload,
+                });
+            }
+
+            offset = scrolled.next_page_offset;
+            if offset.is_none() || page_len == 0 || out.len() >= max_points {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     // ── Training read (EXPERIENCE_PIPELINE.md §7 Phase 2) ────────────────

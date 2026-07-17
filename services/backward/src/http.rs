@@ -5,6 +5,9 @@
 //! - `/metrics` - Prometheus metrics endpoint
 //! - `/api/v1/experiences/sample` - recent experience vectors + payload for
 //!   the UMAP "what is janus thinking" view (EXPERIENCE_PIPELINE.md §8)
+//! - `/api/v1/training/evals` - the parsed challenger `eval_history.jsonl`
+//!   (last N sessions), so Gate-A day quotes numbers from an endpoint instead
+//!   of a docker-exec archaeology session
 
 use axum::{
     Json, Router,
@@ -63,6 +66,7 @@ pub async fn start_http_server(port: u16, state: HttpState) -> anyhow::Result<()
             "/api/v1/experiences/sample",
             get(experiences_sample_handler),
         )
+        .route("/api/v1/training/evals", get(training_evals_handler))
         .with_state(Arc::new(state));
 
     let addr = format!("0.0.0.0:{}", port);
@@ -122,6 +126,32 @@ mod tests {
         assert!(!state.version.is_empty());
         assert!(state.start_time.elapsed().as_secs() < 1);
     }
+
+    #[test]
+    fn test_tail_evals_bounds_to_last_n_in_order() {
+        use crate::tasks::promote::EvalRecord;
+        let rec = |unix: u64| EvalRecord {
+            unix,
+            eval_winrate: 0.5,
+            eval_samples: 10,
+            eval_mean_reward: 0.0,
+            eval_winrate_directional: 0.0,
+            eval_samples_directional: 0,
+        };
+        let records: Vec<EvalRecord> = (1..=5).map(rec).collect();
+
+        // Fewer records than the limit → everything, unchanged order.
+        assert_eq!(tail_evals(records.clone(), 100).len(), 5);
+
+        // More records than the limit → the LAST n, chronological order.
+        let tail = tail_evals(records, 2);
+        assert_eq!(tail.len(), 2);
+        assert_eq!(tail[0].unix, 4);
+        assert_eq!(tail[1].unix, 5);
+
+        // Empty history → empty response.
+        assert!(tail_evals(Vec::new(), 10).is_empty());
+    }
 }
 
 /// Query parameters for `/api/v1/experiences/sample`.
@@ -155,4 +185,49 @@ async fn experiences_sample_handler(
             Json(json!({ "points": [], "total": 0 })).into_response()
         }
     }
+}
+
+/// Query parameters for `/api/v1/training/evals`.
+#[derive(Debug, serde::Deserialize)]
+pub struct EvalsQuery {
+    /// Maximum number of most-recent sessions to return (default 100,
+    /// clamped to 1..=1000).
+    pub limit: Option<usize>,
+}
+
+/// Bounded tail of the eval history: the last `limit` records, in
+/// chronological (file) order. Pure — unit-tested.
+fn tail_evals(
+    records: Vec<crate::tasks::promote::EvalRecord>,
+    limit: usize,
+) -> Vec<crate::tasks::promote::EvalRecord> {
+    let skip = records.len().saturating_sub(limit);
+    records.into_iter().skip(skip).collect()
+}
+
+/// GET /api/v1/training/evals — the parsed challenger `eval_history.jsonl`
+/// (see `tasks::promote`), bounded to the last N sessions (default 100).
+///
+/// Read-only observability: reads the same file the training session appends
+/// and the promotion gate reads (`<challenger_dir>/eval_history.jsonl` inside
+/// the checkpoints volume). The challenger dir resolves exactly like the
+/// trainer's (`JANUS_TRAIN_CHALLENGER_DIR`, defaulting to the canonical
+/// challenger subdir). A missing file yields an honest empty list.
+async fn training_evals_handler(Query(q): Query<EvalsQuery>) -> Response {
+    let limit = q.limit.unwrap_or(100).clamp(1, 1000);
+    let challenger_dir = std::env::var(crate::tasks::train::TRAIN_CHALLENGER_DIR_ENV)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| crate::tasks::promote::DEFAULT_CHALLENGER_DIR.to_string());
+    let records = crate::tasks::promote::read_eval_history(std::path::Path::new(&challenger_dir));
+    let total_recorded = records.len();
+    let evals = tail_evals(records, limit);
+    Json(json!({
+        "challenger_dir": challenger_dir,
+        "total_recorded": total_recorded,
+        "returned": evals.len(),
+        "evals": evals,
+    }))
+    .into_response()
 }

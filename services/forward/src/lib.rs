@@ -46,6 +46,7 @@ pub mod cnn_inference;
 pub mod execution;
 pub mod experience;
 pub mod features;
+pub mod gate_block_mix;
 pub mod gate_integration;
 pub mod gate_metrics_redis;
 pub mod gate_recorder;
@@ -1516,6 +1517,15 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                 crate::gate_metrics_redis::GateMetricsRedisConfig::from_env(),
             )
             .await;
+            // Daily block-mix soak log (Gate-A prereg §4a J3): armed by the
+            // SAME opt-in flag as the exporter above; appends per-reason gate
+            // counters + pass rate to an append-only JSONL in the checkpoints
+            // volume, once at startup and then daily. Supervised (#156/#157
+            // pattern) and best-effort — it never blocks trading.
+            let _gate_block_mix_task = crate::gate_block_mix::spawn(
+                Arc::clone(&forward_gate),
+                crate::gate_block_mix::BlockMixConfig::from_env(),
+            );
             // Experience pipeline producer (Phase 1, default OFF —
             // JANUS_EXPERIENCE_ENABLED). When enabled, every closed candle
             // records a post-gate decision transition (docs/architecture/
