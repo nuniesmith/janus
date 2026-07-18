@@ -42,6 +42,7 @@ pub mod metrics;
 pub mod persistence;
 pub mod sched;
 pub mod tasks;
+pub mod verdict;
 pub mod worker;
 
 use tokio_util::sync::CancellationToken;

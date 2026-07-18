@@ -416,6 +416,15 @@ fn action_to_index(action_type: &ActionType) -> usize {
     }
 }
 
+/// True for action indices that take a market direction: Buy (0) and Sell (1).
+/// Hold (2) and Close (3) are non-directional — Hold always records reward
+/// exactly 0.0 and Close carries no entry direction — so both are excluded
+/// from the directional eval metric (Gate-A prereg §4a J2).
+fn is_directional_action(action_index: usize) -> bool {
+    action_index == action_to_index(&ActionType::Buy)
+        || action_index == action_to_index(&ActionType::Sell)
+}
+
 /// Run the LSTM forward pass and return Q-values for a batch of states.
 ///
 /// Each state is independently fed through the model as a `[1, 1, input_size]`
@@ -788,8 +797,8 @@ pub async fn handle_training(job: TrainJob, notifier: Option<&CheckpointNotifier
                         .to_string();
 
                     let notification = CheckpointNotification::new(&model_path, "lstm_dqn_v1")
-                        .with_version(online.step_count as u64)
-                        .with_training_step(online.step_count as u64)
+                        .with_version(online.step_count)
+                        .with_training_step(online.step_count)
                         .with_metadata("loss", format!("{:.6}", step_result.loss))
                         .with_metadata("mean_q", format!("{:.4}", step_result.mean_q));
 
@@ -866,10 +875,21 @@ pub struct TrainSessionMetrics {
     /// that action's realized reward was non-negative (a conservative lower
     /// bound — see the `evaluate_challenger` / `compute_challenger_eval` docs).
     pub eval_winrate: f64,
+    /// Directional-only greedy-eval winrate (Gate-A prereg §4a J2): the same
+    /// greedy-match ∧ reward ≥ 0 win condition, but computed over recorded
+    /// **Buy/Sell** actions only — Hold and Close are excluded from both the
+    /// numerator and the denominator. Closes the Hold-domination hole in
+    /// `eval_winrate` (Hold reward is exactly 0.0 and 0 ≥ 0 scores as a win,
+    /// so an always-Hold policy scores ≈ the Hold fraction of the slice).
+    pub eval_winrate_directional: f64,
     /// Mean realized reward over the recent eval slice.
     pub eval_mean_reward: f64,
     /// Number of experiences actually evaluated (at most `EVAL_SLICE_SIZE`).
     pub eval_samples: usize,
+    /// Number of eval samples whose RECORDED action was directional (Buy/Sell)
+    /// — the denominator of `eval_winrate_directional`. 0 ⇒ the directional
+    /// metric carries no signal for this session.
+    pub eval_samples_directional: usize,
 }
 
 /// Outcome of greedily evaluating a trained challenger over a recent slice of
@@ -892,14 +912,23 @@ pub struct TrainSessionMetrics {
 /// * `mean_reward` — mean of the recorded `reward` across the slice. This is
 ///   independent of the greedy action; it characterises the realized-reward
 ///   distribution of the recent buffer the challenger trained against.
+/// * `winrate_directional` / `samples_directional` — the same win condition
+///   restricted to samples whose RECORDED action is directional (Buy/Sell).
+///   Hold and Close are excluded from both numerator and denominator, so a
+///   policy that has only learned "don't trade" scores 0 directional samples
+///   (or a directional winrate that reflects only its actual directional
+///   calls) instead of inheriting free wins from zero-reward Holds. This is
+///   the Gate-A prereg §4a J2 instrument.
 ///
 /// This is for observability and a future promotion gate only — it never
 /// auto-promotes and never touches the champion.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct ChallengerEval {
     winrate: f64,
+    winrate_directional: f64,
     mean_reward: f64,
     samples: usize,
+    samples_directional: usize,
 }
 
 /// Index of the maximum value in `v` (first-max on ties). Empty slice → 0.
@@ -930,12 +959,16 @@ fn compute_challenger_eval(
     if n == 0 {
         return ChallengerEval {
             winrate: 0.0,
+            winrate_directional: 0.0,
             mean_reward: 0.0,
             samples: 0,
+            samples_directional: 0,
         };
     }
 
     let mut wins = 0usize;
+    let mut directional = 0usize;
+    let mut directional_wins = 0usize;
     let mut reward_sum = 0.0_f64;
     for i in 0..n {
         reward_sum += rewards[i];
@@ -952,15 +985,33 @@ fn compute_challenger_eval(
         // Greedy action agrees with the log AND its realized reward is
         // non-negative → credit a win (honest: we only have a realized reward
         // for the recorded action).
-        if has_signal && argmax(q) == recorded_actions[i] && rewards[i] >= 0.0 {
+        let win = has_signal && argmax(q) == recorded_actions[i] && rewards[i] >= 0.0;
+        if win {
             wins += 1;
+        }
+        // Directional variant (Gate-A prereg §4a J2): only samples whose
+        // RECORDED action is Buy/Sell enter the denominator; the win condition
+        // is unchanged. Hold pays exactly 0.0 reward (0 ≥ 0 counts as a win in
+        // the legacy metric), so excluding Hold here is what closes the
+        // always-Hold gaming hole.
+        if is_directional_action(recorded_actions[i]) {
+            directional += 1;
+            if win {
+                directional_wins += 1;
+            }
         }
     }
 
     ChallengerEval {
         winrate: wins as f64 / n as f64,
+        winrate_directional: if directional > 0 {
+            directional_wins as f64 / directional as f64
+        } else {
+            0.0
+        },
         mean_reward: reward_sum / n as f64,
         samples: n,
+        samples_directional: directional,
     }
 }
 
@@ -976,8 +1027,10 @@ fn evaluate_challenger(
     if recent.is_empty() {
         return ChallengerEval {
             winrate: 0.0,
+            winrate_directional: 0.0,
             mean_reward: 0.0,
             samples: 0,
+            samples_directional: 0,
         };
     }
 
@@ -1131,6 +1184,8 @@ pub async fn run_training_session(
         eval.winrate,
         eval.samples,
         eval.mean_reward,
+        eval.winrate_directional,
+        eval.samples_directional,
     ) {
         warn!(error = %e, "failed to append challenger eval history (non-fatal)");
     }
@@ -1142,8 +1197,10 @@ pub async fn run_training_session(
         mean_q,
         buffer_size,
         eval_winrate: eval.winrate,
+        eval_winrate_directional: eval.winrate_directional,
         eval_mean_reward: eval.mean_reward,
         eval_samples: eval.samples,
+        eval_samples_directional: eval.samples_directional,
     };
 
     info!(
@@ -1153,8 +1210,10 @@ pub async fn run_training_session(
         mean_q = format!("{:.4}", metrics.mean_q),
         buffer_size = metrics.buffer_size,
         eval_winrate = format!("{:.4}", metrics.eval_winrate),
+        eval_winrate_directional = format!("{:.4}", metrics.eval_winrate_directional),
         eval_mean_reward = format!("{:.6}", metrics.eval_mean_reward),
         eval_samples = metrics.eval_samples,
+        eval_samples_directional = metrics.eval_samples_directional,
         checkpoint_dir = %config.checkpoint_dir,
         "Challenger training session completed (challenger checkpoint written)"
     );
@@ -1340,8 +1399,10 @@ pub async fn run_training_scheduler(cancel: tokio_util::sync::CancellationToken)
                         mean_q = format!("{:.4}", m.mean_q),
                         buffer_size = m.buffer_size,
                         eval_winrate = format!("{:.4}", m.eval_winrate),
+                        eval_winrate_directional = format!("{:.4}", m.eval_winrate_directional),
                         eval_mean_reward = format!("{:.6}", m.eval_mean_reward),
                         eval_samples = m.eval_samples,
+                        eval_samples_directional = m.eval_samples_directional,
                         challenger_dir = %cfg.challenger_dir,
                         "scheduled challenger training session completed"
                     ),
@@ -2180,10 +2241,134 @@ mod tests {
             eval,
             ChallengerEval {
                 winrate: 0.0,
+                winrate_directional: 0.0,
                 mean_reward: 0.0,
-                samples: 0
+                samples: 0,
+                samples_directional: 0
             }
         );
+    }
+
+    /// THE anti-gaming case for Gate-A prereg §4a J2 (Hold-domination hole).
+    ///
+    /// A synthetic "lobotomized" model greedily predicts Hold on EVERY sample.
+    /// Over a Hold-dominated slice (the live shape: `DecisionCtx::hold` is the
+    /// overwhelmingly common case and Hold reward is exactly 0.0, which the
+    /// legacy win condition scores as a win because 0 ≥ 0), the legacy
+    /// `eval_winrate` comes out HIGH — 90% here, comfortably clearing both the
+    /// original Gate-A bar (> 0.5) and the promotion default (0.55) — while
+    /// `eval_winrate_directional` is 0.0 over the 10 directional samples:
+    /// the model made zero correct directional calls, and the metric says so.
+    /// This proves the directional variant closes the always-Hold gaming hole.
+    #[test]
+    fn test_directional_eval_defeats_always_hold_gaming() {
+        const HOLD: usize = 2;
+        let n = 100usize;
+        let n_directional = 10usize;
+
+        let mut q_values = Vec::with_capacity(n);
+        let mut recorded_actions = Vec::with_capacity(n);
+        let mut rewards = Vec::with_capacity(n);
+        for i in 0..n {
+            // Non-degenerate, finite Q-vector whose argmax is ALWAYS Hold —
+            // a genuinely-trained always-Hold policy, not a diverged one, so
+            // the `has_signal` guard does NOT exclude it.
+            q_values.push(vec![0.1, 0.2, 0.9, 0.0]);
+            if i < n_directional {
+                // Directional recorded actions (alternating Buy/Sell) with
+                // non-negative rewards — even "easy" directional samples earn
+                // the Hold-predictor nothing, because greedy ≠ recorded.
+                recorded_actions.push(i % 2);
+                rewards.push(0.5);
+            } else {
+                // The Hold-dominated bulk: recorded Hold, reward exactly 0.0.
+                recorded_actions.push(HOLD);
+                rewards.push(0.0);
+            }
+        }
+
+        let eval = compute_challenger_eval(&q_values, &recorded_actions, &rewards);
+        assert_eq!(eval.samples, n);
+
+        // Legacy metric: every recorded-Hold sample scores a win (greedy==Hold
+        // and 0.0 ≥ 0) → 90/100. The always-Hold model "passes" the old bar.
+        assert!(
+            (eval.winrate - 0.9).abs() < 1e-12,
+            "legacy winrate should be inflated to 0.9 by Hold domination, got {}",
+            eval.winrate
+        );
+        assert!(
+            eval.winrate > 0.5,
+            "legacy metric is gameable: always-Hold clears the original Gate-A bar"
+        );
+
+        // Directional metric: 10 directional samples in the denominator, zero
+        // wins — the lobotomized model's directional performance is honest.
+        assert_eq!(eval.samples_directional, n_directional);
+        assert_eq!(
+            eval.winrate_directional, 0.0,
+            "always-Hold must score 0 on the directional metric"
+        );
+    }
+
+    /// Degenerate slice: EVERY recorded action is Hold ⇒ the directional
+    /// metric yields 0 samples (no denominator, no free wins) while the legacy
+    /// winrate is a perfect 1.0. A 0-directional-sample session carries no J2
+    /// signal — prereg J2 requires ≥ 30 directional samples per session.
+    #[test]
+    fn test_directional_eval_all_hold_slice_has_zero_directional_samples() {
+        const HOLD: usize = 2;
+        let n = 50usize;
+        let q_values = vec![vec![0.1, 0.2, 0.9, 0.0]; n];
+        let recorded_actions = vec![HOLD; n];
+        let rewards = vec![0.0_f64; n];
+
+        let eval = compute_challenger_eval(&q_values, &recorded_actions, &rewards);
+        assert!(
+            (eval.winrate - 1.0).abs() < 1e-12,
+            "legacy metric maxes out"
+        );
+        assert_eq!(eval.samples_directional, 0);
+        assert_eq!(eval.winrate_directional, 0.0);
+    }
+
+    /// A model that actually calls direction gets credited by BOTH metrics:
+    /// directional wins are counted over the directional denominator only, and
+    /// Close (non-directional) is excluded from it just like Hold.
+    #[test]
+    fn test_directional_eval_credits_real_directional_calls() {
+        let q_values = vec![
+            vec![0.9, 0.1, 0.0, 0.0], // argmax Buy
+            vec![0.1, 0.9, 0.0, 0.0], // argmax Sell
+            vec![0.9, 0.1, 0.0, 0.0], // argmax Buy
+            vec![0.1, 0.9, 0.0, 0.0], // argmax Sell (greedy ≠ recorded Buy)
+            vec![0.0, 0.1, 0.9, 0.0], // argmax Hold
+            vec![0.0, 0.1, 0.0, 0.9], // argmax Close
+        ];
+        let recorded_actions = vec![0usize, 1, 0, 0, 2, 3];
+        let rewards = vec![0.4_f64, 0.2, -0.3, 0.4, 0.0, 0.1];
+
+        let eval = compute_challenger_eval(&q_values, &recorded_actions, &rewards);
+        // Directional denominator: recorded Buy/Sell = samples 0..=3 (4 of 6).
+        assert_eq!(eval.samples_directional, 4);
+        // Directional wins: sample 0 (match, +0.4) and sample 1 (match, +0.2);
+        // sample 2 matches but reward < 0; sample 3 mismatches → 2/4.
+        assert!(
+            (eval.winrate_directional - 0.5).abs() < 1e-12,
+            "directional winrate = {}",
+            eval.winrate_directional
+        );
+        // Legacy: those 2 wins + Hold (0.0 ≥ 0) + Close (0.1 ≥ 0) = 4/6.
+        assert!((eval.winrate - 4.0 / 6.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_is_directional_action_indices() {
+        assert!(is_directional_action(0), "Buy is directional");
+        assert!(is_directional_action(1), "Sell is directional");
+        assert!(!is_directional_action(2), "Hold is not directional");
+        assert!(!is_directional_action(3), "Close is not directional");
+        assert!(!is_directional_action(7), "out-of-range is not directional");
     }
 
     #[test]

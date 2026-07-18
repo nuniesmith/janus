@@ -130,6 +130,18 @@ pub struct EvalRecord {
     pub eval_samples: usize,
     /// Mean realized reward over the eval slice.
     pub eval_mean_reward: f64,
+    /// Directional-only winrate (Gate-A prereg §4a J2): greedy-match ∧
+    /// reward ≥ 0 over recorded Buy/Sell actions only (Hold/Close excluded
+    /// from numerator AND denominator). `#[serde(default)]` keeps pre-J2
+    /// history lines parseable (they deserialize as 0.0 with 0 samples), and
+    /// the field is additive so existing readers are unaffected.
+    #[serde(default)]
+    pub eval_winrate_directional: f64,
+    /// Number of directional (Buy/Sell) recorded actions in the eval slice —
+    /// the denominator of `eval_winrate_directional` (0 ⇒ no directional
+    /// signal this session; prereg J2 requires ≥ 30 to count a session).
+    #[serde(default)]
+    pub eval_samples_directional: usize,
 }
 
 /// Current unix time in whole seconds (0 if the clock predates the epoch).
@@ -169,6 +181,8 @@ pub fn append_session_eval(
     eval_winrate: f64,
     eval_samples: usize,
     eval_mean_reward: f64,
+    eval_winrate_directional: f64,
+    eval_samples_directional: usize,
 ) -> Result<()> {
     append_eval_record(
         challenger_dir,
@@ -177,6 +191,8 @@ pub fn append_session_eval(
             eval_winrate,
             eval_samples,
             eval_mean_reward,
+            eval_winrate_directional,
+            eval_samples_directional,
         },
     )
 }
@@ -608,6 +624,8 @@ mod tests {
             eval_winrate: winrate,
             eval_samples: samples,
             eval_mean_reward: 0.0,
+            eval_winrate_directional: 0.0,
+            eval_samples_directional: 0,
         }
     }
 
@@ -672,12 +690,36 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         assert!(read_eval_history(tmp.path()).is_empty());
         append_eval_record(tmp.path(), &rec(1, 0.6, 10)).unwrap();
-        append_session_eval(tmp.path(), 0.7, 20, 0.01).unwrap();
+        append_session_eval(tmp.path(), 0.7, 20, 0.01, 0.55, 42).unwrap();
         let hist = read_eval_history(tmp.path());
         assert_eq!(hist.len(), 2);
         assert_eq!(hist[0], rec(1, 0.6, 10));
         assert_eq!(hist[1].eval_winrate, 0.7);
         assert_eq!(hist[1].eval_samples, 20);
+        assert_eq!(hist[1].eval_winrate_directional, 0.55);
+        assert_eq!(hist[1].eval_samples_directional, 42);
+    }
+
+    #[test]
+    fn test_eval_history_reads_pre_directional_lines() {
+        // History lines written BEFORE the J2 directional fields existed must
+        // still parse (additive JSON fields, serde defaults) — the promotion
+        // gate and any other reader keep working across the format bump.
+        use std::io::Write;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(EVAL_HISTORY_FILE);
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(
+            f,
+            r#"{{"unix":100,"eval_winrate":0.62,"eval_samples":256,"eval_mean_reward":0.01}}"#
+        )
+        .unwrap();
+        let hist = read_eval_history(tmp.path());
+        assert_eq!(hist.len(), 1);
+        assert_eq!(hist[0].eval_winrate, 0.62);
+        assert_eq!(hist[0].eval_samples, 256);
+        assert_eq!(hist[0].eval_winrate_directional, 0.0, "defaults to 0.0");
+        assert_eq!(hist[0].eval_samples_directional, 0, "defaults to 0");
     }
 
     #[test]

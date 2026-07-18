@@ -11,6 +11,12 @@ repository.workspace = true
 name = "janus-backward"
 path = "src/main.rs"
 
+# Committed, re-runnable Gate-A janus-side verdict script
+# (GATE_A_PREREGISTRATION.md §4a; statistics live in src/verdict.rs).
+[[bin]]
+name = "gate_a_verdict"
+path = "src/bin/gate_a_verdict.rs"
+
 [dependencies]
 # Unified JANUS core
 janus-core = { workspace = true }
