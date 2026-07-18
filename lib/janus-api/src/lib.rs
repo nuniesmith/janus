@@ -81,13 +81,15 @@ pub async fn start_module(state: Arc<JanusState>) -> janus_core::Result<()> {
     // the repeated snapshots a producer pushes for one position_id.
     let position_tracker = Arc::new(PositionTracker::new());
 
-    // Build the main HTTP router
-    let app = create_router(
+    // Build the main HTTP router, then wrap it with bearer-auth on mutating
+    // routes (applied here, not in create_router, so unit tests exercise the
+    // routes without a token).
+    let app = with_bearer_auth(create_router(
         state.clone(),
         position_store,
         param_manager,
         position_tracker,
-    );
+    ));
 
     // Build the metrics router
     let metrics_app = create_metrics_router();
@@ -265,6 +267,24 @@ fn create_router(
         .layer(Extension(position_tracker))
         .layer(cors)
         .with_state(state)
+}
+
+/// Wrap a built router with the bearer-auth layer. Applied at the serve site
+/// (not inside [`create_router`]) so the router stays auth-free for unit tests
+/// while every *served* instance enforces the token.
+///
+/// Gates every mutating (non-GET) route: `/api/config` PUT,
+/// `/api/services/{start,stop}`, `/api/signals/publish`, `/api/log-level`,
+/// `/api/v1/positions/{event,close}`. GET/HEAD/OPTIONS (health, status,
+/// dashboards, bars, SSE, all reads) and the separate metrics port stay open.
+/// Fail-closed when `JANUS_API_TOKEN` is unset — see [`janus_auth`].
+fn with_bearer_auth(app: Router) -> Router {
+    let posture = janus_auth::Posture::from_env();
+    posture.log_startup("janus-api");
+    app.layer(axum::middleware::from_fn_with_state(
+        posture,
+        janus_auth::enforce,
+    ))
 }
 
 /// Create the metrics router

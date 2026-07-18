@@ -5622,6 +5622,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "janus-auth"
+version = "0.1.0"
+dependencies = [
+ "axum 0.8.8",
+ "http-body-util",
+ "sha2 0.10.9",
+ "subtle",
+ "tokio",
+ "tower 0.5.3",
+ "tracing",
+]
+
+[[package]]
 name = "janus-backtest-cli"
 version = "0.1.0"
 dependencies = [
@@ -5825,6 +5838,7 @@ dependencies = [
  "futures",
  "futures-util",
  "indicators-ta",
+ "janus-auth",
  "janus-backward",
  "jflow-cns",
  "jflow-common",
@@ -5975,6 +5989,7 @@ dependencies = [
  "http 1.4.0",
  "http-body-util",
  "indicators-ta",
+ "janus-auth",
  "jflow-core",
  "prometheus",
  "redis",

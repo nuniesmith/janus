@@ -50,6 +50,8 @@ path = "tests/staging_validation.rs"
 [dependencies]
 # Unified JANUS core
 janus-core = { workspace = true }
+# Bearer-auth middleware for mutating HTTP routes
+janus-auth = { workspace = true }
 
 # Centralized proto definitions
 fks-proto = { workspace = true }
