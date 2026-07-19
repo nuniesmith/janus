@@ -13,6 +13,7 @@ name = "janus_api"
 
 [dependencies]
 janus-core.workspace = true
+janus-auth.workspace = true
 janus-indicators.workspace = true
 
 tokio.workspace = true

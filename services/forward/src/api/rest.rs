@@ -61,6 +61,14 @@ impl RestServer {
             .route("/api/v1/signals/generate", post(generate_signal_handler))
             .route("/api/v1/signals/batch", post(generate_batch_handler))
             .route("/api/v1/metrics", get(metrics_handler))
+            // Not started in the unified binary (the combined server.rs router is
+            // the served surface), but guard its mutating routes anyway so this
+            // standalone signals-only server is never exposed unauthenticated if
+            // wired up later. Fail-closed when JANUS_API_TOKEN is unset.
+            .layer(axum::middleware::from_fn_with_state(
+                janus_auth::Posture::from_env(),
+                janus_auth::enforce,
+            ))
             .with_state(generator)
     }
 

@@ -213,7 +213,18 @@ impl RestServer {
             );
         }
 
+        // Bearer-auth on every mutating (non-GET) route: risk config PUT,
+        // portfolio POST/DELETE, signal generation, brain kill-switch, etc.
+        // GET/HEAD/OPTIONS (health, metrics, all reads) stay open. Added last so
+        // it is the outermost layer and rejects before any downstream work.
+        // See janus-auth for the fail-closed posture when JANUS_API_TOKEN is unset.
+        let posture = janus_auth::Posture::from_env();
+        posture.log_startup("forward-rest");
         app.layer(TraceLayer::new_for_http())
+            .layer(axum::middleware::from_fn_with_state(
+                posture,
+                janus_auth::enforce,
+            ))
     }
 
     /// Start the REST API server

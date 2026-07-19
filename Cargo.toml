@@ -22,6 +22,7 @@ members = [
     "bin/backtest-cli",
     "lib/janus-core",
     "lib/janus-api",
+    "crates/janus-auth",
     # Existing crates
     # NOTE: `crates/indicators` (jflow-indicators) retired — consolidated onto
     # the published `indicators-ta` crate (see [workspace.dependencies]).
@@ -93,6 +94,7 @@ fks-proto = { path = "crates/fks-proto" }
 # ===========================================================================
 janus-core = { path = "lib/janus-core", package = "jflow-core", version = "0.1.0" }
 janus-api = { path = "lib/janus-api", package = "jflow-api", version = "0.1.0" }
+janus-auth = { path = "crates/janus-auth" }
 janus-dsp = { path = "crates/dsp", package = "jflow-dsp", version = "0.1.0" }
 janus-exchanges = { path = "crates/exchanges", package = "jflow-exchanges", version = "0.1.0" }
 janus-ltn = { path = "crates/ltn", package = "jflow-ltn", version = "0.1.0" }
@@ -170,6 +172,7 @@ hmac = "0.12.1"
 sha2 = "0.10.9"
 hex = "0.4.3"
 ring = "0.17.14"
+subtle = "2.6"
 
 # Configuration
 config = "0.15.19"

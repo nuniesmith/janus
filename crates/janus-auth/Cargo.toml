@@ -1,0 +1,23 @@
+# janus-auth — shared bearer-token middleware for janus HTTP surfaces.
+#
+# A single, unit-tested enforcement point so every mutating (non-GET) route on
+# the forward REST server and the janus-api gateway requires
+# `Authorization: Bearer $JANUS_API_TOKEN`. GET / HEAD / OPTIONS (health,
+# metrics, WS upgrades, all reads) stay open — the tailnet read posture is
+# deliberate. See `src/lib.rs` for the fail-posture rationale.
+[package]
+name = "janus-auth"
+publish = false # app/vendored: not published to crates.io
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+axum = { workspace = true }
+sha2 = { workspace = true }
+subtle = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tower = { workspace = true }
+http-body-util = "0.1"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
