@@ -7,20 +7,27 @@
 //! - `GET /api/v1/brain/health` — Full brain health report (runtime state,
 //!   boot status, watchdog snapshot, pipeline metrics, kill switch status).
 //! - `GET /api/v1/brain/pipeline` — Pipeline-only metrics snapshot.
-//! - `POST /api/v1/brain/kill-switch/activate` — Activate the pipeline kill switch. **🔒 Protected**
-//! - `POST /api/v1/brain/kill-switch/deactivate` — Deactivate the pipeline kill switch. **🔒 Protected**
+//! - `POST /api/v1/brain/kill-switch/activate` — Activate the pipeline kill switch. **🔒 Bearer (janus-auth)**
+//! - `POST /api/v1/brain/kill-switch/deactivate` — Deactivate the pipeline kill switch. **🔒 Bearer (janus-auth)**
 //! - `GET /api/v1/brain/affinity` — Export current strategy affinity state as JSON.
-//! - `POST /api/v1/brain/affinity/record` — Record a closed-trade outcome into the affinity tracker.
-//! - `POST /api/v1/brain/affinity/reset` — Reset strategy affinity tracker to empty state. **🔒 Protected**
+//! - `POST /api/v1/brain/affinity/record` — Record a closed-trade outcome into the affinity tracker. **🔒 Bearer (janus-auth)**
+//! - `POST /api/v1/brain/affinity/reset` — Reset strategy affinity tracker to empty state. **🔒 Bearer (janus-auth)**
 //!
 //! ## Authentication
 //!
 //! Destructive endpoints (kill-switch activate/deactivate, affinity reset) are
-//! protected by bearer-token authentication when `BRAIN_API_TOKEN` is set.
-//! Read-only endpoints (health, pipeline, affinity export) remain public.
+//! POSTs, so they are gated by the combined REST server's outer `janus-auth`
+//! layer (keyed on `JANUS_API_TOKEN`) exactly like every other mutating route
+//! — see [`crate::api::server::RestServer::router`]. Read-only endpoints
+//! (health, pipeline, affinity export) are GETs and stay open.
 //!
-//! If `BRAIN_API_TOKEN` is **not** set, all endpoints are open (suitable for
-//! development). A warning is logged at startup when the token is absent.
+//! This router therefore carries **no** auth layer of its own. It used to
+//! attach a second, separately-keyed `BRAIN_API_TOKEN` middleware here, but a
+//! single `Authorization` header cannot satisfy two independently-keyed layers:
+//! with `BRAIN_API_TOKEN` and `JANUS_API_TOKEN` set to different values the
+//! kill-switch — a safety control — became uninvokable. The inner layer was
+//! retired in favour of the single janus-auth seam; `BRAIN_API_TOKEN` is no
+//! longer read.
 //!
 //! ## Architecture
 //!
@@ -43,9 +50,8 @@ use std::sync::Arc;
 
 use axum::{
     Json, Router,
-    extract::{Request, State},
-    http::{HeaderMap, StatusCode},
-    middleware::{self, Next},
+    extract::State,
+    http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -348,103 +354,18 @@ impl From<PipelineHealthMetrics> for PipelineHealthDto {
 // Router
 // ════════════════════════════════════════════════════════════════════
 
-// ════════════════════════════════════════════════════════════════════
-// Auth Middleware
-// ════════════════════════════════════════════════════════════════════
-
-/// Load the bearer token from `BRAIN_API_TOKEN` environment variable.
-///
-/// Returns `None` when the variable is unset or empty — in that case
-/// all endpoints are unprotected and a warning is logged.
-fn load_api_token() -> Option<String> {
-    match std::env::var("BRAIN_API_TOKEN") {
-        Ok(token) if !token.is_empty() => {
-            info!(
-                "🔒 Brain REST API: destructive endpoints protected by BRAIN_API_TOKEN ({} chars)",
-                token.len()
-            );
-            Some(token)
-        }
-        _ => {
-            warn!(
-                "⚠️  BRAIN_API_TOKEN not set — kill-switch and affinity-reset endpoints are \
-                 UNPROTECTED. Set BRAIN_API_TOKEN for production use."
-            );
-            None
-        }
-    }
-}
-
-/// Axum middleware that checks the `Authorization: Bearer <token>` header
-/// against the configured `BRAIN_API_TOKEN`.
-///
-/// When no token is configured (dev mode), all requests pass through.
-async fn require_brain_token(
-    State(expected): State<Option<String>>,
-    headers: HeaderMap,
-    request: Request,
-    next: Next,
-) -> Response {
-    // No token configured → pass through (dev mode)
-    let expected_token = match expected {
-        Some(ref t) => t,
-        None => return next.run(request).await,
-    };
-
-    // Extract the Authorization header
-    let auth_header = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok());
-
-    match auth_header {
-        Some(value) if value.starts_with("Bearer ") => {
-            let provided = &value[7..];
-            if provided == expected_token {
-                next.run(request).await
-            } else {
-                warn!("🔒 Brain REST API: rejected request — invalid bearer token");
-                (
-                    StatusCode::FORBIDDEN,
-                    Json(BrainApiError {
-                        error: "forbidden".to_string(),
-                        message: "Invalid bearer token".to_string(),
-                    }),
-                )
-                    .into_response()
-            }
-        }
-        Some(_) => {
-            // Has Authorization header but not Bearer scheme
-            (
-                StatusCode::UNAUTHORIZED,
-                Json(BrainApiError {
-                    error: "unauthorized".to_string(),
-                    message: "Expected Authorization: Bearer <token>".to_string(),
-                }),
-            )
-                .into_response()
-        }
-        None => {
-            // No Authorization header at all
-            (
-                StatusCode::UNAUTHORIZED,
-                Json(BrainApiError {
-                    error: "unauthorized".to_string(),
-                    message:
-                        "Missing Authorization header. Use: Authorization: Bearer <BRAIN_API_TOKEN>"
-                            .to_string(),
-                }),
-            )
-                .into_response()
-        }
-    }
-}
-
 /// Build the brain health Axum router.
 ///
-/// Read-only endpoints (health, pipeline, affinity export) are public.
-/// Destructive endpoints (kill-switch, affinity reset) are protected by
-/// bearer-token auth when `BRAIN_API_TOKEN` is set.
+/// Read-only endpoints (health, pipeline, affinity export) are GETs and stay
+/// open. The destructive endpoints (kill-switch activate/deactivate, affinity
+/// reset) are POSTs and are gated by the combined REST server's outer
+/// `janus-auth` layer (`JANUS_API_TOKEN`) — see
+/// [`crate::api::server::RestServer::router`], which wraps this router. This
+/// router intentionally carries no auth layer of its own: a second,
+/// separately-keyed `BRAIN_API_TOKEN` layer used to live here, but two
+/// independently-keyed layers cannot both be satisfied by one `Authorization`
+/// header, which could lock out the kill-switch. It was retired in favour of
+/// the single janus-auth seam.
 ///
 /// Mount this into the main server router:
 ///
@@ -453,28 +374,16 @@ async fn require_brain_token(
 /// let app = Router::new().merge(brain_router);
 /// ```
 pub fn router(state: Arc<BrainHealthState>) -> Router {
-    let api_token = load_api_token();
-    router_with_token(state, api_token)
-}
-
-/// Build the brain health Axum router with an explicitly provided API token.
-///
-/// This avoids reading `BRAIN_API_TOKEN` from the environment, which makes
-/// it safe to call from concurrent tests without env-var races.
-pub fn router_with_token(state: Arc<BrainHealthState>, api_token: Option<String>) -> Router {
-    // Public read-only endpoints
-    let public_routes = Router::new()
+    Router::new()
+        // Read-only (open): GETs pass the janus-auth layer untouched.
         .route("/api/v1/brain/health", get(brain_health_handler))
         .route("/api/v1/brain/pipeline", get(brain_pipeline_handler))
         .route("/api/v1/brain/affinity", get(affinity_export_handler))
+        // Mutating (bearer-gated by the outer janus-auth layer): POSTs.
         .route(
             "/api/v1/brain/affinity/record",
             post(affinity_record_handler),
         )
-        .with_state(state.clone());
-
-    // Protected destructive endpoints
-    let protected_routes = Router::new()
         .route(
             "/api/v1/brain/kill-switch/activate",
             post(kill_switch_activate_handler),
@@ -484,13 +393,7 @@ pub fn router_with_token(state: Arc<BrainHealthState>, api_token: Option<String>
             post(kill_switch_deactivate_handler),
         )
         .route("/api/v1/brain/affinity/reset", post(affinity_reset_handler))
-        .route_layer(middleware::from_fn_with_state(
-            api_token,
-            require_brain_token,
-        ))
-        .with_state(state);
-
-    public_routes.merge(protected_routes)
+        .with_state(state)
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -774,8 +677,11 @@ mod tests {
     /// Spin up the brain REST router on a random port.
     /// Returns the base URL (e.g. `http://127.0.0.1:12345`).
     async fn spawn_server(state: Arc<BrainHealthState>) -> String {
-        // Use router_with_token(None) to avoid env-var races between parallel tests
-        let app = router_with_token(state, None);
+        // The brain router carries no auth of its own — mutating routes are
+        // gated by the combined server's outer janus-auth layer, exercised in
+        // the janus-auth crate and in `server.rs`. Here we drive the bare
+        // router so the handler behaviour is tested in isolation.
+        let app = router(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -784,23 +690,6 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(30)).await;
 
         format!("http://{}", addr)
-    }
-
-    /// Spin up the brain REST router **with** auth enabled.
-    /// Returns `(base_url, token)`.
-    ///
-    /// Uses `router_with_token` to inject the token directly, avoiding
-    /// env-var races when tests run in parallel.
-    async fn spawn_server_with_auth(state: Arc<BrainHealthState>, token: &str) -> (String, String) {
-        let app = router_with_token(state, Some(token.to_string()));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.ok();
-        });
-        tokio::time::sleep(Duration::from_millis(30)).await;
-
-        (format!("http://{}", addr), token.to_string())
     }
 
     #[tokio::test]
@@ -1176,182 +1065,62 @@ mod tests {
     }
 
     // ────────────────────────────────────────────────────────────────
-    // Auth middleware tests
+    // Auth delegation
     // ────────────────────────────────────────────────────────────────
 
+    /// Regression (double-bearer lockout): the brain router must carry **no**
+    /// inner auth layer. Every destructive route reaches its handler on the
+    /// bare router with no `Authorization` header — proving there is no second,
+    /// separately-keyed gate that (combined with the outer janus-auth layer)
+    /// could make the kill-switch uninvokable when two tokens are configured.
+    /// The real bearer enforcement lives in the outer janus-auth layer applied
+    /// by `server.rs` and is exercised in the `janus-auth` crate.
     #[tokio::test]
-    async fn test_auth_kill_switch_blocked_without_token() {
-        let pipeline = make_pipeline();
-        let state = make_state(Some(pipeline));
-        let (base, _token) = spawn_server_with_auth(state, "test-secret-42").await;
-
-        let client = reqwest::Client::new();
-
-        // POST without auth header → 401
-        let resp = client
-            .post(format!("{}/api/v1/brain/kill-switch/activate", base))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 401);
-
-        let json: BrainApiError = resp.json().await.unwrap();
-        assert_eq!(json.error, "unauthorized");
-    }
-
-    #[tokio::test]
-    async fn test_auth_kill_switch_blocked_with_wrong_token() {
-        let pipeline = make_pipeline();
-        let state = make_state(Some(pipeline));
-        let (base, _token) = spawn_server_with_auth(state, "correct-token").await;
-
-        let client = reqwest::Client::new();
-
-        let resp = client
-            .post(format!("{}/api/v1/brain/kill-switch/activate", base))
-            .bearer_auth("wrong-token")
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 403);
-
-        let json: BrainApiError = resp.json().await.unwrap();
-        assert_eq!(json.error, "forbidden");
-    }
-
-    #[tokio::test]
-    async fn test_auth_kill_switch_allowed_with_correct_token() {
+    async fn test_destructive_routes_have_no_inner_auth_gate() {
         let pipeline = make_pipeline();
         let state = make_state(Some(pipeline.clone()));
-        let (base, token) = spawn_server_with_auth(state, "my-secret-token").await;
+        let base = spawn_server(state).await;
 
         let client = reqwest::Client::new();
 
+        // kill-switch activate — no bearer, still reaches the handler (200).
         let resp = client
             .post(format!("{}/api/v1/brain/kill-switch/activate", base))
-            .bearer_auth(&token)
             .send()
             .await
             .unwrap();
-        assert_eq!(resp.status(), 200);
-
-        let json: KillSwitchResponse = resp.json().await.unwrap();
-        assert!(json.success);
-        assert!(json.is_killed);
+        assert_eq!(
+            resp.status(),
+            200,
+            "bare brain router must not gate the kill-switch itself"
+        );
         assert!(pipeline.is_killed().await);
-    }
 
-    #[tokio::test]
-    async fn test_auth_affinity_reset_blocked_without_token() {
-        let pipeline = make_pipeline();
-        let state = make_state(Some(pipeline));
-        let (base, _token) = spawn_server_with_auth(state, "secret-reset").await;
-
-        let client = reqwest::Client::new();
-
+        // affinity reset — no bearer, still reaches the handler (200).
         let resp = client
             .post(format!("{}/api/v1/brain/affinity/reset", base))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 401);
-    }
-
-    #[tokio::test]
-    async fn test_auth_affinity_reset_allowed_with_correct_token() {
-        let pipeline = make_pipeline();
-        let state = make_state(Some(pipeline));
-        let (base, token) = spawn_server_with_auth(state, "secret-reset").await;
-
-        let client = reqwest::Client::new();
-
-        let resp = client
-            .post(format!("{}/api/v1/brain/affinity/reset", base))
-            .bearer_auth(&token)
             .send()
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
-
         let json: AffinityResetResponse = resp.json().await.unwrap();
         assert!(json.success);
     }
 
     #[tokio::test]
-    async fn test_auth_public_endpoints_always_accessible() {
+    async fn test_public_endpoints_accessible() {
         let pipeline = make_pipeline();
         let state = make_state(Some(pipeline));
-        let (base, _token) = spawn_server_with_auth(state, "locked-down").await;
+        let base = spawn_server(state).await;
 
-        // Health endpoint — no auth needed
-        let resp = reqwest::get(format!("{}/api/v1/brain/health", base))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-
-        // Pipeline endpoint — no auth needed
-        let resp = reqwest::get(format!("{}/api/v1/brain/pipeline", base))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-
-        // Affinity export — no auth needed
-        let resp = reqwest::get(format!("{}/api/v1/brain/affinity", base))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-    }
-
-    #[tokio::test]
-    async fn test_auth_non_bearer_scheme_rejected() {
-        let pipeline = make_pipeline();
-        let state = make_state(Some(pipeline));
-        let (base, _token) = spawn_server_with_auth(state, "secret").await;
-
-        let client = reqwest::Client::new();
-
-        let resp = client
-            .post(format!("{}/api/v1/brain/kill-switch/activate", base))
-            .header("Authorization", "Basic dXNlcjpwYXNz")
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 401);
-
-        let json: BrainApiError = resp.json().await.unwrap();
-        assert_eq!(json.error, "unauthorized");
-        assert!(json.message.contains("Bearer"));
-    }
-
-    #[tokio::test]
-    async fn test_auth_deactivate_also_protected() {
-        let pipeline = make_pipeline();
-        pipeline.activate_kill_switch().await;
-        let state = make_state(Some(pipeline.clone()));
-        let (base, token) = spawn_server_with_auth(state, "deact-secret").await;
-
-        let client = reqwest::Client::new();
-
-        // Without token → 401
-        let resp = client
-            .post(format!("{}/api/v1/brain/kill-switch/deactivate", base))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 401);
-
-        // With token → 200
-        let resp = client
-            .post(format!("{}/api/v1/brain/kill-switch/deactivate", base))
-            .bearer_auth(&token)
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-
-        let json: KillSwitchResponse = resp.json().await.unwrap();
-        assert!(!json.is_killed);
-        assert!(!pipeline.is_killed().await);
+        for path in [
+            "/api/v1/brain/health",
+            "/api/v1/brain/pipeline",
+            "/api/v1/brain/affinity",
+        ] {
+            let resp = reqwest::get(format!("{}{}", base, path)).await.unwrap();
+            assert_eq!(resp.status(), 200, "GET {path} should be open");
+        }
     }
 
     #[tokio::test]

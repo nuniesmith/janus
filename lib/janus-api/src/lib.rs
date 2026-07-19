@@ -191,10 +191,6 @@ fn create_router(
     param_manager: Arc<ParamManager>,
     position_tracker: Arc<PositionTracker>,
 ) -> Router {
-    // NOTE: Permissive CORS is acceptable for internal/paper-trading use.
-    // For production, restrict origins via state.config.cors_origins.
-    let cors = CorsLayer::permissive();
-
     Router::new()
         // Root
         .route("/", get(root_handler))
@@ -265,19 +261,29 @@ fn create_router(
         .layer(Extension(position_store))
         .layer(Extension(param_manager))
         .layer(Extension(position_tracker))
-        .layer(cors)
         .with_state(state)
+    // NOTE: CORS is applied in `with_bearer_auth` as the outermost layer, not
+    // here, so it also decorates the auth layer's 401/503 rejections (a
+    // cross-origin browser hitting a mutating route then sees a clean status
+    // instead of an opaque CORS error). See there.
 }
 
-/// Wrap a built router with the bearer-auth layer. Applied at the serve site
-/// (not inside [`create_router`]) so the router stays auth-free for unit tests
-/// while every *served* instance enforces the token.
+/// Wrap a built router with the bearer-auth and CORS layers. Applied at the
+/// serve site (not inside [`create_router`]) so the router stays auth-free for
+/// unit tests while every *served* instance enforces the token.
 ///
 /// Gates every mutating (non-GET) route: `/api/config` PUT,
 /// `/api/services/{start,stop}`, `/api/signals/publish`, `/api/log-level`,
 /// `/api/v1/positions/{event,close}`. GET/HEAD/OPTIONS (health, status,
 /// dashboards, bars, SSE, all reads) and the separate metrics port stay open.
 /// Fail-closed when `JANUS_API_TOKEN` is unset — see [`janus_auth`].
+///
+/// Layer order (outermost first): CORS → auth → routes. CORS is outermost so
+/// its `Access-Control-Allow-Origin` header is present even on auth rejections;
+/// preflight `OPTIONS` is non-mutating and passes the auth layer untouched.
+///
+/// NOTE: Permissive CORS is acceptable for internal/paper-trading use. For
+/// production, restrict origins via `state.config.cors_origins`.
 fn with_bearer_auth(app: Router) -> Router {
     let posture = janus_auth::Posture::from_env();
     posture.log_startup("janus-api");
@@ -285,6 +291,8 @@ fn with_bearer_auth(app: Router) -> Router {
         posture,
         janus_auth::enforce,
     ))
+    // Applied after (⇒ outside) the auth layer so rejections keep CORS headers.
+    .layer(CorsLayer::permissive())
 }
 
 /// Create the metrics router
@@ -1557,6 +1565,50 @@ mod tests {
     async fn test_router_creation() {
         let state = test_state().await;
         let _router = test_router(state);
+    }
+
+    /// Regression: with CORS applied as the OUTERMOST layer (outside auth), a
+    /// mutating request that the auth layer rejects must still carry the
+    /// `access-control-allow-origin` header — otherwise a cross-origin browser
+    /// sees an opaque CORS error instead of the real 401/503. A GET (never
+    /// gated) is the control.
+    #[tokio::test]
+    async fn cors_header_present_even_on_auth_rejected_mutation() {
+        let app = with_bearer_auth(test_router(test_state().await));
+
+        // Mutating POST with no bearer → rejected by auth (401 if a token is
+        // configured in the env, 503 fail-closed if not). Either way CORS must
+        // decorate the rejection.
+        let req = http::Request::builder()
+            .method("POST")
+            .uri("/api/services/start")
+            .header("origin", "https://example.com")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert!(
+            resp.status() == StatusCode::UNAUTHORIZED
+                || resp.status() == StatusCode::SERVICE_UNAVAILABLE,
+            "unauthenticated mutation must be rejected, got {}",
+            resp.status()
+        );
+        assert!(
+            resp.headers().contains_key("access-control-allow-origin"),
+            "auth rejection must still carry CORS headers"
+        );
+
+        // Control: a read passes auth and is likewise CORS-decorated.
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("/health")
+            .header("origin", "https://example.com")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert!(
+            resp.headers().contains_key("access-control-allow-origin"),
+            "reads must carry CORS headers"
+        );
     }
 
     #[tokio::test]
