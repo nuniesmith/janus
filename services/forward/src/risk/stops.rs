@@ -189,13 +189,18 @@ impl StopLossCalculator {
         if distance_pct >= MIN_STOP_DISTANCE_PCT {
             return stop_loss;
         }
+        // Widen along the stop's OWN side, not the signal type's. `is_bullish`
+        // is only Buy|StrongBuy and `is_bearish` only Sell|StrongSell, so a
+        // `Hold` satisfies neither — keying the direction off the signal type
+        // made this fall through and return the stop unchanged, which is
+        // exactly how POL/USDT kept getting rejected after the first deploy.
+        // The calculator has already placed the stop above or below entry;
+        // that placement is the ground truth for which way "wider" is.
         let floor_distance = entry_price * MIN_STOP_DISTANCE_PCT;
-        let widened = if bullish {
+        let widened = if stop_loss < entry_price {
             entry_price - floor_distance
-        } else if bearish {
-            entry_price + floor_distance
         } else {
-            return stop_loss;
+            entry_price + floor_distance
         };
         tracing::debug!(
             entry_price,
@@ -853,6 +858,37 @@ mod tests {
         let expected = 50000.0 * (1.0 + MIN_STOP_DISTANCE_PCT);
         assert!((stop - expected).abs() < 1e-6, "got {stop}");
         assert!(stop > 50000.0, "short stop must stay ABOVE entry");
+    }
+
+    #[test]
+    fn test_hold_signal_with_tight_stop_is_still_clamped() {
+        // REGRESSION (2026-07-27, found by measuring the live deploy rather
+        // than trusting it): the first clamp keyed the widen direction off
+        // is_bullish()/is_bearish(), which are ONLY Buy|StrongBuy /
+        // Sell|StrongSell. A `Hold` signal satisfies neither, so the clamp
+        // fell through its final `else` and returned the stop UNCHANGED — and
+        // validate_stop_loss then rejected it exactly as before. Post-deploy
+        // POL/USDT kept being rejected for this reason.
+        //
+        // The stop's own side is the ground truth: calculate_*_stop has
+        // already placed it above or below entry. Widen along THAT.
+        let config = create_test_config();
+        let calculator = StopLossCalculator::new(config);
+
+        let mut signal = create_buy_signal(50000.0);
+        signal.signal_type = SignalType::Hold;
+        let market_data = MarketData::new(50000.0);
+
+        let method = StopLossMethod::Percentage { percent: 0.0001 };
+        let stop = calculator
+            .calculate_stop_loss(&signal, &market_data, &method)
+            .expect("a non-directional signal must still get a usable stop");
+
+        let distance_pct = ((50000.0 - stop).abs()) / 50000.0;
+        assert!(
+            distance_pct >= MIN_STOP_DISTANCE_PCT - 1e-12,
+            "stop must be widened to the floor even for Hold; got {distance_pct}"
+        );
     }
 
     #[test]
