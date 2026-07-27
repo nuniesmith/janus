@@ -196,7 +196,16 @@ impl StopLossCalculator {
         // exactly how POL/USDT kept getting rejected after the first deploy.
         // The calculator has already placed the stop above or below entry;
         // that placement is the ground truth for which way "wider" is.
-        let floor_distance = entry_price * MIN_STOP_DISTANCE_PCT;
+        // Clamp slightly BEYOND the floor, not exactly onto it. `validate_stop_loss`
+        // re-derives the distance as `(entry - stop).abs() / entry`, and that
+        // round-trip is not exact in binary floating point: widening to exactly
+        // `entry * MIN` re-reads as e.g. 0.0009999999999999196 for entry=0.07758
+        // and is rejected as "too close" — a correctly clamped stop failing the
+        // very check it was clamped to satisfy. Over 100k sampled entry prices
+        // this lands under the floor ~50% of the time, which is why rejections
+        // persisted after #162/#163 and looked random across symbols.
+        // The margin is 1e-9 relative — economically nothing, numerically decisive.
+        let floor_distance = entry_price * MIN_STOP_DISTANCE_PCT * (1.0 + 1e-9);
         let widened = if stop_loss < entry_price {
             entry_price - floor_distance
         } else {
@@ -889,6 +898,37 @@ mod tests {
             distance_pct >= MIN_STOP_DISTANCE_PCT - 1e-12,
             "stop must be widened to the floor even for Hold; got {distance_pct}"
         );
+    }
+
+    #[test]
+    fn test_clamped_stop_survives_the_validator_round_trip() {
+        // REGRESSION (production numbers, POL/USDT 2026-07-27T03:22Z):
+        // clamping to EXACTLY entry*MIN re-reads as 0.0009999999999999196 in
+        // validate_stop_loss and was rejected — the clamp satisfied the floor
+        // and the validator disagreed, ~50% of the time across entry prices.
+        let config = create_test_config();
+        let calculator = StopLossCalculator::new(config);
+
+        // Prices chosen to span the failure: the live POL entry, a sub-cent
+        // token, and a BTC-scale price.
+        for entry in [0.07758_f64, 0.0031_f64, 104_237.91_f64, 50_000.0_f64] {
+            let mut signal = create_buy_signal(entry);
+            signal.signal_type = SignalType::Hold; // the non-directional path too
+            let market_data = MarketData::new(entry);
+            let method = StopLossMethod::Percentage { percent: 0.00005 };
+
+            let stop = calculator
+                .calculate_stop_loss(&signal, &market_data, &method)
+                .unwrap_or_else(|e| panic!("entry {entry}: clamped stop must validate, got {e:?}"));
+
+            // Re-derive exactly as validate_stop_loss does — this is the
+            // round-trip that was failing.
+            let dist = ((entry - stop).abs() / entry).abs();
+            assert!(
+                dist >= MIN_STOP_DISTANCE_PCT,
+                "entry {entry}: clamped distance {dist} fell BELOW the floor {MIN_STOP_DISTANCE_PCT}"
+            );
+        }
     }
 
     #[test]
