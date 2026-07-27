@@ -12,6 +12,16 @@ use crate::risk::{MarketData, RiskConfig, RiskError};
 use crate::signal::types::TradingSignal;
 use serde::{Deserialize, Serialize};
 
+/// Minimum stop distance as a fraction of entry price (0.1%).
+///
+/// A stop nearer than this is indistinguishable from noise, so the floor is
+/// sound — but it must CLAMP, not reject: see `clamp_stop_to_min_distance`.
+/// Rejecting on it discarded ~30% of all directional decisions (59.8% of all
+/// gate blocks) because ATR-derived stops off 1-minute candles routinely land
+/// inside it. Named rather than inlined so the guard and the clamp can never
+/// drift apart.
+const MIN_STOP_DISTANCE_PCT: f64 = 0.001;
+
 /// Stop loss calculation method
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -130,10 +140,72 @@ impl StopLossCalculator {
             } => self.calculate_high_low_stop(signal, entry_price, market_data, *buffer_pct)?,
         };
 
+        // CLAMP, don't reject (2026-07-27). A stop computed INSIDE the minimum
+        // distance is a reason to widen the stop, not to discard the signal —
+        // but `validate_stop_loss` rejected it, and that single rejection was
+        // 59.8% of ALL gate blocks and ~30% of every directional decision
+        // (~6,571 in the Gate-A window). The gate named "risk" was throwing
+        // away one signal in three for a units artifact: stops are ATR-derived
+        // and janus ingests 1m candles, so a calm 1-minute ATR is routinely
+        // smaller than MIN_STOP_DISTANCE_PCT of price (for BTC at ~$100k the
+        // floor is ~$100 — under a quiet 1m ATR). Observed rejecting BTC/USDT
+        // and POL/USDT entries, and not merely advisory: the same rejection
+        // surfaced as "risk ENFORCE: blocking live entry".
+        //
+        // Widening to the floor is the conservative direction: the resulting
+        // stop is FARTHER from entry (more room, smaller position for a fixed
+        // risk budget), never tighter. The too-far and wrong-side checks in
+        // `validate_stop_loss` still apply and can still reject.
+        let stop_loss = self.clamp_stop_to_min_distance(signal, entry_price, stop_loss);
+
         // Validate stop loss
         self.validate_stop_loss(signal, entry_price, stop_loss)?;
 
         Ok(stop_loss)
+    }
+
+    /// Push a too-close stop out to [`MIN_STOP_DISTANCE_PCT`], preserving side.
+    ///
+    /// Returns the stop unchanged when it is already at or beyond the floor,
+    /// or when the inputs are degenerate (non-positive entry, or a stop on the
+    /// wrong side — the latter is left for `validate_stop_loss` to reject
+    /// rather than silently "fixed" into a valid-looking stop).
+    fn clamp_stop_to_min_distance(
+        &self,
+        signal: &TradingSignal,
+        entry_price: f64,
+        stop_loss: f64,
+    ) -> f64 {
+        if entry_price <= 0.0 || stop_loss <= 0.0 {
+            return stop_loss;
+        }
+        let bullish = signal.signal_type.is_bullish();
+        let bearish = signal.signal_type.is_bearish();
+        // Wrong-side stops are a different fault; don't mask them.
+        if (bullish && stop_loss >= entry_price) || (bearish && stop_loss <= entry_price) {
+            return stop_loss;
+        }
+        let distance_pct = ((entry_price - stop_loss).abs()) / entry_price;
+        if distance_pct >= MIN_STOP_DISTANCE_PCT {
+            return stop_loss;
+        }
+        let floor_distance = entry_price * MIN_STOP_DISTANCE_PCT;
+        let widened = if bullish {
+            entry_price - floor_distance
+        } else if bearish {
+            entry_price + floor_distance
+        } else {
+            return stop_loss;
+        };
+        tracing::debug!(
+            entry_price,
+            original_stop = stop_loss,
+            widened_stop = widened,
+            original_distance_pct = distance_pct,
+            min_distance_pct = MIN_STOP_DISTANCE_PCT,
+            "risk: stop inside the minimum distance — widened to the floor (was rejected before 2026-07-27)"
+        );
+        widened
     }
 
     /// ATR-based stop loss
@@ -298,9 +370,11 @@ impl StopLossCalculator {
             });
         }
 
-        // Check if stop is too close (less than 0.1%)
+        // Check if stop is too close. Reaching here now means the clamp above
+        // could not fix it (degenerate/wrong-side input), so rejecting is
+        // correct — the floor itself is sound, it was the INPUT that was wrong.
         let stop_distance_pct = ((entry_price - stop_loss).abs() / entry_price).abs();
-        if stop_distance_pct < 0.001 {
+        if stop_distance_pct < MIN_STOP_DISTANCE_PCT {
             return Err(RiskError::InvalidStopLoss {
                 reason: "Stop loss too close to entry (< 0.1%)".to_string(),
             });
@@ -734,18 +808,68 @@ mod tests {
     }
 
     #[test]
-    fn test_invalid_stop_too_close() {
+    fn test_stop_too_close_is_widened_not_rejected() {
+        // CONTRACT CHANGE 2026-07-27: a stop inside the minimum distance used
+        // to be REJECTED, which discarded ~30% of all directional decisions
+        // (59.8% of every gate block) because ATR-derived stops off 1-minute
+        // candles routinely land inside the floor. It is now widened to the
+        // floor — the signal survives, with a *wider* (more conservative) stop.
         let config = create_test_config();
         let calculator = StopLossCalculator::new(config);
 
         let signal = create_buy_signal(50000.0);
         let market_data = MarketData::new(50000.0);
 
-        // Stop too close (0.01%)
+        // 0.01% — an order of magnitude inside the 0.1% floor.
         let method = StopLossMethod::Percentage { percent: 0.0001 };
-        let result = calculator.calculate_stop_loss(&signal, &market_data, &method);
+        let stop = calculator
+            .calculate_stop_loss(&signal, &market_data, &method)
+            .expect("a too-close stop must be widened, not rejected");
 
-        assert!(result.is_err());
+        // Long: widened DOWNWARD to exactly the floor.
+        let expected = 50000.0 * (1.0 - MIN_STOP_DISTANCE_PCT);
+        assert!(
+            (stop - expected).abs() < 1e-6,
+            "expected widen to {expected}, got {stop}"
+        );
+        // The stop moved AWAY from entry, never toward it.
+        let naive = 50000.0 * (1.0 - 0.0001);
+        assert!(stop < naive, "clamp must widen, not tighten");
+    }
+
+    #[test]
+    fn test_stop_too_close_short_widens_upward() {
+        let config = create_test_config();
+        let calculator = StopLossCalculator::new(config);
+
+        let signal = create_sell_signal(50000.0);
+        let market_data = MarketData::new(50000.0);
+
+        let method = StopLossMethod::Percentage { percent: 0.0001 };
+        let stop = calculator
+            .calculate_stop_loss(&signal, &market_data, &method)
+            .expect("short: too-close stop must be widened");
+
+        let expected = 50000.0 * (1.0 + MIN_STOP_DISTANCE_PCT);
+        assert!((stop - expected).abs() < 1e-6, "got {stop}");
+        assert!(stop > 50000.0, "short stop must stay ABOVE entry");
+    }
+
+    #[test]
+    fn test_adequate_stop_is_left_untouched() {
+        // The clamp must be a no-op for stops already beyond the floor —
+        // it widens only what would otherwise have been thrown away.
+        let config = create_test_config();
+        let calculator = StopLossCalculator::new(config);
+
+        let signal = create_buy_signal(50000.0);
+        let market_data = MarketData::new(50000.0);
+
+        let method = StopLossMethod::Percentage { percent: 0.02 }; // 2%, well clear
+        let stop = calculator
+            .calculate_stop_loss(&signal, &market_data, &method)
+            .expect("an adequate stop stays valid");
+        assert!((stop - 49000.0).abs() < 1e-6, "got {stop}");
     }
 
     #[test]
