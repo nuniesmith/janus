@@ -515,6 +515,37 @@ mod tests {
         assert_eq!(matched, 1);
     }
 
+    /// Build a schema carrying a `rows_meta` side-channel JSON string.
+    fn schema_with_rows_meta(json: &str) -> Schema {
+        let mut md = std::collections::HashMap::new();
+        md.insert("rows_meta".to_string(), json.to_string());
+        Schema::new_with_metadata(vec![Field::new("reward", DataType::Float32, false)], md)
+    }
+
+    #[test]
+    fn parse_rows_meta_carries_reward_decomposition() {
+        // New producer: rows_meta includes the §4g reward decomposition per row.
+        let schema = schema_with_rows_meta(
+            r#"[{"i":0,"interval":"1m","confidence":0.9,"reward_gross":0.5,"fee_sigma":0.1}]"#,
+        );
+        let parsed = parse_rows_meta(&schema).expect("rows_meta present");
+        let m = parsed.get(&0).expect("row 0 present");
+        assert_eq!(m.reward_gross, Some(0.5));
+        assert_eq!(m.fee_sigma, Some(0.1));
+    }
+
+    #[test]
+    fn parse_rows_meta_without_decomposition_is_none_not_zero() {
+        // Older producer: rows_meta predates the decomposition keys. The parse
+        // must yield None (unknown), never 0.0 — a 0.0 gross on an old row would
+        // fabricate "the signal was exactly fee-sized".
+        let schema = schema_with_rows_meta(r#"[{"i":0,"interval":"1m","confidence":0.9}]"#);
+        let parsed = parse_rows_meta(&schema).expect("rows_meta present");
+        let m = parsed.get(&0).expect("row 0 present");
+        assert_eq!(m.reward_gross, None);
+        assert_eq!(m.fee_sigma, None);
+    }
+
     #[test]
     fn test_process_record_batch_all_valid() {
         let batch = create_test_batch(10);

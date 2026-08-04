@@ -273,10 +273,38 @@ fn rolling_sigma(closes: &VecDeque<f32>) -> Option<f64> {
     Some(var.sqrt())
 }
 
-/// Compute a completed decision's reward under `cfg`. `bars_held` is how many
-/// bars actually elapsed (≤ horizon; less only when an episode boundary closes
-/// the position early), used to scale the volatility normalizer (σ over N bars
-/// ≈ σ₁ × √N). `sigma1` is the per-bar σ from [`rolling_sigma`].
+/// A completed decision's reward, decomposed so a verdict script can separate
+/// the signal from its fixed cost (GATE_A_PREREGISTRATION.md §4g: the J1
+/// headline is fee-dominated, but gross vs net was never stored per row so the
+/// two could not be told apart).
+///
+/// - `net` — the exact scalar the replay buffer and TD target consume. Frozen:
+///   bit-identical to the pre-decomposition formula, same rounding, same
+///   finite safety net. This is the ONLY field trading/training reads.
+/// - `gross` — the same reward under the same normalization but WITHOUT the fee
+///   subtracted (the pre-fee signal).
+/// - `fee_sigma` — the fee constant actually subtracted, expressed in the same
+///   (σ-normalized) units as `net`/`gross`, so `net ≈ gross - fee_sigma`.
+///
+/// All three are `0.0` for Hold (no fee, no reward). `gross`/`fee_sigma` carry
+/// the same finite guard as `net`: a degenerate config never stores ±inf/NaN.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct RewardParts {
+    net: f32,
+    gross: f32,
+    fee_sigma: f32,
+}
+
+/// Compute a completed decision's reward under `cfg`, decomposed into
+/// [`RewardParts`]. `bars_held` is how many bars actually elapsed (≤ horizon;
+/// less only when an episode boundary closes the position early), used to scale
+/// the volatility normalizer (σ over N bars ≈ σ₁ × √N). `sigma1` is the per-bar
+/// σ from [`rolling_sigma`].
+///
+/// The `net` field is computed through the identical operation sequence the
+/// pre-decomposition code used — `gross`/`fee_sigma` are tracked alongside on
+/// their own variables and never feed back into `net`, so `net` stays
+/// bit-identical (the zero-change property the next measurement window rests on).
 fn compute_reward(
     action: janus_core::SignalType,
     entry_close: f64,
@@ -284,25 +312,49 @@ fn compute_reward(
     bars_held: usize,
     sigma1: Option<f64>,
     cfg: &RewardConfig,
-) -> f32 {
+) -> RewardParts {
     let dir = match action {
         janus_core::SignalType::Buy => 1.0_f64,
         janus_core::SignalType::Sell => -1.0_f64,
-        _ => return 0.0, // Hold (and anything non-directional) earns nothing.
+        // Hold (and anything non-directional) earns nothing and pays no fee.
+        _ => {
+            return RewardParts {
+                net: 0.0,
+                gross: 0.0,
+                fee_sigma: 0.0,
+            };
+        }
     };
-    let mut r = dir * (exit_close / entry_close).ln();
+    let gross_raw = dir * (exit_close / entry_close).ln();
+    // NET — the frozen sequence. `r` takes the identical bits of `gross_raw`,
+    // then the same `-= fee` / `/= sigma_h` as before: do not reorder.
+    let mut r = gross_raw;
     // Round-trip fee is a fixed cost on any directional action.
     r -= cfg.fee;
+    // Decomposition tracked on their own variables, normalized identically to
+    // `r` so the three stay comparable (`net ≈ gross - fee_sigma`).
+    let mut gross = gross_raw;
+    let mut fee = cfg.fee;
     if cfg.vol_norm {
         let n = bars_held.max(1) as f64;
         let sigma_h = sigma1.unwrap_or(0.0).max(cfg.vol_floor) * n.sqrt();
         r /= sigma_h;
+        gross /= sigma_h;
+        fee /= sigma_h;
     }
     // Final safety net: a degenerate config/input must never inject a non-finite
-    // reward into the replay buffer (the DQN reads it straight into its TD
-    // target). Fall back to a neutral 0.0.
-    let out = r as f32;
-    if out.is_finite() { out } else { 0.0 }
+    // value into the replay buffer (the DQN reads `net` straight into its TD
+    // target) or the Qdrant payload. Fall back to a neutral 0.0 — identical to
+    // the frozen guard for `net`, applied to all three.
+    fn finite(x: f64) -> f32 {
+        let v = x as f32;
+        if v.is_finite() { v } else { 0.0 }
+    }
+    RewardParts {
+        net: finite(r),
+        gross: finite(gross),
+        fee_sigma: finite(fee),
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -344,7 +396,18 @@ pub struct ExperienceRow {
     pub action_type: u8,
     pub action_symbol: String,
     pub action_qty: f32,
+    /// The NET reward (fee-adjusted, σ-normalized) — the frozen scalar the
+    /// replay buffer and TD target consume, bit-identical to Phase 2.5.
     pub reward: f32,
+    /// The PRE-FEE reward under the same normalization as `reward`
+    /// (`reward ≈ reward_gross - fee_sigma`). Travels the `rows_meta`
+    /// side-channel into the Qdrant payload so a verdict script can separate
+    /// signal from the fixed fee cost. Not an Arrow schema column — the frozen
+    /// 10-field schema is untouched.
+    pub reward_gross: f32,
+    /// The fee constant actually subtracted, in the same σ-normalized units as
+    /// `reward`/`reward_gross`. `0.0` for Hold and for a zero-fee config.
+    pub fee_sigma: f32,
     pub next_state_gaf: Vec<f32>,
     pub next_state_raw: Option<Vec<f32>>,
     pub done: bool,
@@ -522,7 +585,11 @@ impl ExperienceRecorder {
                     action_type: p.ctx.action.to_u8(),
                     action_symbol: p.symbol,
                     action_qty: 0.0,
-                    reward,
+                    // `reward` stays the NET scalar (frozen). The decomposition
+                    // rides the side-channel; the replay buffer is untouched.
+                    reward: reward.net,
+                    reward_gross: reward.gross,
+                    fee_sigma: reward.fee_sigma,
                     next_state_gaf: gaf_now.clone(),
                     next_state_raw: None,
                     done: episode_end,
@@ -743,6 +810,11 @@ struct RowMeta<'a> {
     i: usize,
     interval: &'a str,
     confidence: f64,
+    /// Reward decomposition (§4g). Always emitted for new rows; backward parses
+    /// them as `Option`, so their absence on older files reads as "unknown"
+    /// (never a fabricated 0.0 gross).
+    reward_gross: f32,
+    fee_sigma: f32,
     #[serde(skip_serializing_if = "Option::is_none")]
     blocked: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -757,6 +829,8 @@ fn write_ipc(path: &std::path::Path, rows: &[ExperienceRow]) -> anyhow::Result<(
             i,
             interval: &r.interval,
             confidence: r.confidence,
+            reward_gross: r.reward_gross,
+            fee_sigma: r.fee_sigma,
             blocked: r.blocked.as_deref(),
             regime: r.regime.as_deref(),
         })
@@ -1085,7 +1159,7 @@ mod tests {
         assert_eq!(cfg.fee, 0.0);
         assert!(!cfg.vol_norm);
         // compute_reward under legacy == signed single-bar log return.
-        let r = compute_reward(SignalType::Buy, 100.0, 110.0, 1, Some(0.01), &cfg);
+        let r = compute_reward(SignalType::Buy, 100.0, 110.0, 1, Some(0.01), &cfg).net;
         assert!((r - (110.0f64 / 100.0).ln() as f32).abs() < 1e-6);
     }
 
@@ -1110,15 +1184,15 @@ mod tests {
             vol_norm: false,
             vol_floor: 1e-4,
         };
-        let buy = compute_reward(SignalType::Buy, 100.0, 110.0, 1, None, &cfg);
+        let buy = compute_reward(SignalType::Buy, 100.0, 110.0, 1, None, &cfg).net;
         assert!((buy - ((110.0f64 / 100.0).ln() - 0.001) as f32).abs() < 1e-6);
         // Hold pays no fee and earns nothing.
         assert_eq!(
-            compute_reward(SignalType::Hold, 100.0, 110.0, 1, None, &cfg),
+            compute_reward(SignalType::Hold, 100.0, 110.0, 1, None, &cfg).net,
             0.0
         );
         // A losing Sell still pays the fee (fee is a cost, not a sign flip).
-        let sell = compute_reward(SignalType::Sell, 100.0, 110.0, 1, None, &cfg);
+        let sell = compute_reward(SignalType::Sell, 100.0, 110.0, 1, None, &cfg).net;
         assert!(sell < 0.0);
         assert!((sell - (-(110.0f64 / 100.0).ln() - 0.001) as f32).abs() < 1e-6);
     }
@@ -1132,7 +1206,7 @@ mod tests {
             vol_floor: 1e-6,
         };
         // sigma_h = 0.01 * sqrt(4) = 0.02 ⇒ reward = ln(1.1)/0.02.
-        let r = compute_reward(SignalType::Buy, 100.0, 110.0, 4, Some(0.01), &cfg);
+        let r = compute_reward(SignalType::Buy, 100.0, 110.0, 4, Some(0.01), &cfg).net;
         let expected = ((110.0f64 / 100.0).ln() / (0.01 * 4.0_f64.sqrt())) as f32;
         assert!((r - expected).abs() < 1e-4, "got {r}, want {expected}");
     }
@@ -1146,7 +1220,7 @@ mod tests {
             vol_floor: 0.01,
         };
         // σ=0 (flat) must fall back to the floor, keeping the reward finite.
-        let r = compute_reward(SignalType::Buy, 100.0, 110.0, 1, Some(0.0), &cfg);
+        let r = compute_reward(SignalType::Buy, 100.0, 110.0, 1, Some(0.0), &cfg).net;
         let expected = ((110.0f64 / 100.0).ln() / 0.01) as f32;
         assert!(r.is_finite());
         assert!((r - expected).abs() < 1e-4);
@@ -1162,14 +1236,189 @@ mod tests {
             vol_norm: true,
             vol_floor: 0.0, // as if an operator set VOL_FLOOR=0
         };
-        let r = compute_reward(SignalType::Buy, 100.0, 110.0, 1, Some(0.0), &cfg);
-        assert!(r.is_finite(), "reward must stay finite, got {r}");
+        let parts = compute_reward(SignalType::Buy, 100.0, 110.0, 1, Some(0.0), &cfg);
+        assert!(
+            parts.net.is_finite(),
+            "net must stay finite, got {}",
+            parts.net
+        );
+        // The decomposition scalars share the same finite guard — a degenerate
+        // config must not push ±inf/NaN into the Qdrant payload either.
+        assert!(
+            parts.gross.is_finite() && parts.fee_sigma.is_finite(),
+            "gross/fee_sigma must stay finite, got {} / {}",
+            parts.gross,
+            parts.fee_sigma
+        );
         // Also verify from_env clamps to a real floor (>= 1e-8), never ~0.
         let parsed = RewardConfig::from_env();
         assert!(
             parsed.vol_floor >= 1e-8,
             "vol_floor must clamp to a real floor"
         );
+    }
+
+    /// ZERO-CHANGE PROOF — the pivot the whole measurement window rests on.
+    /// The NET reward out of the decomposing `compute_reward` must be *bit-for-
+    /// bit* the scalar the frozen pre-decomposition formula produced. `net`
+    /// never derives from `gross - fee_sigma`; it walks the identical operation
+    /// sequence. If this ever fails, instrumentation became a regime change —
+    /// STOP. Grid: both directional signs × σ straddling the vol floor (incl.
+    /// the degenerate σ=0 / None) × bars_held 1/5/20 × entry==exit and extreme
+    /// prices × legacy/production/degenerate configs.
+    #[test]
+    fn net_reward_is_bit_identical_to_frozen_formula() {
+        // The frozen formula, transcribed verbatim from the pre-decomposition
+        // code, kept local so a future edit to `compute_reward` is checked
+        // against this fixed reference instead of against itself.
+        fn net_frozen(
+            action: SignalType,
+            entry: f64,
+            exit: f64,
+            bars: usize,
+            sigma1: Option<f64>,
+            cfg: &RewardConfig,
+        ) -> f32 {
+            let dir = match action {
+                SignalType::Buy => 1.0_f64,
+                SignalType::Sell => -1.0_f64,
+                _ => return 0.0,
+            };
+            let mut r = dir * (exit / entry).ln();
+            r -= cfg.fee;
+            if cfg.vol_norm {
+                let n = bars.max(1) as f64;
+                let sigma_h = sigma1.unwrap_or(0.0).max(cfg.vol_floor) * n.sqrt();
+                r /= sigma_h;
+            }
+            let out = r as f32;
+            if out.is_finite() { out } else { 0.0 }
+        }
+
+        let actions = [SignalType::Buy, SignalType::Sell, SignalType::Hold];
+        let prices: [(f64, f64); 5] = [
+            (100.0, 110.0),         // up
+            (100.0, 90.0),          // down
+            (100.0, 100.0),         // entry == exit → ln(1) = 0
+            (1.0, 1_000_000_000.0), // extreme up
+            (50_000.0, 49_999.0),   // tiny move
+        ];
+        let bars_grid = [1usize, 5, 20];
+        // σ straddling the vol floor, plus the flat-window None and Some(0.0)
+        // degenerate cases that exercise the finite guard.
+        let sigmas = [
+            None,
+            Some(0.0),
+            Some(1e-6),
+            Some(1e-4),
+            Some(0.02),
+            Some(1.0),
+        ];
+        let cfgs = [
+            RewardConfig::legacy(),
+            RewardConfig {
+                horizon: 5,
+                fee: 0.0008,
+                vol_norm: true,
+                vol_floor: 1e-4,
+            },
+            RewardConfig {
+                horizon: 5,
+                fee: 0.0008,
+                vol_norm: false,
+                vol_floor: 1e-4,
+            },
+            RewardConfig {
+                horizon: 1,
+                fee: 0.0,
+                vol_norm: true,
+                vol_floor: 0.0, // degenerate floor → exercises the guard
+            },
+            RewardConfig {
+                horizon: 20,
+                fee: 0.002,
+                vol_norm: true,
+                vol_floor: 1e-8,
+            },
+        ];
+
+        for &action in &actions {
+            for &(entry, exit) in &prices {
+                for &bars in &bars_grid {
+                    for &sigma in &sigmas {
+                        for cfg in &cfgs {
+                            let got = compute_reward(action, entry, exit, bars, sigma, cfg);
+                            let want = net_frozen(action, entry, exit, bars, sigma, cfg);
+                            // Bit-for-bit: compare raw f32 bits so a reordered op
+                            // or a NaN-guard slip is caught exactly, not within a
+                            // tolerance that could hide a one-ULP regime shift.
+                            assert_eq!(
+                                got.net.to_bits(),
+                                want.to_bits(),
+                                "NET drifted: action={action:?} entry={entry} exit={exit} \
+                                 bars={bars} sigma={sigma:?} cfg={cfg:?} — got {} want {}",
+                                got.net,
+                                want
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The decomposition a verdict script will read: `gross` is the pre-fee
+    /// reward under the same normalization, `fee_sigma` is that fee in σ units,
+    /// and together they reconstruct `net` (§4g: this is exactly what lets "no
+    /// signal" be told apart from "8 bps ate a small edge").
+    #[test]
+    fn decomposition_separates_gross_signal_from_fee_cost() {
+        // 8 bps fee, σ-normalized over a 5-bar horizon — the production shape
+        // that made the J1 headline fee-dominated.
+        let cfg = RewardConfig {
+            horizon: 5,
+            fee: 0.0008,
+            vol_norm: true,
+            vol_floor: 1e-4,
+        };
+        let sigma1 = 0.01;
+        let sigma_h = sigma1 * 5.0_f64.sqrt();
+        let parts = compute_reward(SignalType::Buy, 100.0, 110.0, 5, Some(sigma1), &cfg);
+
+        // gross = the pre-fee σ-normalized return (no fee term subtracted).
+        let want_gross = ((110.0f64 / 100.0).ln() / sigma_h) as f32;
+        assert!(
+            (parts.gross - want_gross).abs() < 1e-4,
+            "gross is the pre-fee σ-normalized return: got {} want {want_gross}",
+            parts.gross
+        );
+        // fee_sigma = the fee constant expressed in the same σ units.
+        let want_fee = (0.0008f64 / sigma_h) as f32;
+        assert!(
+            (parts.fee_sigma - want_fee).abs() < 1e-4,
+            "fee_sigma is fee/sigma_h: got {} want {want_fee}",
+            parts.fee_sigma
+        );
+        // net reconstructs from the decomposition (up to f32 rounding).
+        assert!(
+            (parts.net - (parts.gross - parts.fee_sigma)).abs() < 1e-4,
+            "net ≈ gross - fee_sigma: net={} gross={} fee_sigma={}",
+            parts.net,
+            parts.gross,
+            parts.fee_sigma
+        );
+        // The fee is a real drag: gross strictly exceeds net.
+        assert!(parts.gross > parts.net);
+
+        // Sell mirrors the sign on gross, but the fee cost stays positive.
+        let sell = compute_reward(SignalType::Sell, 100.0, 110.0, 5, Some(sigma1), &cfg);
+        assert!(sell.gross < 0.0, "sell into a rally has negative gross");
+        assert!(sell.fee_sigma > 0.0, "fee is a cost regardless of side");
+        assert!((sell.fee_sigma - want_fee).abs() < 1e-4);
+
+        // Hold is all zeros — no signal, no fee, nothing to decompose.
+        let hold = compute_reward(SignalType::Hold, 100.0, 110.0, 5, Some(sigma1), &cfg);
+        assert_eq!((hold.net, hold.gross, hold.fee_sigma), (0.0, 0.0, 0.0));
     }
 
     #[test]
@@ -1316,6 +1565,8 @@ mod tests {
                 action_symbol: "BTCUSDT".to_string(),
                 action_qty: 0.0,
                 reward: 0.01,
+                reward_gross: 0.02,
+                fee_sigma: 0.01,
                 next_state_gaf: vec![0.2; 9],
                 next_state_raw: None,
                 done: false,

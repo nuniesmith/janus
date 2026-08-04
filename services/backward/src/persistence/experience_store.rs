@@ -164,6 +164,17 @@ pub struct RowSideMeta {
     pub blocked: Option<String>,
     #[serde(default)]
     pub regime: Option<String>,
+    /// Pre-fee reward under the same normalization as the frozen `reward`
+    /// column (§4g decomposition). `Option` on purpose: rows written before
+    /// this field existed simply omit it, and absence MUST read as "unknown",
+    /// never `Some(0.0)` — a fabricated 0.0 gross would assert the signal was
+    /// exactly fee-sized, the bug family this platform keeps hitting.
+    #[serde(default)]
+    pub reward_gross: Option<f32>,
+    /// The fee constant actually subtracted, in the same σ-normalized units as
+    /// `reward_gross`. Same `Option`/absence contract as `reward_gross`.
+    #[serde(default)]
+    pub fee_sigma: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -927,6 +938,27 @@ impl ExperienceStore {
                     },
                 );
             }
+            // Reward decomposition (§4g). Inserted ONLY when present: an absent
+            // field leaves the payload key unset so a verdict script reads null
+            // = "unknown" rather than a fabricated 0.0. `reward` (net) is always
+            // present as its own payload key above — this augments, never
+            // replaces it, so the replay/training path is untouched.
+            if let Some(g) = meta.reward_gross {
+                payload.insert(
+                    "reward_gross".into(),
+                    Value {
+                        kind: Some(Kind::DoubleValue(g as f64)),
+                    },
+                );
+            }
+            if let Some(f) = meta.fee_sigma {
+                payload.insert(
+                    "fee_sigma".into(),
+                    Value {
+                        kind: Some(Kind::DoubleValue(f as f64)),
+                    },
+                );
+            }
         }
 
         // Encode next_state_vector as a JSON string in the payload so it can
@@ -1566,6 +1598,100 @@ mod tests {
         assert!(payload.contains_key("done"));
         assert!(payload.contains_key("timestamp_ms"));
         assert!(payload.contains_key("next_state_vector"));
+    }
+
+    #[test]
+    fn row_to_point_carries_reward_decomposition_when_present() {
+        use qdrant_client::qdrant::value::Kind;
+        let store = ExperienceStore::mock();
+        let row = ExperienceRow {
+            state_vector: vec![1.0, 2.0, 3.0],
+            state_raw: None,
+            action_type: 0,
+            action_symbol: "BTCUSDT".into(),
+            action_qty: 0.0,
+            reward: 0.31,
+            next_state_vector: vec![1.1, 2.1, 3.1],
+            next_state_raw: None,
+            done: false,
+            timestamp_ms: 1_782_000_000_000,
+            meta: Some(RowSideMeta {
+                reward_gross: Some(0.42),
+                fee_sigma: Some(0.11),
+                ..Default::default()
+            }),
+        };
+        let point = store.row_to_point(experience_point_id("b", 0), &row);
+        // Net reward keeps its own payload key (the replay/training path).
+        assert!(point.payload.contains_key("reward"));
+        // Decomposition rides as its own keys, as f64 doubles.
+        let g = point
+            .payload
+            .get("reward_gross")
+            .expect("reward_gross present");
+        let f = point.payload.get("fee_sigma").expect("fee_sigma present");
+        assert!(
+            matches!(&g.kind, Some(Kind::DoubleValue(x)) if (x - 0.42).abs() < 1e-6),
+            "reward_gross value: {:?}",
+            g.kind
+        );
+        assert!(
+            matches!(&f.kind, Some(Kind::DoubleValue(x)) if (x - 0.11).abs() < 1e-6),
+            "fee_sigma value: {:?}",
+            f.kind
+        );
+    }
+
+    #[test]
+    fn row_to_point_omits_decomposition_when_absent() {
+        // Old rows: `meta` is None, or present without the decomposition. Either
+        // way the payload must NOT carry reward_gross/fee_sigma — a verdict
+        // script reads the missing key as "unknown", never a fabricated 0.0.
+        let store = ExperienceStore::mock();
+        let base = ExperienceRow {
+            state_vector: vec![1.0, 2.0, 3.0],
+            state_raw: None,
+            action_type: 2,
+            action_symbol: "BTCUSDT".into(),
+            action_qty: 0.0,
+            reward: 0.0,
+            next_state_vector: vec![1.1, 2.1, 3.1],
+            next_state_raw: None,
+            done: false,
+            timestamp_ms: 1_782_000_000_000,
+            meta: None,
+        };
+        let p_none = store.row_to_point(experience_point_id("b", 1), &base);
+        assert!(!p_none.payload.contains_key("reward_gross"));
+        assert!(!p_none.payload.contains_key("fee_sigma"));
+
+        // meta present (confidence only), decomposition absent → still omitted.
+        let mut row = base.clone();
+        row.meta = Some(RowSideMeta {
+            confidence: Some(0.7),
+            ..Default::default()
+        });
+        let p_partial = store.row_to_point(experience_point_id("b", 2), &row);
+        assert!(p_partial.payload.contains_key("confidence"));
+        assert!(!p_partial.payload.contains_key("reward_gross"));
+        assert!(!p_partial.payload.contains_key("fee_sigma"));
+    }
+
+    #[test]
+    fn row_side_meta_absence_deserializes_to_none_not_zero() {
+        // The backward-compat contract at the JSON boundary: an older producer's
+        // rows_meta entry lacks the decomposition keys → the Option is None.
+        let old: RowSideMeta =
+            serde_json::from_str(r#"{"interval":"1m","confidence":0.9}"#).unwrap();
+        assert_eq!(old.reward_gross, None);
+        assert_eq!(old.fee_sigma, None);
+        // A new producer's entry round-trips the values.
+        let new: RowSideMeta = serde_json::from_str(
+            r#"{"interval":"1m","confidence":0.9,"reward_gross":0.5,"fee_sigma":0.1}"#,
+        )
+        .unwrap();
+        assert_eq!(new.reward_gross, Some(0.5));
+        assert_eq!(new.fee_sigma, Some(0.1));
     }
 
     #[test]
