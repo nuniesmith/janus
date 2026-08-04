@@ -107,6 +107,29 @@ async fn producer_batches_ingest_through_the_real_consumer() {
         schema.metadata().get("schema_version").map(String::as_str),
         Some("1")
     );
+    // The reward decomposition (§4g) rides the same `rows_meta` side-channel as
+    // confidence/blocked and must survive the real batched write → file round
+    // trip, so a future verdict script can read gross vs fee per point. Every
+    // completed row carries a numeric reward_gross + fee_sigma (legacy scheme
+    // here: fee_sigma == 0 and gross == net, but the fields are always present).
+    let rows_meta_json = schema
+        .metadata()
+        .get("rows_meta")
+        .expect("producer emits the rows_meta side-channel");
+    let rows_meta: Vec<serde_json::Value> =
+        serde_json::from_str(rows_meta_json).expect("rows_meta is a JSON array");
+    assert_eq!(
+        rows_meta.len(),
+        completed_rows,
+        "one rows_meta entry per completed row"
+    );
+    assert!(
+        rows_meta.iter().all(|e| {
+            e.get("reward_gross").and_then(|v| v.as_f64()).is_some()
+                && e.get("fee_sigma").and_then(|v| v.as_f64()).is_some()
+        }),
+        "every row carries a numeric reward_gross + fee_sigma decomposition: {rows_meta:?}"
+    );
     let mut action_codes = Vec::new();
     let mut gaf_lens = Vec::new();
     for batch in reader {
