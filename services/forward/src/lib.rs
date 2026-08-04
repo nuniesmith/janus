@@ -43,6 +43,7 @@ pub mod brain_runtime;
 pub mod brain_wiring;
 pub mod bybit_compat;
 pub mod cnn_inference;
+pub mod config;
 pub mod execution;
 pub mod experience;
 pub mod features;
@@ -1346,6 +1347,12 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
         let min_confidence = state_clone.config.forward.signals.min_confidence;
         let min_strength = state_clone.config.forward.signals.min_strength;
 
+        // Execution floor (was the bare literal `0.7` at the submit site). Read
+        // once here, captured `Copy` into the supervised loop, logged at
+        // startup. Unset env ⇒ exactly 0.7, so the actionable/`below_exec_floor`
+        // partition is bit-identical to before (see `config::ForwardFloors`).
+        let exec_floor = crate::config::ForwardFloors::from_env().exec_floor;
+
         // Read indicator config from JanusState
         let ind_config = IndicatorConfig {
             ema_fast_period: state_clone
@@ -1580,8 +1587,8 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                 ind_config.macd_signal_period,
             );
             info!(
-                "   Strategy thresholds: min_confidence={:.2}, min_strength={:.2}, RSI ob/os={:.0}/{:.0}",
-                min_confidence, min_strength, rsi_overbought, rsi_oversold,
+                "   Strategy thresholds: min_confidence={:.2}, min_strength={:.2}, exec_floor={:.4}, RSI ob/os={:.0}/{:.0}",
+                min_confidence, min_strength, exec_floor, rsi_overbought, rsi_oversold,
             );
 
             // ── Watchdog heartbeat sender ────────────────────────────
@@ -2358,7 +2365,7 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                                 // (§3.5: a blocked Buy/Sell is still that decision — the
                                 // gate is part of the environment).
                                 let mut exp_blocked: Option<String> = None;
-                                if final_type != janus_core::SignalType::Hold && avg_confidence >= 0.7 {
+                                if final_type != janus_core::SignalType::Hold && avg_confidence >= exec_floor {
                                     let block_reason = if prop_firm_enforce
                                         && prop_firm_label.starts_with("violation")
                                     {
@@ -2385,10 +2392,25 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                                         warn!("Failed to submit live signal to execution: {}", e);
                                     }
                                 } else if final_type != janus_core::SignalType::Hold {
-                                    // Actionable consensus below the 0.7 execution floor:
+                                    // Actionable consensus below the execution floor
+                                    // (config::ForwardFloors::exec_floor, default 0.7):
                                     // published to the bus, never submitted.
                                     exp_blocked = Some("below_exec_floor".to_string());
                                 }
+
+                                // The ADVISORY 9-gate verdict, recorded on every
+                                // gated entry independent of enforcement. Reuses
+                                // the `gate_outcome` already computed above (the
+                                // same `metadata` string sent to the `gate`
+                                // signal field / Redis) — the gates are NOT
+                                // re-run. `None` for a Hold (no entry gated).
+                                // Kept SEPARATE from `blocked`: with
+                                // JANUS_GATE_ENFORCE=0 an advisory block never
+                                // reaches `blocked`, so this field is what makes
+                                // the enforce-flip prerequisite measurable
+                                // (GATE_A_PREREGISTRATION §4g).
+                                let exp_advisory_gate =
+                                    gate_outcome.as_ref().map(|out| out.metadata.clone());
 
                                 // Record the post-gate decision transition (§3.5 site 3).
                                 if let Some(rec) = experience_recorder.as_mut() {
@@ -2402,6 +2424,7 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                                             action: final_type,
                                             confidence: avg_confidence,
                                             blocked: exp_blocked,
+                                            advisory_gate: exp_advisory_gate,
                                             regime: regime_manager
                                                 .current_regime(&symbol_str)
                                                 .map(|r| r.to_string()),
@@ -2827,6 +2850,161 @@ fn risk_enforce_enabled(value: Option<String>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The advisory 9-gate verdict travels into the experience record on a
+    /// field of its own, distinct from `blocked`. These tests exercise the
+    /// recorder end-to-end (the exact path the live loop feeds at lib.rs
+    /// ~2401) to prove the two populations stay distinguishable and that the
+    /// new field never perturbs the net reward.
+    mod advisory_gate_threading {
+        use crate::experience::{DecisionCtx, ExperienceRecorder, ExperienceRow, GAF_WINDOW};
+        use janus_core::SignalType;
+        use tokio::sync::mpsc;
+
+        const MIN: i64 = 60_000; // 1m in ms
+
+        fn recorder() -> (ExperienceRecorder, mpsc::Receiver<ExperienceRow>) {
+            let (tx, rx) = mpsc::channel(64);
+            (ExperienceRecorder::new(tx), rx)
+        }
+
+        /// Warm the GAF window with `n` Holds and return the next candle time.
+        fn warm(rec: &mut ExperienceRecorder, key: &str, n: usize) -> i64 {
+            let mut t = 0i64;
+            for i in 0..n {
+                rec.observe(
+                    key,
+                    "BTCUSDT",
+                    "1m",
+                    t,
+                    100.0 + (i as f64 % 7.0),
+                    DecisionCtx::hold(None),
+                );
+                t += MIN;
+            }
+            t
+        }
+
+        /// Arm `ctx` at `t`, then a Hold one bar later to realize it, and return
+        /// the last row emitted (the decision under test).
+        fn record_one(ctx: DecisionCtx) -> ExperienceRow {
+            let (mut rec, mut rx) = recorder();
+            let key = "K:1m";
+            let t = warm(&mut rec, key, GAF_WINDOW);
+            rec.observe(key, "BTCUSDT", "1m", t, 100.0, ctx);
+            rec.observe(
+                key,
+                "BTCUSDT",
+                "1m",
+                t + MIN,
+                110.0,
+                DecisionCtx::hold(None),
+            );
+            let mut last = None;
+            while let Ok(r) = rx.try_recv() {
+                last = Some(r);
+            }
+            last.expect("a completed row for the decision under test")
+        }
+
+        /// Advisory-block, enforcement OFF: the entry was ACTIONABLE (`blocked`
+        /// stays `None`) but the 9-gate would have blocked it — the reason is
+        /// captured on `advisory_gate`. This is the population the enforce-flip
+        /// prerequisite needs and that `blocked`-only recording never exposed.
+        #[test]
+        fn advisory_block_is_recorded_while_blocked_stays_none() {
+            let row = record_one(DecisionCtx {
+                action: SignalType::Buy,
+                confidence: 0.9,
+                blocked: None,
+                advisory_gate: Some("block_ao_divergence:against AO".to_string()),
+                regime: None,
+            });
+            assert_eq!(row.action_type, SignalType::Buy.to_u8());
+            assert_eq!(
+                row.advisory_gate.as_deref(),
+                Some("block_ao_divergence:against AO"),
+                "the advisory verdict must reach the record"
+            );
+            assert_eq!(
+                row.blocked, None,
+                "an advisory-only block is NOT an exclusion — blocked must stay None"
+            );
+        }
+
+        /// An advisory `pass` on an actionable entry is recorded as such — so
+        /// the actionable cohort is partitionable into gate-pass vs
+        /// gate-would-block, which is the whole point of the field.
+        #[test]
+        fn advisory_pass_is_recorded_on_actionable_entries() {
+            let row = record_one(DecisionCtx {
+                action: SignalType::Buy,
+                confidence: 0.9,
+                blocked: None,
+                advisory_gate: Some("pass".to_string()),
+                regime: None,
+            });
+            assert_eq!(row.advisory_gate.as_deref(), Some("pass"));
+            assert_eq!(row.blocked, None);
+        }
+
+        /// Enforce-mode block: `blocked` is set exactly as today, AND the
+        /// advisory verdict rides alongside on its own field. The two never
+        /// overwrite each other, so the populations stay distinguishable
+        /// forever.
+        #[test]
+        fn enforce_block_sets_blocked_and_keeps_advisory_alongside() {
+            let row = record_one(DecisionCtx {
+                action: SignalType::Sell,
+                confidence: 0.85,
+                blocked: Some("gate: block_risk:rejected".to_string()),
+                advisory_gate: Some("block_risk:rejected".to_string()),
+                regime: None,
+            });
+            assert_eq!(
+                row.blocked.as_deref(),
+                Some("gate: block_risk:rejected"),
+                "enforce-mode block sets `blocked` exactly as before"
+            );
+            assert_eq!(
+                row.advisory_gate.as_deref(),
+                Some("block_risk:rejected"),
+                "the advisory verdict is preserved next to it"
+            );
+        }
+
+        /// A Hold gates nothing, so `advisory_gate` is `None` — mirroring the
+        /// live loop, where `gate_outcome` is `None` for non-entry decisions.
+        #[test]
+        fn hold_has_no_advisory_verdict() {
+            let row = record_one(DecisionCtx::hold(None));
+            assert_eq!(row.advisory_gate, None);
+        }
+
+        /// ZERO-CHANGE PROOF: the advisory field is pure side-channel — it must
+        /// not perturb the NET reward written to the replay buffer. Two
+        /// otherwise-identical decisions differing ONLY in `advisory_gate`
+        /// realize a bit-identical reward.
+        #[test]
+        fn advisory_gate_does_not_perturb_net_reward() {
+            let base = |advisory: Option<String>| DecisionCtx {
+                action: SignalType::Buy,
+                confidence: 0.9,
+                blocked: None,
+                advisory_gate: advisory,
+                regime: None,
+            };
+            let without = record_one(base(None));
+            let with = record_one(base(Some("block_ao_divergence:against AO".to_string())));
+            assert_eq!(
+                without.reward.to_bits(),
+                with.reward.to_bits(),
+                "advisory_gate must be inert w.r.t. the net reward (got {} vs {})",
+                without.reward,
+                with.reward
+            );
+        }
+    }
 
     #[test]
     fn risk_enforce_defaults_on_and_fails_safe() {
