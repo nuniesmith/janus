@@ -175,6 +175,15 @@ pub struct RowSideMeta {
     /// `reward_gross`. Same `Option`/absence contract as `reward_gross`.
     #[serde(default)]
     pub fee_sigma: Option<f32>,
+    /// What the ADVISORY 9-gate would have said for this decision ("pass" or a
+    /// block reason). Distinct from `blocked` — which keeps meaning "actually
+    /// excluded from the actionable cohort" — so the two populations remain
+    /// distinguishable forever. Same `Option`/absence contract: legacy rows
+    /// omit it and absence reads as UNKNOWN, never "pass" — treating a legacy
+    /// row as advisory-pass would fabricate a clean gate verdict on every
+    /// pre-instrumentation decision.
+    #[serde(default)]
+    pub advisory_gate: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -959,6 +968,14 @@ impl ExperienceStore {
                     },
                 );
             }
+            if let Some(a) = &meta.advisory_gate {
+                payload.insert(
+                    "advisory_gate".into(),
+                    Value {
+                        kind: Some(Kind::StringValue(a.clone())),
+                    },
+                );
+            }
         }
 
         // Encode next_state_vector as a JSON string in the payload so it can
@@ -1617,6 +1634,7 @@ mod tests {
             timestamp_ms: 1_782_000_000_000,
             meta: Some(RowSideMeta {
                 reward_gross: Some(0.42),
+                advisory_gate: Some("block_vol_filter".into()),
                 fee_sigma: Some(0.11),
                 ..Default::default()
             }),
@@ -1639,6 +1657,17 @@ mod tests {
             matches!(&f.kind, Some(Kind::DoubleValue(x)) if (x - 0.11).abs() < 1e-6),
             "fee_sigma value: {:?}",
             f.kind
+        );
+        // The advisory verdict must survive into the Qdrant payload — a field
+        // that dies at the doorbell is decoration.
+        let a = point
+            .payload
+            .get("advisory_gate")
+            .expect("advisory_gate present");
+        assert!(
+            matches!(&a.kind, Some(Kind::StringValue(x)) if x == "block_vol_filter"),
+            "advisory_gate value: {:?}",
+            a.kind
         );
     }
 
