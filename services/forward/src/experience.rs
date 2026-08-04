@@ -370,6 +370,25 @@ pub struct DecisionCtx {
     pub action: janus_core::SignalType,
     pub confidence: f64,
     pub blocked: Option<String>,
+    /// The **advisory** 9-gate verdict for this decision, independent of
+    /// enforcement: `Some("pass")` or `Some("block_<gate>:<detail>")` for an
+    /// actionable Buy/Sell that was run through the execution gate, `None` for a
+    /// Hold (no entry to gate). It reuses the exact `GateOutcome::metadata`
+    /// string already emitted to the `gate` signal metadata / Redis — the gates
+    /// are never re-run to fill it.
+    ///
+    /// DISTINCT FROM `blocked`; the two populations must never be conflated:
+    /// - `blocked` = the decision was *actually excluded* from the actionable
+    ///   cohort (risk / prop-firm ENFORCE, a gate ENFORCE block, or below the
+    ///   execution floor). With `JANUS_GATE_ENFORCE=0` it is `None` even when
+    ///   the advisory gate would have blocked.
+    /// - `advisory_gate` = what the 9-gate *would have said*, recorded for every
+    ///   gated entry whether or not enforcement is on. This is what makes the
+    ///   pre-registration's enforce-flip prerequisite ("a 9-gate-blocked entry
+    ///   is worse than an actionable one") measurable WITHOUT flipping
+    ///   enforcement in production — the population the t=24.98 print never
+    ///   actually covered (GATE_A_PREREGISTRATION §4g).
+    pub advisory_gate: Option<String>,
     /// Live market regime at the decision bar (side-channel for the UMAP
     /// view's coloring — travels in file metadata, not the Arrow schema).
     pub regime: Option<String>,
@@ -382,6 +401,7 @@ impl DecisionCtx {
             action: janus_core::SignalType::Hold,
             confidence: 0.0,
             blocked: None,
+            advisory_gate: None,
             regime,
         }
     }
@@ -416,6 +436,9 @@ pub struct ExperienceRow {
     pub interval: String,
     pub confidence: f64,
     pub blocked: Option<String>,
+    /// The advisory 9-gate verdict (`pass` / `block_...`), independent of the
+    /// `blocked` exclusion reason — see [`DecisionCtx::advisory_gate`].
+    pub advisory_gate: Option<String>,
     pub regime: Option<String>,
 }
 
@@ -598,6 +621,7 @@ impl ExperienceRecorder {
                     confidence: p.ctx.confidence,
                     regime: p.ctx.regime,
                     blocked: p.ctx.blocked,
+                    advisory_gate: p.ctx.advisory_gate,
                 };
                 match self.tx.try_send(row) {
                     Ok(()) => metrics().rows_recorded.inc(),
@@ -817,6 +841,11 @@ struct RowMeta<'a> {
     fee_sigma: f32,
     #[serde(skip_serializing_if = "Option::is_none")]
     blocked: Option<&'a str>,
+    /// Advisory 9-gate verdict — kept out of the JSON when absent, so files
+    /// from older producers and the backward consumer's `RowSideMeta` (which
+    /// ignores unknown keys) are unaffected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    advisory_gate: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     regime: Option<&'a str>,
 }
@@ -832,6 +861,7 @@ fn write_ipc(path: &std::path::Path, rows: &[ExperienceRow]) -> anyhow::Result<(
             reward_gross: r.reward_gross,
             fee_sigma: r.fee_sigma,
             blocked: r.blocked.as_deref(),
+            advisory_gate: r.advisory_gate.as_deref(),
             regime: r.regime.as_deref(),
         })
         .collect();
@@ -1007,6 +1037,7 @@ mod tests {
                 action: SignalType::Buy,
                 confidence: 0.9,
                 blocked: None,
+                advisory_gate: None,
                 regime: None,
             },
         );
@@ -1048,6 +1079,7 @@ mod tests {
                 action: SignalType::Sell,
                 confidence: 0.8,
                 blocked: Some("gate: test".to_string()),
+                advisory_gate: None,
                 regime: None,
             },
         );
@@ -1443,6 +1475,7 @@ mod tests {
                 action: SignalType::Buy,
                 confidence: 0.9,
                 blocked: None,
+                advisory_gate: None,
                 regime: None,
             },
         );
@@ -1574,6 +1607,7 @@ mod tests {
                 interval: "1m".to_string(),
                 confidence: 0.5,
                 blocked: None,
+                advisory_gate: None,
                 regime: None,
             })
             .await
