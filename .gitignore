@@ -24,3 +24,10 @@ logs/
 
 # Minted model artifacts (reproducible via crates/ml train_cnn_champion; not tracked)
 models/*.bin
+
+# Gate-A verdict artifacts. `gate_a_verdict` writes its output next to the
+# binary's cwd, and this repo is PUBLIC. Verdicts are governance evidence and
+# belong in the private fks-governance repo (evidence/gate-a/), so ignore them
+# here rather than risk one being committed by a routine `git add`.
+verdict-*.json
+verdict-*.txt
