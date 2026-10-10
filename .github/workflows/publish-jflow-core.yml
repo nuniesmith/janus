@@ -1,0 +1,25 @@
+name: Publish jflow-core to crates.io
+
+on:
+  push:
+    tags: ["jflow-core-v[0-9]+.[0-9]+.[0-9]+"]
+
+jobs:
+  gate:
+    name: jflow-core gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p jflow-core
+      - run: cargo package -p jflow-core --list
+
+  publish:
+    needs: [gate]
+    uses: nuniesmith/actions/.github/workflows/rust-crate-publish.yml@v1
+    with:
+      crate-path: lib/janus-core
+      package: jflow-core
+      tag-prefix: "jflow-core-v"
+    secrets: inherit
