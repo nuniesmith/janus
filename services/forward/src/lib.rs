@@ -1384,6 +1384,42 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
         let rsi_overbought = state_clone.config.forward.indicators.rsi_overbought;
         let rsi_oversold = state_clone.config.forward.indicators.rsi_oversold;
 
+        // ── Regime bridge gRPC server ────────────────────────────────
+        // The live loop below computes a BridgedRegimeState on every
+        // candle (bridge_regime_signal) but historically kept it
+        // in-process. Publish it on a broadcast channel and serve it via
+        // the RegimeBridgeService gRPC API (GetCurrentRegime /
+        // StreamRegimeUpdates / PushRegimeState) so external consumers
+        // (e.g. the FKS advisory bridge) can read Janus's regime view.
+        // Port: REGIME_BRIDGE_GRPC_PORT (default 50052). Auth comes from
+        // AuthConfig::from_env() — set REGIME_GRPC_AUTH_TOKEN to require
+        // a bearer token; unset means the interceptor is a pass-through.
+        let (regime_bridge_tx, _) =
+            tokio::sync::broadcast::channel::<crate::regime_bridge::BridgedRegimeState>(256);
+        {
+            let regime_bridge_port: u16 = std::env::var("REGIME_BRIDGE_GRPC_PORT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(50052);
+            let regime_bridge_server =
+                crate::regime_bridge_server::RegimeBridgeServer::new(regime_bridge_tx.clone());
+            match crate::regime_bridge_server::start_authenticated_regime_bridge_grpc(
+                regime_bridge_server,
+                regime_bridge_port,
+                crate::regime_bridge_auth::AuthConfig::from_env(),
+            )
+            .await
+            {
+                Ok(_handle) => {
+                    info!("Regime bridge gRPC server started on port {regime_bridge_port}")
+                }
+                Err(e) => {
+                    warn!("Regime bridge gRPC server failed to start: {e}")
+                }
+            }
+        }
+        let regime_bridge_tx_src = regime_bridge_tx.clone();
+
         // Shared RiskManager + live portfolio for the inline risk check (Track 3 Stage 4).
         let risk_manager_src = risk_manager_handle.clone();
         let portfolio_src = portfolio_handle.clone();
@@ -1409,6 +1445,7 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                     // original loop body, unchanged.
                     let mut market_rx = sup_state.market_data_bus.subscribe();
                     let state_clone = sup_state.clone();
+                    let regime_bridge_tx = regime_bridge_tx_src.clone();
                     let signal_gen = signal_gen_src.clone();
                     let wd_handle = wd_handle_src.clone();
                     let risk_manager = risk_manager_src.clone();
@@ -1726,6 +1763,11 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                                         None,
                                         None,
                                     );
+                                    // Publish for the regime bridge gRPC
+                                    // server (spawned in start_module).
+                                    // Send errors (no subscribers yet) are
+                                    // ignored by design.
+                                    let _ = regime_bridge_tx.send(bridged.clone());
                                     last_fear.insert(
                                         symbol_str.clone(),
                                         bridged.amygdala_regime.to_string(),
