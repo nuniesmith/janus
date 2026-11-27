@@ -415,8 +415,7 @@ mod tests {
         let px = vec![100.0; 5];
         let short = vec![100.0; 4];
         assert_eq!(
-            backtest_signals(&preds, &short, &px, &px, &px, &BacktestConfig::default())
-                .n_trades,
+            backtest_signals(&preds, &short, &px, &px, &px, &BacktestConfig::default()).n_trades,
             0
         );
     }

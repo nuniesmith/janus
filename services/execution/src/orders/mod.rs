@@ -779,9 +779,14 @@ pub(crate) fn validate_reduce_only_order(position_size: Decimal, order: &Order) 
         return Err(ExecutionError::Validation(format!(
             "reduce-only order rejected: side {side} would not reduce the {direction} position \
              on {} / {}",
-            order.exchange, order.symbol,
+            order.exchange,
+            order.symbol,
             side = order.side,
-            direction = if position_size.is_sign_positive() { "long" } else { "short" },
+            direction = if position_size.is_sign_positive() {
+                "long"
+            } else {
+                "short"
+            },
         )));
     }
 
@@ -790,7 +795,8 @@ pub(crate) fn validate_reduce_only_order(position_size: Decimal, order: &Order) 
         return Err(ExecutionError::Validation(format!(
             "reduce-only order rejected: quantity {qty} exceeds position size {pos} on {} / {}; \
              reducing may never open the opposite side",
-            order.exchange, order.symbol,
+            order.exchange,
+            order.symbol,
             qty = order.quantity,
             pos = abs_position,
         )));
@@ -881,36 +887,51 @@ mod tests {
 
     #[test]
     fn reduce_only_rejected_with_no_position() {
-        let err = validate_reduce_only_order(Decimal::ZERO, &reduce_only_order(crate::types::OrderSide::Sell, Decimal::ONE))
-            .expect_err("reduce-only with no position must be rejected");
+        let err = validate_reduce_only_order(
+            Decimal::ZERO,
+            &reduce_only_order(crate::types::OrderSide::Sell, Decimal::ONE),
+        )
+        .expect_err("reduce-only with no position must be rejected");
         assert!(matches!(err, ExecutionError::Validation(_)));
     }
 
     #[test]
     fn reduce_only_rejected_on_wrong_side() {
         // Long position (positive size): closing side is Sell, so a Buy is rejected.
-        let err = validate_reduce_only_order(Decimal::from(2), &reduce_only_order(crate::types::OrderSide::Buy, Decimal::ONE))
-            .expect_err("reduce-only buy against a long must be rejected");
+        let err = validate_reduce_only_order(
+            Decimal::from(2),
+            &reduce_only_order(crate::types::OrderSide::Buy, Decimal::ONE),
+        )
+        .expect_err("reduce-only buy against a long must be rejected");
         assert!(matches!(err, ExecutionError::Validation(_)));
     }
 
     #[test]
     fn reduce_only_rejected_when_larger_than_position() {
         // Selling more than the long holds would flip into a short.
-        let err = validate_reduce_only_order(Decimal::from(2), &reduce_only_order(crate::types::OrderSide::Sell, Decimal::from(3)))
-            .expect_err("reduce-only larger than the position must be rejected");
+        let err = validate_reduce_only_order(
+            Decimal::from(2),
+            &reduce_only_order(crate::types::OrderSide::Sell, Decimal::from(3)),
+        )
+        .expect_err("reduce-only larger than the position must be rejected");
         assert!(matches!(err, ExecutionError::Validation(_)));
     }
 
     #[test]
     fn reduce_only_allows_exact_reduction() {
         // Exact-size Sell closes the long without crossing zero.
-        validate_reduce_only_order(Decimal::from(2), &reduce_only_order(crate::types::OrderSide::Sell, Decimal::from(2)))
-            .expect("exact reduce must be allowed");
+        validate_reduce_only_order(
+            Decimal::from(2),
+            &reduce_only_order(crate::types::OrderSide::Sell, Decimal::from(2)),
+        )
+        .expect("exact reduce must be allowed");
 
         // Short position (negative size) closes with a Buy.
-        validate_reduce_only_order(Decimal::from(-5), &reduce_only_order(crate::types::OrderSide::Buy, Decimal::from(5)))
-            .expect("exact short reduction must be allowed");
+        validate_reduce_only_order(
+            Decimal::from(-5),
+            &reduce_only_order(crate::types::OrderSide::Buy, Decimal::from(5)),
+        )
+        .expect("exact short reduction must be allowed");
     }
 
     // The single most safety-critical invariant in the execution service: a

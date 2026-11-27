@@ -171,9 +171,7 @@ impl ExecutionService for ExecutionServiceImpl {
 
         // A client_order_id is the idempotency key across retries and
         // restarts; an empty string is treated as "not provided".
-        order.client_order_id = req
-            .client_order_id
-            .filter(|id| !id.trim().is_empty());
+        order.client_order_id = req.client_order_id.filter(|id| !id.trim().is_empty());
 
         if let Some(price) = req.price {
             order.price = Some(

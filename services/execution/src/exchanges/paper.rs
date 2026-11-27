@@ -165,8 +165,7 @@ impl PaperExchange {
         // exact for whole numbers, and the /10_000 division must happen in
         // Decimal — doing it in f64 leaves float residue (100.02 becoming
         // …0095843472).
-        let slip_bps = Decimal::from_f64_retain(self.config.slippage_bps)
-            .unwrap_or(Decimal::ZERO);
+        let slip_bps = Decimal::from_f64_retain(self.config.slippage_bps).unwrap_or(Decimal::ZERO);
         let slip = slip_bps / Decimal::from(10_000u32);
         match side {
             OrderSide::Buy => price * (Decimal::ONE + slip),
@@ -175,8 +174,7 @@ impl PaperExchange {
     }
 
     fn taker_fee(&self, notional: Decimal) -> Decimal {
-        let fee_bps =
-            Decimal::from_f64_retain(self.config.taker_fee_bps).unwrap_or(Decimal::ZERO);
+        let fee_bps = Decimal::from_f64_retain(self.config.taker_fee_bps).unwrap_or(Decimal::ZERO);
         let rate = fee_bps / Decimal::from(10_000u32);
         notional * rate
     }
@@ -229,7 +227,8 @@ impl PaperExchange {
                 return Err(ExecutionError::RiskViolation(format!(
                     "paper exchange: reduce-only quantity {} exceeds position size {} — \
                      would cross through zero into new exposure",
-                    order.quantity, position_size.abs()
+                    order.quantity,
+                    position_size.abs()
                 )));
             }
         }
@@ -293,7 +292,9 @@ impl PaperExchange {
             timestamp: Utc::now(),
             is_maker: false,
         };
-        account.pending_fills.insert(exchange_order_id.to_string(), fill.clone());
+        account
+            .pending_fills
+            .insert(exchange_order_id.to_string(), fill.clone());
         account.orders.insert(
             exchange_order_id.to_string(),
             PaperOrder {
@@ -395,9 +396,7 @@ impl Exchange for PaperExchange {
         let mut account = self.account.lock().unwrap();
         let mut cancelled = Vec::new();
         for (id, po) in account.orders.iter_mut() {
-            if po.status == OrderStatusEnum::Submitted
-                && symbol.is_none_or(|s| po.symbol == s)
-            {
+            if po.status == OrderStatusEnum::Submitted && symbol.is_none_or(|s| po.symbol == s) {
                 po.status = OrderStatusEnum::Cancelled;
                 cancelled.push(id.clone());
             }
@@ -493,7 +492,7 @@ impl Exchange for PaperExchange {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{OrderTypeEnum, OrderSide};
+    use crate::types::{OrderSide, OrderTypeEnum};
 
     fn market_order(side: OrderSide, qty: Decimal, reference: Decimal) -> Order {
         let mut o = Order::new(
@@ -526,7 +525,10 @@ mod tests {
         assert_eq!(fill.fee, expected_fee);
         // Cash reduced by notional + fee.
         let balance = paper.get_balance().await.unwrap();
-        assert_eq!(balance.total, Decimal::from(100_000) - Decimal::new(10002, 2) - expected_fee);
+        assert_eq!(
+            balance.total,
+            Decimal::from(100_000) - Decimal::new(10002, 2) - expected_fee
+        );
         // Position opened long 1.
         let positions = paper.get_positions(Some("BTCUSD")).await.unwrap();
         assert_eq!(positions.len(), 1);
@@ -548,10 +550,19 @@ mod tests {
         paper.take_fill(&close_id).unwrap();
 
         // Position flat after the closing sell.
-        assert!(paper.get_positions(Some("BTCUSD")).await.unwrap().is_empty());
+        assert!(
+            paper
+                .get_positions(Some("BTCUSD"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
         // Cash below start: round trip paid slippage + fees both ways.
         let cash = paper.get_balance().await.unwrap().total;
-        assert!(cash < Decimal::from(100_000), "round trip must cost money, got {cash}");
+        assert!(
+            cash < Decimal::from(100_000),
+            "round trip must cost money, got {cash}"
+        );
     }
 
     #[tokio::test]
@@ -589,7 +600,13 @@ mod tests {
         order.reduce_only = true;
         let close_id = paper.place_order(&order).await.unwrap();
         assert!(paper.take_fill(&close_id).is_some());
-        assert!(paper.get_positions(Some("BTCUSD")).await.unwrap().is_empty());
+        assert!(
+            paper
+                .get_positions(Some("BTCUSD"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -607,7 +624,10 @@ mod tests {
         let mut order = market_order(OrderSide::Buy, Decimal::from(1), Decimal::from(100));
         order.order_type = OrderTypeEnum::Limit;
         let id = paper.place_order(&order).await.unwrap();
-        assert!(paper.take_fill(&id).is_none(), "resting limit must not fill");
+        assert!(
+            paper.take_fill(&id).is_none(),
+            "resting limit must not fill"
+        );
         let status = paper.get_order_status(&id).await.unwrap();
         assert_eq!(status.status, OrderStatusEnum::Submitted);
         // And it is cancellable.

@@ -701,7 +701,11 @@ impl ExecutionClient {
             // Reduce-only is set by callers (brain-gated exits); an entry
             // signal is never reduce-only.
             reduce_only: Some(
-                signal.metadata.get("reduce_only").map(|v| v == "true").unwrap_or(false),
+                signal
+                    .metadata
+                    .get("reduce_only")
+                    .map(|v| v == "true")
+                    .unwrap_or(false),
             ),
         };
 

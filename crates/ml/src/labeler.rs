@@ -418,8 +418,7 @@ mod tests {
         // entry: from the executable 106.0 entry the sideways 106.x drift
         // neither reaches TP nor SL before timeout.
         assert_eq!(
-            labeled.labels[34],
-            LABEL_FLAT,
+            labeled.labels[34], LABEL_FLAT,
             "gap-over entry must not inherit the stale-boundary win"
         );
     }
@@ -445,8 +444,7 @@ mod tests {
         close[50] = 100.0;
         let labeled = generate_labels_breakout_labeled(&open, &high, &low, &close, &cfg);
         assert_eq!(
-            labeled.labels[34],
-            LABEL_LOSS,
+            labeled.labels[34], LABEL_LOSS,
             "TP/SL tie on one bar must resolve to the stop"
         );
     }

@@ -83,7 +83,9 @@ impl CnnConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(d.confidence_threshold),
-            approved_symbol: std::env::var("CNN_APPROVED_SYMBOL").ok().filter(|s| !s.trim().is_empty()),
+            approved_symbol: std::env::var("CNN_APPROVED_SYMBOL")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
             approved_interval: std::env::var("CNN_APPROVED_INTERVAL")
                 .ok()
                 .filter(|s| !s.trim().is_empty()),
@@ -402,7 +404,10 @@ mod tests {
         for i in 0..o.len() {
             buf.push(o[i], h[i], l[i], c[i], v[i]);
         }
-        assert!(cnn.consensus_vote("BTCUSD", "15m", &buf, LiveState::default()).is_none());
+        assert!(
+            cnn.consensus_vote("BTCUSD", "15m", &buf, LiveState::default())
+                .is_none()
+        );
     }
 
     #[test]
@@ -437,11 +442,13 @@ mod tests {
             buf.push(o[i], h[i], l[i], c[i], v[i]);
         }
         assert!(
-            cnn.consensus_vote("ETHUSD", "15m", &buf, LiveState::default()).is_none(),
+            cnn.consensus_vote("ETHUSD", "15m", &buf, LiveState::default())
+                .is_none(),
             "another symbol must never receive this checkpoint's vote"
         );
         assert!(
-            cnn.consensus_vote("BTCUSD", "1h", &buf, LiveState::default()).is_none(),
+            cnn.consensus_vote("BTCUSD", "1h", &buf, LiveState::default())
+                .is_none(),
             "another interval must never receive this checkpoint's vote"
         );
         // In-scope request behaves like the unscoped model (no scope refusal).
@@ -533,10 +540,8 @@ mod tests {
             ..PerAssetCnnConfig::default()
         };
         let model = PerAssetCnn::<CpuBackend>::new(cfg, &device);
-        let dir = std::env::temp_dir().join(format!(
-            "janus-cnn-window-test-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("janus-cnn-window-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("w40.bin");
         model.save(&path).unwrap();

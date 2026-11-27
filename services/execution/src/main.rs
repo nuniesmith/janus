@@ -140,14 +140,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // paper trading runs against a simulated venue that fills
             // through the real order lifecycle; live venues are not wired
             // yet and must be added explicitly, never defaulted to.
-            let backend = std::env::var("EXECUTION_BACKEND").unwrap_or_else(|_| "paper".to_string());
+            let backend =
+                std::env::var("EXECUTION_BACKEND").unwrap_or_else(|_| "paper".to_string());
             match backend.as_str() {
                 "paper" => {
                     let paper = janus_execution::PaperExchange::from_env();
                     let mut router = janus_execution::ExchangeRouter::new();
-                    router
-                        .add_paper_exchange("paper", Arc::new(paper))
-                        .await;
+                    router.add_paper_exchange("paper", Arc::new(paper)).await;
                     mgr.set_exchange_router(Arc::new(router));
                     info!("Execution backend: paper (simulated fills, no real funds at risk)");
                 }
@@ -159,8 +158,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
                 other => {
-                    return Err(format!("Unknown EXECUTION_BACKEND '{other}' (supported: paper)")
-                        .into());
+                    return Err(
+                        format!("Unknown EXECUTION_BACKEND '{other}' (supported: paper)").into(),
+                    );
                 }
             }
 
