@@ -1,0 +1,188 @@
+name: Project Janus Paper
+
+# Builds the Project Janus paper (project_janus/janus.tex) to PDF.
+#
+# Ported from nuniesmith/technical-papers' ci-cd.yml (its lint-latex and
+# build-latex jobs, using the same nuniesmith/actions LaTeX actions) when
+# the paper moved into this repo. Adaptations vs the source workflow:
+#   - Triggers are path-scoped to project_janus/** and this file, so the
+#     workflow can never fire on unrelated changes to the Rust workspace.
+#   - contents: write is granted to the build job only (for the PDF
+#     auto-commit), not workflow-wide.
+#   - PDF listing/upload/auto-commit are scoped to project_janus/
+#     (the source used repo-wide globs; technical-papers holds no other
+#     PDFs, so behaviour there was identical).
+#   - The source's Python test and CI summary jobs were not ported: they
+#     test technical-papers' own Python package, not the paper.
+
+on:
+    push:
+        branches:
+            - main
+        paths:
+            - "project_janus/**"
+            - ".github/workflows/project-janus-paper.yml"
+    pull_request:
+        paths:
+            - "project_janus/**"
+            - ".github/workflows/project-janus-paper.yml"
+    workflow_dispatch:
+        inputs:
+            skip_lint:
+                description: "Skip LaTeX linting"
+                required: false
+                type: boolean
+                default: false
+            latex_engine:
+                description: "LaTeX engine to use"
+                required: false
+                type: choice
+                options:
+                    - pdflatex
+                    - xelatex
+                    - lualatex
+                default: pdflatex
+
+concurrency:
+    group: ${{ github.workflow }}-${{ github.ref }}
+    cancel-in-progress: true
+
+permissions:
+    contents: read
+
+defaults:
+    run:
+        shell: bash
+
+jobs:
+    lint-latex:
+        name: ✨ Lint LaTeX
+        runs-on: ubuntu-latest
+        timeout-minutes: 10
+        if: ${{ !inputs.skip_lint }}
+
+        steps:
+            - name: 📥 Checkout repository
+              uses: actions/checkout@v4
+
+            - name: 📦 Setup TeX Live
+              uses: nuniesmith/actions/.github/actions/latex-setup@main
+              with:
+                  scheme: custom
+                  install-biber: "true"
+                  install-chktex: "true"
+                  install-latexmk: "false"
+                  cache-enabled: "true"
+
+            - name: ✨ Lint LaTeX files
+              uses: nuniesmith/actions/.github/actions/latex-lint@main
+              with:
+                  working-directory: "."
+                  run-chktex: "true"
+                  run-lacheck: "true"
+                  run-custom-checks: "true"
+                  chktex-warnings-as-errors: "false"
+                  # Suppress common noisy chktex warnings:
+                  #   1  = Command terminated with space
+                  #   24 = Delete this space to maintain correct pagereferences
+                  #   36 = Vertical rules in tables
+                  #   44 = User Regex (often false positives)
+                  chktex-nowarn: "1,24,36,44"
+                  check-encoding: "true"
+                  check-todos: "true"
+                  check-bibliography: "true"
+                  fail-on-warnings: "false"
+
+    build-latex:
+        name: 📄 Build LaTeX PDFs
+        runs-on: ubuntu-latest
+        timeout-minutes: 20
+        needs: [lint-latex]
+        if: |
+            always() &&
+            (needs.lint-latex.result == 'success' || needs.lint-latex.result == 'skipped')
+        permissions:
+            contents: write
+
+        steps:
+            - name: 📥 Checkout repository
+              uses: actions/checkout@v4
+
+            - name: 📦 Setup TeX Live
+              uses: nuniesmith/actions/.github/actions/latex-setup@main
+              with:
+                  scheme: custom
+                  install-biber: "true"
+                  install-chktex: "false"
+                  install-latexmk: "false"
+                  cache-enabled: "true"
+                  cache-key-suffix: "build"
+
+            - name: 🔨 Compile LaTeX documents
+              id: build
+              uses: nuniesmith/actions/.github/actions/latex-build@main
+              with:
+                  working-directory: "."
+                  engine: ${{ inputs.latex_engine || 'pdflatex' }}
+                  bib-engine: "auto"
+                  compile-passes: "3"
+                  interaction-mode: "nonstopmode"
+                  halt-on-error: "true"
+                  shell-escape: "false"
+                  clean-aux: "true"
+                  keep-log-on-failure: "true"
+                  fail-on-warnings: "false"
+
+            - name: 📦 List generated PDFs
+              run: |
+                  echo "📦 Generated PDFs:"
+                  find project_janus -name "*.pdf" -type f -exec ls -lh {} \;
+
+            - name: 📤 Upload PDF artifacts
+              uses: actions/upload-artifact@v4
+              with:
+                  name: latex-pdfs
+                  path: "project_janus/**/*.pdf"
+                  retention-days: 90
+
+            - name: 📝 Commit PDFs to repository
+              if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+              run: |
+                  git config --local user.email "github-actions[bot]@users.noreply.github.com"
+                  git config --local user.name "GitHub Actions"
+
+                  # Pull latest to avoid conflicts with concurrent runs
+                  git pull --rebase origin main || true
+
+                  # Add the paper's PDFs
+                  find project_janus -name "*.pdf" -type f -exec git add -f {} \;
+
+                  # Commit only if there are staged changes
+                  if git diff --staged --quiet; then
+                    echo "ℹ️  No PDF changes to commit"
+                  else
+                    git commit -m "🤖 Auto-compile LaTeX PDFs [skip ci]" \
+                      -m "Built with ${{ inputs.latex_engine || 'pdflatex' }}" \
+                      -m "Commit: ${{ github.sha }}" \
+                      -m "PDFs compiled: ${{ steps.build.outputs.pdf-count }}"
+                    git push || echo "⚠️  Push failed — another commit may have landed"
+                  fi
+
+            - name: 📋 Build Summary
+              if: always()
+              run: |
+                  {
+                    echo "# 📄 LaTeX Build Results"
+                    echo ""
+                    echo "| Detail | Value |"
+                    echo "|--------|-------|"
+                    echo "| **Commit** | \`${{ github.sha }}\` |"
+                    echo "| **Branch** | \`${{ github.ref_name }}\` |"
+                    echo "| **Engine** | ${{ inputs.latex_engine || 'pdflatex' }} |"
+                    echo "| **PDFs built** | ${{ steps.build.outputs.pdf-count || '—' }} |"
+                    echo "| **Failures** | ${{ steps.build.outputs.fail-count || '—' }} |"
+                    echo "| **Warnings** | ${{ steps.build.outputs.total-warnings || '—' }} |"
+                    echo "| **Result** | ${{ steps.build.outputs.build-result || '—' }} |"
+                    echo ""
+                    echo "Download compiled PDFs from the **Artifacts** section above ⬆️"
+                  } >> $GITHUB_STEP_SUMMARY
