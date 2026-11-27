@@ -1,0 +1,16 @@
+# Project JANUS Visualization Examples - Requirements
+# =====================================================
+#
+# Install with: pip install -r requirements.txt
+#
+# For development: pip install -e .[dev] from the root directory
+# For all features: pip install -e .[all] from the root directory
+
+# Core dependencies (required)
+numpy>=1.24.0
+scipy>=1.10.0
+matplotlib>=3.7.0
+scikit-learn>=1.3.0
+
+# Optional dependencies (install manually if needed)
+# pip install umap-learn torch seaborn networkx plotly
