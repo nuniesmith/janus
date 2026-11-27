@@ -58,6 +58,12 @@ pub struct Order {
     /// Time in force
     pub time_in_force: TimeInForceEnum,
 
+    /// Reduce-only: this order must only reduce an existing opposite
+    /// position and must never open or increase exposure. Enforced by the
+    /// order manager against tracked positions (and by venues that support
+    /// it natively) before submission.
+    pub reduce_only: bool,
+
     /// Execution strategy
     pub strategy: ExecutionStrategyEnum,
 
@@ -104,6 +110,7 @@ impl Order {
             stop_price: None,
             average_fill_price: None,
             time_in_force: TimeInForceEnum::Gtc,
+            reduce_only: false,
             strategy: ExecutionStrategyEnum::Immediate,
             status: OrderStatusEnum::New,
             fills: Vec::new(),

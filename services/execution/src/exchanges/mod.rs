@@ -98,6 +98,7 @@ pub mod bybit;
 pub mod kraken;
 pub mod market_data;
 pub mod metrics;
+pub mod paper;
 pub mod provider;
 pub mod rate_limit;
 pub mod router;

@@ -120,6 +120,13 @@ impl OrderHistory {
             line.push_str(&escape_tag(exchange_order_id));
         }
 
+        // Add client_order_id tag if available — the durable idempotency key:
+        // duplicate-submission detection and restart recovery look this up.
+        if let Some(ref client_order_id) = order.client_order_id {
+            line.push_str(",client_order_id=");
+            line.push_str(&escape_tag(client_order_id));
+        }
+
         // Add signal_id tag
         line.push_str(",signal_id=");
         line.push_str(&escape_tag(&order.signal_id));
@@ -236,6 +243,69 @@ impl OrderHistory {
         }
     }
 
+    /// Look up the internal order ID for a client order ID via the QuestDB
+    /// REST API — the durable half of idempotent submission: a retry after a
+    /// restart (or a crash between exchange acceptance and acknowledgment)
+    /// finds the order that was already persisted as an intent.
+    ///
+    /// Fail-closed: when the lookup itself cannot be performed (REST
+    /// unreachable), the caller must refuse to submit rather than risk a
+    /// duplicate order.
+    pub async fn find_order_id_by_client_order_id(
+        &self,
+        client_order_id: &str,
+    ) -> Result<Option<String>> {
+        if client_order_id.is_empty() {
+            return Ok(None);
+        }
+        // The ID is interpolated into SQL and ILP: restrict it to a safe
+        // charset so neither channel has an injection surface. Our own
+        // generated IDs (`jf-<uuid>`) always conform.
+        if !is_safe_client_order_id(client_order_id) {
+            return Err(ExecutionError::OrderValidation(format!(
+                "client_order_id {:?} contains characters outside the safe set — refusing lookup",
+                client_order_id
+            )));
+        }
+        let host = self.questdb_host.split(':').next().unwrap_or("localhost");
+        let rest_port: u16 = std::env::var("QUESTDB_REST_PORT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(9000);
+        let query = format!(
+            "SELECT order_id FROM {} WHERE client_order_id = '{}' ORDER BY timestamp DESC LIMIT 1",
+            self.orders_table, client_order_id
+        );
+        let url = format!("http://{host}:{rest_port}/exec?query={}", urlencode(&query));
+        let response = reqwest::get(&url)
+            .await
+            .map_err(|e| {
+                ExecutionError::Storage(StorageError::Connection(format!(
+                    "QuestDB REST lookup for client_order_id failed at {url}: {e}"
+                )))
+            })?
+            .error_for_status()
+            .map_err(|e| {
+                ExecutionError::Storage(StorageError::Connection(format!(
+                    "QuestDB REST lookup for client_order_id failed: {e}"
+                )))
+            })?;
+        let body: serde_json::Value = response.json().await.map_err(|e| {
+            ExecutionError::Storage(StorageError::Connection(format!(
+                "QuestDB REST lookup returned unparsable JSON: {e}"
+            )))
+        })?;
+        // QuestDB /exec shape: {"dataset": [["order-id"], ...], "columns": [...]}
+        if let Some(rows) = body.get("dataset").and_then(|d| d.as_array())
+            && let Some(first_row) = rows.first()
+            && let Some(id) = first_row.as_array().and_then(|row| row.first())
+            && let Some(id_str) = id.as_str()
+        {
+            return Ok(Some(id_str.to_string()));
+        }
+        Ok(None)
+    }
+
     /// Get orders by symbol (placeholder - requires REST API or PG wire)
     pub async fn get_orders_by_symbol(&self, symbol: &str, limit: usize) -> Result<Vec<Order>> {
         // This is a placeholder implementation
@@ -330,6 +400,30 @@ fn escape_tag(value: &str) -> String {
         .replace('=', "\\=")
 }
 
+/// Characters permitted in a `client_order_id` used in SQL/ILP lookups.
+/// Anything outside this set is refused — no injection surface on either
+/// channel.
+fn is_safe_client_order_id(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
+}
+
+/// Percent-encode a string for use in a URL query component.
+fn urlencode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for b in value.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 /// Convert Decimal to f64 for ILP
 fn decimal_to_f64(value: Decimal) -> Result<f64> {
     value.to_f64().ok_or_else(|| {
@@ -370,6 +464,7 @@ mod tests {
             fills: vec![],
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            reduce_only: false,
             metadata: HashMap::new(),
         }
     }

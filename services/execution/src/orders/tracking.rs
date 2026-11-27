@@ -415,6 +415,7 @@ mod tests {
             fills: Vec::new(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            reduce_only: false,
             metadata: HashMap::new(),
         }
     }

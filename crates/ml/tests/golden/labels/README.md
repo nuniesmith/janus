@@ -29,7 +29,8 @@ Then `cargo test -p jflow-ml labeler` verifies parity.
 
 ```jsonc
 {
-  "high":  [...], "low": [...], "close": [...],  // float32 OHLC
+  "open":   [...],
+  "high":   [...], "low": [...], "close": [...],  // float32 OHLC
   "expected": [ /* one i64 label per bar: 0 flat, 1 long, 2 short, 3 loss */ ]
 }
 ```
@@ -37,3 +38,9 @@ Then `cargo test -p jflow-ml labeler` verifies parity.
 Uses the labeler defaults, which match `BreakoutLabelConfig::default()`
 (consolidation_bars 20, atr_mult 5.5, breakout_wait 40, tp/sl 1.5/1.0,
 max_hold 90, atr_period 14).
+
+> **Semantics note (2026-11):** the Rust labeler now fills gap-over breakouts
+> at the breakout bar's **open** and resolves TP/SL ties to the **stop** —
+> deliberately stricter than the legacy Python oracle in
+> `fks/src/ruby/src/ml/labeler.py`. Goldens recorded from the old oracle will
+> fail; regenerate only from an oracle updated to the same rules.

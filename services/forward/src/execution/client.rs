@@ -453,7 +453,14 @@ impl ExecutionClient {
         );
 
         // Convert TradingSignal to SubmitSignalRequest
-        let request = self.convert_signal_to_request(signal)?;
+        let mut request = self.convert_signal_to_request(signal)?;
+
+        // One idempotency key per logical order, minted here — outside the
+        // retry loop — so every retry of this submission carries the same
+        // key and the execution service deduplicates them (across retries
+        // and across restarts). A new key per attempt would defeat that.
+        let client_order_id = format!("jf-{}-{}", signal.signal_id, uuid::Uuid::new_v4());
+        request.client_order_id = Some(client_order_id);
 
         // Submit with retries
         let mut attempt = 0;
@@ -591,13 +598,41 @@ impl ExecutionClient {
             Side::Buy
         };
 
-        // Calculate quantity based on confidence and exchange limits
-        let base_quantity = exchange_config.default_quantity;
-        let mut quantity = base_quantity * signal.confidence;
-
-        // Apply exchange-specific limits
-        quantity = quantity.max(exchange_config.min_quantity);
-        quantity = quantity.min(exchange_config.max_quantity);
+        // Calculate quantity from the RiskManager-approved size when the
+        // signal carries one. An approved size is authoritative: it is never
+        // multiplied by confidence again, never bumped up to a venue minimum
+        // (a size below the minimum means "do not trade this much" — the
+        // order is refused), and only clamped down to the venue maximum.
+        // Signals without approved sizing (legacy producers) keep the old
+        // confidence-scaled default.
+        let quantity = match signal.metadata.get("position_size_units") {
+            Some(raw) => {
+                let approved = raw
+                    .parse::<f64>()
+                    .map_err(|e| anyhow::anyhow!("invalid position_size_units '{raw}': {e}"))?;
+                if approved <= 0.0 {
+                    return Err(anyhow::anyhow!(
+                        "non-positive approved position_size_units {approved} for signal {}",
+                        signal.signal_id
+                    ));
+                }
+                if approved < exchange_config.min_quantity {
+                    return Err(anyhow::anyhow!(
+                        "approved position_size_units {approved} is below the venue minimum {} \
+                         for signal {} — refusing to size up",
+                        exchange_config.min_quantity,
+                        signal.signal_id
+                    ));
+                }
+                approved.min(exchange_config.max_quantity)
+            }
+            None => {
+                let mut quantity = exchange_config.default_quantity * signal.confidence;
+                quantity = quantity.max(exchange_config.min_quantity);
+                quantity = quantity.min(exchange_config.max_quantity);
+                quantity
+            }
+        };
 
         if quantity <= 0.0 {
             return Err(anyhow::anyhow!(
@@ -660,6 +695,18 @@ impl ExecutionClient {
             time_in_force: exchange_config.default_time_in_force as i32,
             strategy: self.config.default_strategy as i32,
             metadata,
+            // Generated once per signal in `submit_signal` (outside the retry
+            // loop) so retries are idempotent at the execution service.
+            client_order_id: None,
+            // Reduce-only is set by callers (brain-gated exits); an entry
+            // signal is never reduce-only.
+            reduce_only: Some(
+                signal
+                    .metadata
+                    .get("reduce_only")
+                    .map(|v| v == "true")
+                    .unwrap_or(false),
+            ),
         };
 
         Ok(request)

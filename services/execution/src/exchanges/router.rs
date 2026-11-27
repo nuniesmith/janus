@@ -32,6 +32,10 @@ pub struct ExchangeRouter {
 
     /// Routing rules (symbol -> exchange)
     routing_rules: Arc<RwLock<HashMap<String, String>>>,
+
+    /// The registered paper backend, if any — kept separately so the order
+    /// manager can pull simulated fills from it without downcasting.
+    paper: Arc<RwLock<Option<Arc<crate::exchanges::paper::PaperExchange>>>>,
 }
 
 impl ExchangeRouter {
@@ -45,6 +49,7 @@ impl ExchangeRouter {
             exchanges: Arc::new(RwLock::new(HashMap::new())),
             default_exchange: Arc::new(RwLock::new(None)),
             routing_rules: Arc::new(RwLock::new(HashMap::new())),
+            paper: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -58,7 +63,36 @@ impl ExchangeRouter {
             exchanges: Arc::new(RwLock::new(HashMap::new())),
             default_exchange: Arc::new(RwLock::new(Some("kraken".to_string()))),
             routing_rules: Arc::new(RwLock::new(HashMap::new())),
+            paper: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// Register a paper backend under the given name (conventionally
+    /// `"paper"`). The exchange is added to the normal routing map **and**
+    /// retained in a dedicated slot so [`ExchangeRouter::paper`] can hand the
+    /// simulated-fill source back to the order manager.
+    pub async fn add_paper_exchange(
+        &mut self,
+        name: impl Into<String>,
+        paper: std::sync::Arc<crate::exchanges::paper::PaperExchange>,
+    ) {
+        let name = name.into();
+        let exchange: Arc<dyn Exchange> = paper.clone();
+        {
+            let mut exchanges = self.exchanges.write().await;
+            exchanges.insert(name.clone(), exchange);
+            // First registered venue becomes the routing default (same rule
+            // as `add_exchange`).
+            if exchanges.len() == 1 {
+                *self.default_exchange.write().await = Some(name.clone());
+            }
+        }
+        *self.paper.write().await = Some(paper);
+    }
+
+    /// The registered paper backend, if any.
+    pub async fn paper(&self) -> Option<Arc<crate::exchanges::paper::PaperExchange>> {
+        self.paper.read().await.clone()
     }
 
     /// Add an exchange to the router

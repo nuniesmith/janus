@@ -15,9 +15,18 @@
 //!    consolidation → label flat.
 //! 3. Scan up to `max_breakout_wait` bars ahead for a *close* beyond the range;
 //!    no breakout → flat.
-//! 4. From the breakout bar, size an ATR bracket and walk forward up to
-//!    `max_hold_bars`: TP hit → long/short (win), SL hit → loss, timeout → flat.
-//! 5. Assign the outcome to bar `i` (not the breakout bar).
+//! 4. The executable entry is the breakout level, **or the breakout bar's open
+//!    when it gaps over the range** — a bar that opens beyond the old boundary
+//!    was never fillable at that level.
+//! 5. From the breakout bar, size an ATR bracket and walk forward up to
+//!    `max_hold_bars`: SL hit → loss, TP hit → long/short (win), timeout →
+//!    flat. A bar touching both resolves to the **stop** (the conservative
+//!    assumption, matching the backtest simulator).
+//! 6. Assign the outcome to bar `i` (not the breakout bar).
+//!
+//! [`generate_labels_breakout_labeled`] also reports which bars have a fully
+//! observable outcome; the final `max_breakout_wait + max_hold_bars` bars can
+//! never be labeled from complete data.
 //!
 //! # Parity
 //!
@@ -25,6 +34,11 @@
 //! range, `adjust=False`). Helper + scenario unit tests cover it in-sandbox;
 //! `tests::python_goldens` checks full Python↔Rust parity against vectors from
 //! `tools/parity/record_labels.py` (skips cleanly when absent).
+//!
+//! **Divergence note:** steps 4–5 are deliberately *stricter* than the legacy
+//! Python oracle (which filled gap-over entries at the stale boundary and
+//! resolved TP/SL ties optimistically). Goldens recorded from the old oracle
+//! will fail after this change and must be regenerated from an updated oracle.
 
 /// No signal / timed out.
 pub const LABEL_FLAT: i64 = 0;
@@ -34,6 +48,21 @@ pub const LABEL_LONG: i64 = 1;
 pub const LABEL_SHORT: i64 = 2;
 /// Breakout that hit SL first (explicit loss).
 pub const LABEL_LOSS: i64 = 3;
+
+/// Breakout labels plus per-bar observability.
+///
+/// `valid[i]` is `false` where bar `i`'s outcome cannot be fully observed from
+/// the supplied data (the warmup head and the final label-horizon tail). An
+/// unknown label is **not** a flat-market observation: training and evaluation
+/// must exclude invalid bars rather than treating them as `LABEL_FLAT`.
+#[derive(Debug, Clone)]
+pub struct LabeledSeries {
+    /// Per-bar class in `0..=3` (`LABEL_*`). Bars outside `valid` carry
+    /// `LABEL_FLAT` as a placeholder only.
+    pub labels: Vec<i64>,
+    /// `true` where `labels[i]` is a fully observed outcome.
+    pub valid: Vec<bool>,
+}
 
 /// Breakout-labeler configuration (defaults match the Python champion).
 #[derive(Debug, Clone, PartialEq)]
@@ -98,22 +127,33 @@ fn atr_ewm(high: &[f64], low: &[f64], close: &[f64], period: usize) -> Vec<f64> 
 
 /// Generate 4-class breakout labels for an OHLC series (one per bar).
 ///
+/// Labels bars via the consolidation→breakout→ATR-bracket walk-forward.
+///
+/// Convenience wrapper over [`generate_labels_breakout_labeled`] returning only
+/// the labels; prefer the `_labeled` variant in training/evaluation so
+/// unobservable bars are excluded rather than counted as flat.
+///
 /// Returns all-`LABEL_FLAT` when there are fewer than [`BreakoutLabelConfig::min_rows`]
 /// bars or the input lengths disagree.
 // Index-faithful port of the NumPy walk-forward: the scan loop needs the
 // absolute bar index for `breakout_idx` + an early break, so range-indexing is
 // intentional here.
 #[allow(clippy::needless_range_loop)]
-pub fn generate_labels_breakout(
+pub fn generate_labels_breakout_labeled(
+    open: &[f32],
     high: &[f32],
     low: &[f32],
     close: &[f32],
     cfg: &BreakoutLabelConfig,
-) -> Vec<i64> {
+) -> LabeledSeries {
     let n = close.len();
-    if n < cfg.min_rows() || high.len() != n || low.len() != n {
-        return vec![LABEL_FLAT; n];
+    if n < cfg.min_rows() || high.len() != n || low.len() != n || open.len() != n {
+        return LabeledSeries {
+            labels: vec![LABEL_FLAT; n],
+            valid: vec![false; n],
+        };
     }
+    let op: Vec<f64> = open.iter().map(|&v| v as f64).collect();
     let hi: Vec<f64> = high.iter().map(|&v| v as f64).collect();
     let lo: Vec<f64> = low.iter().map(|&v| v as f64).collect();
     let cl: Vec<f64> = close.iter().map(|&v| v as f64).collect();
@@ -158,12 +198,14 @@ pub fn generate_labels_breakout(
         for j in (i + 1)..scan_end {
             if cl[j] > range_h {
                 direction = LABEL_LONG;
-                entry_price = range_h;
+                // Executable entry: a bar that *opens* beyond the range was
+                // never fillable at the stale boundary — fill at its open.
+                entry_price = range_h.max(op[j]);
                 breakout_idx = j;
                 break;
             } else if cl[j] < range_l {
                 direction = LABEL_SHORT;
-                entry_price = range_l;
+                entry_price = range_l.min(op[j]);
                 breakout_idx = j;
                 break;
             }
@@ -189,33 +231,48 @@ pub fn generate_labels_breakout(
             )
         };
 
-        // Walk forward to an outcome (timeout → flat).
+        // Walk forward to an outcome (timeout → flat). The stop is checked
+        // first: a bar touching both TP and SL is a loss, not a win.
         let mut outcome = LABEL_FLAT;
         let walk_end = (breakout_idx + cfg.max_hold_bars + 1).min(n);
         for k in (breakout_idx + 1)..walk_end {
             if direction == LABEL_LONG {
-                if hi[k] >= tp_price {
-                    outcome = LABEL_LONG;
-                    break;
-                }
                 if lo[k] <= sl_price {
                     outcome = LABEL_LOSS;
                     break;
                 }
-            } else {
-                if lo[k] <= tp_price {
-                    outcome = LABEL_SHORT;
+                if hi[k] >= tp_price {
+                    outcome = LABEL_LONG;
                     break;
                 }
+            } else {
                 if hi[k] >= sl_price {
                     outcome = LABEL_LOSS;
+                    break;
+                }
+                if lo[k] <= tp_price {
+                    outcome = LABEL_SHORT;
                     break;
                 }
             }
         }
         labels[i] = outcome;
     }
-    labels
+
+    let valid: Vec<bool> = (0..n).map(|i| i >= warmup && i < max_i).collect();
+    LabeledSeries { labels, valid }
+}
+
+/// Backward-compatible label-only entry point (see
+/// [`generate_labels_breakout_labeled`]).
+pub fn generate_labels_breakout(
+    open: &[f32],
+    high: &[f32],
+    low: &[f32],
+    close: &[f32],
+    cfg: &BreakoutLabelConfig,
+) -> Vec<i64> {
+    generate_labels_breakout_labeled(open, high, low, close, cfg).labels
 }
 
 /// Class counts `[flat, long, short, loss]`.
@@ -246,9 +303,11 @@ mod tests {
         let cfg = BreakoutLabelConfig::default();
         let n = cfg.min_rows() - 1;
         let series = vec![100.0f32; n];
-        let labels = generate_labels_breakout(&series, &series, &series, &cfg);
-        assert_eq!(labels.len(), n);
-        assert!(labels.iter().all(|&l| l == LABEL_FLAT));
+        let out = generate_labels_breakout_labeled(&series, &series, &series, &series, &cfg);
+        assert_eq!(out.labels.len(), n);
+        assert!(out.labels.iter().all(|&l| l == LABEL_FLAT));
+        // Short input: nothing is observable.
+        assert!(out.valid.iter().all(|&v| !v));
     }
 
     /// A steep trend never satisfies the consolidation gate → all flat.
@@ -259,7 +318,8 @@ mod tests {
         let close: Vec<f32> = (0..n).map(|i| 100.0 + 2.0 * i as f32).collect();
         let high: Vec<f32> = close.iter().map(|c| c + 0.1).collect();
         let low: Vec<f32> = close.iter().map(|c| c - 0.1).collect();
-        let labels = generate_labels_breakout(&high, &low, &close, &cfg);
+        let open: Vec<f32> = close.iter().map(|c| c - 0.05).collect();
+        let labels = generate_labels_breakout(&open, &high, &low, &close, &cfg);
         assert!(
             labels.iter().all(|&l| l == LABEL_FLAT),
             "trend must not label"
@@ -267,7 +327,9 @@ mod tests {
     }
 
     /// Tight consolidation then a clean upward breakout that hits TP must
-    /// produce at least one LONG label, and only valid classes.
+    /// produce at least one LONG label, and only valid classes. The breakout
+    /// ramps through the range (its open stays below the range high), so the
+    /// executable entry is the range high itself.
     #[test]
     fn consolidation_then_breakout_labels_long() {
         let cfg = BreakoutLabelConfig::default();
@@ -275,13 +337,21 @@ mod tests {
         let mut close = vec![100.0f32; n];
         let mut high = vec![100.3f32; n];
         let mut low = vec![99.7f32; n];
-        for i in 150..n {
-            // sustained breakout well above the ~100.3 range high
+        let mut open = vec![100.0f32; n];
+        // Bar 148 breaks out continuously: open inside the range, close beyond
+        // it (no gap-over), then a sustained move above the old range.
+        open[148] = 100.0;
+        high[148] = 101.2;
+        low[148] = 99.9;
+        close[148] = 101.0;
+        for i in 149..n {
+            open[i] = 103.0;
             close[i] = 103.0;
             high[i] = 103.3;
             low[i] = 102.7;
         }
-        let labels = generate_labels_breakout(&high, &low, &close, &cfg);
+        let labeled = generate_labels_breakout_labeled(&open, &high, &low, &close, &cfg);
+        let labels = &labeled.labels;
         assert!(
             labels.iter().all(|&l| (0..4).contains(&l)),
             "valid classes only"
@@ -291,7 +361,92 @@ mod tests {
             "a consolidation→breakout→TP must yield a LONG label"
         );
         // counts sum to n
-        assert_eq!(label_counts(&labels).iter().sum::<usize>(), n);
+        assert_eq!(label_counts(labels).iter().sum::<usize>(), n);
+    }
+
+    /// Breakout bars must only count long/short labels whose outcome walk
+    /// completes inside the data; the final horizon-sized tail is *unknown*,
+    /// never flat.
+    #[test]
+    fn validity_mask_excludes_warmup_and_final_horizon() {
+        let cfg = BreakoutLabelConfig::default();
+        let n = 250;
+        let close = vec![100.0f32; n];
+        let high = vec![100.3f32; n];
+        let low = vec![99.7f32; n];
+        let open = vec![100.0f32; n];
+        let labeled = generate_labels_breakout_labeled(&open, &high, &low, &close, &cfg);
+        let warmup = cfg.consolidation_bars + 14;
+        let horizon = cfg.max_breakout_wait + cfg.max_hold_bars;
+        for (i, &v) in labeled.valid.iter().enumerate() {
+            assert_eq!(v, i >= warmup && i < n - horizon - 1, "bar {i}");
+        }
+        // The first valid bars sit right after warmup; the tail is invalid.
+        assert!(!labeled.valid[..warmup].contains(&true));
+        assert!(labeled.valid[warmup]); // 250 > warmup + horizon + 1
+        assert!(!labeled.valid[n - horizon - 1..].contains(&true));
+    }
+
+    /// A breakout bar that *opens* beyond the range cannot be filled at the
+    /// stale boundary. The legacy labeler entered at the range high (TP
+    /// immediately reachable → LONG); the executable entry is the bar's open,
+    /// far enough above TP that the bracket never fills before timeout → flat.
+    #[test]
+    fn gap_over_breakout_enters_at_open_not_stale_boundary() {
+        let cfg = BreakoutLabelConfig::default();
+        let n = 250;
+        // Bars 0..49: tight consolidation around 100 (range 99.9–100.1,
+        // ATR ≈ 0.2). Bar 49 gaps open to 106 (well over range_h = 100.1) and
+        // then drifts sideways between the new TP and SL.
+        let mut open = vec![100.0f32; n];
+        let mut high = vec![100.1f32; n];
+        let mut low = vec![99.9f32; n];
+        let mut close = vec![100.0f32; n];
+        open[49] = 106.0;
+        high[49] = 106.2;
+        low[49] = 105.8;
+        close[49] = 106.0;
+        for i in 50..n {
+            open[i] = 106.0;
+            high[i] = 106.2;
+            low[i] = 105.8;
+            close[i] = 106.0;
+        }
+        let labeled = generate_labels_breakout_labeled(&open, &high, &low, &close, &cfg);
+        // First candidate bar (i = warmup = 34) scans forward, sees the bar-49
+        // gap-over breakout, and must NOT be labeled LONG via the stale 100.1
+        // entry: from the executable 106.0 entry the sideways 106.x drift
+        // neither reaches TP nor SL before timeout.
+        assert_eq!(
+            labeled.labels[34], LABEL_FLAT,
+            "gap-over entry must not inherit the stale-boundary win"
+        );
+    }
+
+    /// A single bar touching both TP and SL resolves to the stop (loss), not
+    /// the target — matching the backtest simulator's conservative tie-break.
+    #[test]
+    fn tp_sl_tie_resolves_to_stop() {
+        let cfg = BreakoutLabelConfig::default();
+        let n = 250;
+        let mut open = vec![100.0f32; n];
+        let mut high = vec![100.1f32; n];
+        let mut low = vec![99.9f32; n];
+        let mut close = vec![100.0f32; n];
+        // Bar 49: clean breakout close (no gap — opens inside the range).
+        open[49] = 100.0;
+        high[49] = 102.0;
+        low[49] = 99.9;
+        close[49] = 101.5;
+        // Bar 50 touches both the TP and the SL of the bracket opened at 100.1.
+        high[50] = 102.5;
+        low[50] = 99.0;
+        close[50] = 100.0;
+        let labeled = generate_labels_breakout_labeled(&open, &high, &low, &close, &cfg);
+        assert_eq!(
+            labeled.labels[34], LABEL_LOSS,
+            "TP/SL tie on one bar must resolve to the stop"
+        );
     }
 
     /// Full Python↔Rust parity. Skips when no goldens are present (generate with
@@ -300,6 +455,7 @@ mod tests {
     fn python_goldens() {
         #[derive(serde::Deserialize)]
         struct Case {
+            open: Vec<f32>,
             high: Vec<f32>,
             low: Vec<f32>,
             close: Vec<f32>,
@@ -321,7 +477,8 @@ mod tests {
                 continue;
             }
             let case: Case = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-            let got = generate_labels_breakout(&case.high, &case.low, &case.close, &cfg);
+            let got =
+                generate_labels_breakout(&case.open, &case.high, &case.low, &case.close, &cfg);
             assert_eq!(got, case.expected, "{path:?}: label mismatch");
             checked += 1;
         }

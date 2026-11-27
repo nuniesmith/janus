@@ -474,6 +474,7 @@ mod tests {
             fills: Vec::new(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            reduce_only: false,
             metadata: HashMap::new(),
         }
     }

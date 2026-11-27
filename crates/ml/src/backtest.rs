@@ -3,11 +3,15 @@
 //! Turns a stream of per-bar directional predictions into simulated trades and a
 //! cost-aware PnL, so a classification edge can be judged as *money*, not just
 //! precision. The trade mechanics mirror the training labeler
-//! ([`crate::labeler`]): enter in the predicted direction at the signal bar's
-//! close, bracket with a `tp_atr_mult` / `sl_atr_mult` ATR target/stop, and hold
-//! up to `max_hold_bars` (TP/SL are checked intrabar via the high/low; ties
-//! resolve to the stop, the conservative assumption). One position at a time —
-//! new signals while in a trade are ignored, as a single-lot live bot would.
+//! ([`crate::labeler`]) with an explicit post-decision execution convention:
+//! the decision is read at bar `i`'s close and the position is entered at bar
+//! `i+1`'s **open** (a decision computed from a completed bar cannot trade that
+//! bar's own close). The bracket uses the decision-bar ATR, and exits are
+//! gap-aware: a bar that *opens* beyond the stop fills at its open (the stop
+//! level was never tradeable), not at the stop price. Other TP/SL touches are
+//! checked intrabar via the high/low, and a bar touching both resolves to the
+//! stop (the conservative assumption). One position at a time — new signals
+//! while in a trade are ignored, as a single-lot live bot would.
 //!
 //! This backtests the CNN signal **standalone**. The live loop runs the CNN as
 //! one consensus vote behind additional gates (min-agreement, risk, the 0.7
@@ -101,16 +105,19 @@ fn wilder_atr(high: &[f64], low: &[f64], close: &[f64], period: usize) -> Vec<f6
 
 /// Simulate trades from directional predictions aligned bar-for-bar with the
 /// price arrays. `preds[j] = (class, confidence)` for the same bar as
-/// `high[j]/low[j]/close[j]` (class 1 = long, 2 = short; others never trade).
+/// `open[j]/high[j]/low[j]/close[j]` (class 1 = long, 2 = short; others never
+/// trade). Entry is at the next bar's open after the signal; the decision-bar
+/// close itself is never traded.
 pub fn backtest_signals(
     preds: &[(usize, f64)],
+    open: &[f64],
     high: &[f64],
     low: &[f64],
     close: &[f64],
     cfg: &BacktestConfig,
 ) -> BacktestReport {
     let n = close.len();
-    if n == 0 || preds.len() != n {
+    if n == 0 || preds.len() != n || open.len() != n || high.len() != n || low.len() != n {
         return BacktestReport::default();
     }
     let atr = wilder_atr(high, low, close, cfg.atr_period);
@@ -133,9 +140,18 @@ pub fn backtest_signals(
             i += 1;
             continue;
         }
+        // Post-decision convention: the bar-i decision executes at bar i+1's
+        // open. No next bar → the order could never fill.
+        if i + 1 >= n {
+            break;
+        }
+        let entry = open[i + 1];
+        if entry <= 0.0 {
+            i += 1;
+            continue;
+        }
 
-        // Enter at this bar's close; bracket sized by the entry-bar ATR.
-        let entry = close[i];
+        // Bracket sized by the decision-bar ATR around the executable entry.
         let a = atr[i];
         let (tp, sl) = if dir > 0.0 {
             (entry + cfg.tp_atr_mult * a, entry - cfg.sl_atr_mult * a)
@@ -143,12 +159,20 @@ pub fn backtest_signals(
             (entry - cfg.tp_atr_mult * a, entry + cfg.sl_atr_mult * a)
         };
 
-        // Walk forward for an intrabar TP/SL, else time out at the close.
+        // Walk forward for an intrabar TP/SL, else time out at the close. A
+        // bar that opens beyond the stop fills at its open — the stop level
+        // was never tradeable that bar (gap-through). The stop is checked
+        // before the target: ties resolve to the stop.
         let last = (i + cfg.max_hold_bars).min(n - 1);
         let mut exit = close[last];
         let mut j = i + 1;
         while j <= last {
-            let hit_sl = if dir > 0.0 {
+            let gapped_through_sl = if dir > 0.0 {
+                open[j] <= sl
+            } else {
+                open[j] >= sl
+            };
+            let touched_sl = if dir > 0.0 {
                 low[j] <= sl
             } else {
                 high[j] >= sl
@@ -158,8 +182,11 @@ pub fn backtest_signals(
             } else {
                 low[j] <= tp
             };
-            if hit_sl {
-                exit = sl; // ties → stop first (conservative)
+            if gapped_through_sl {
+                exit = open[j];
+                break;
+            } else if touched_sl {
+                exit = sl;
                 break;
             } else if hit_tp {
                 exit = tp;
@@ -243,7 +270,7 @@ mod tests {
         let n = 50;
         let flat = vec![(0usize, 0.9); n];
         let px = vec![100.0; n];
-        let r = backtest_signals(&flat, &px, &px, &px, &BacktestConfig::default());
+        let r = backtest_signals(&flat, &px, &px, &px, &px, &BacktestConfig::default());
         assert_eq!(r.n_trades, 0);
     }
 
@@ -251,22 +278,24 @@ mod tests {
     fn winning_long_takes_tp_net_of_costs() {
         // Flat then a long signal; price ramps up so TP (1.5 ATR) is hit.
         let n = 20;
+        let mut open = vec![100.0; n];
         let mut high = vec![100.0; n];
         let mut low = vec![100.0; n];
         let mut close = vec![100.0; n];
         // establish some ATR via small ranges, then a strong up move.
         for i in 0..n {
+            open[i] = 100.0 + i as f64 * 0.5;
             high[i] = 100.0 + i as f64 * 0.5 + 0.5;
             low[i] = 100.0 + i as f64 * 0.5 - 0.5;
             close[i] = 100.0 + i as f64 * 0.5;
         }
         let mut preds = vec![(0usize, 0.9); n];
-        preds[2] = (1, 0.9); // long at bar 2
+        preds[2] = (1, 0.9); // long at bar 2 → entered at open[3]
         let cfg = BacktestConfig {
             cost_per_side: 0.0001,
             ..Default::default()
         };
-        let r = backtest_signals(&preds, &high, &low, &close, &cfg);
+        let r = backtest_signals(&preds, &open, &high, &low, &close, &cfg);
         assert_eq!(r.n_trades, 1);
         assert_eq!(r.long_trades, 1);
         // Up-trend long that reaches TP must be net positive after small costs.
@@ -282,7 +311,112 @@ mod tests {
         let lo: Vec<f64> = px.iter().map(|p| p - 0.5).collect();
         let mut preds = vec![(0usize, 0.9); n];
         preds[2] = (1, 0.3); // below default 0.5 threshold
-        let r = backtest_signals(&preds, &hi, &lo, &px, &BacktestConfig::default());
+        let r = backtest_signals(&preds, &px, &hi, &lo, &px, &BacktestConfig::default());
         assert_eq!(r.n_trades, 0);
+    }
+
+    /// The decision read at bar `i`'s close must NOT enter at that close: with
+    /// a gap up into a flat drift, the old same-close convention booked a
+    /// phantom +1% that no live order could capture; the next-open entry
+    /// books ~0.
+    #[test]
+    fn entry_executes_at_next_bar_open_not_decision_close() {
+        let n = 40;
+        let mut open = vec![100.0; n];
+        let mut high = vec![100.5; n];
+        let mut low = vec![99.5; n];
+        let mut close = vec![100.0; n];
+        // Constant TR = 1.0 → ATR converges to exactly 1.0.
+        let mut preds = vec![(0usize, 0.9); n];
+        preds[2] = (1, 0.9); // long decided at close[2] = 100.0
+        // Bar 3 gaps up to 101 and then drifts sideways at 101 forever.
+        for i in 3..n {
+            open[i] = 101.0;
+            high[i] = 101.5;
+            low[i] = 100.5;
+            close[i] = 101.0;
+        }
+        let cfg = BacktestConfig {
+            max_hold_bars: 10,
+            ..Default::default()
+        };
+        let r = backtest_signals(&preds, &open, &high, &low, &close, &cfg);
+        assert_eq!(r.n_trades, 1);
+        // Entry open[3] = 101, timeout exit close[last] = 101 → gross 0.
+        assert!(
+            (r.gross_return - 0.0).abs() < 1e-9,
+            "next-open entry must not book the close-to-open gap: {}",
+            r.gross_return
+        );
+    }
+
+    /// A long whose stop is gapped through must exit at that bar's open, not
+    /// at the stop level the market never traded.
+    #[test]
+    fn gap_through_stop_long_fills_at_open() {
+        let n = 40;
+        let mut open = vec![100.0; n];
+        let mut high = vec![100.5; n];
+        let mut low = vec![99.5; n];
+        let mut close = vec![100.0; n];
+        // Constant TR = 1.0 → ATR = 1.0 → long stop = entry − 1.0.
+        let mut preds = vec![(0usize, 0.9); n];
+        preds[2] = (1, 0.9); // long; entry = open[3] = 100, SL = 99, TP = 101.5
+        // Bar 3 trades normally (no touch), then bar 4 gaps open to 90 —
+        // entirely below the 99 stop.
+        open[4] = 90.0;
+        high[4] = 91.0;
+        low[4] = 89.0;
+        close[4] = 90.5;
+        let cfg = BacktestConfig::default();
+        let r = backtest_signals(&preds, &open, &high, &low, &close, &cfg);
+        assert_eq!(r.n_trades, 1);
+        // gross = (90 − 100)/100 = −0.10 (not the −0.01 the stop level implies).
+        let expected = -0.10 - 2.0 * cfg.cost_per_side;
+        assert!(
+            (r.net_return - expected).abs() < 1e-9,
+            "net {} != {expected}",
+            r.net_return
+        );
+    }
+
+    /// Mirror case for a short: a bar opening above the stop exits at its open.
+    #[test]
+    fn gap_through_stop_short_fills_at_open() {
+        let n = 40;
+        let mut open = vec![100.0; n];
+        let mut high = vec![100.5; n];
+        let mut low = vec![99.5; n];
+        let mut close = vec![100.0; n];
+        // Constant TR = 1.0 → ATR = 1.0 → short stop = entry + 1.0 = 101.
+        let mut preds = vec![(0usize, 0.9); n];
+        preds[2] = (2, 0.9); // short; entry = open[3] = 100, SL = 101, TP = 98.5
+        open[4] = 112.0;
+        high[4] = 113.0;
+        low[4] = 111.0;
+        close[4] = 112.5;
+        let cfg = BacktestConfig::default();
+        let r = backtest_signals(&preds, &open, &high, &low, &close, &cfg);
+        assert_eq!(r.n_trades, 1);
+        assert_eq!(r.short_trades, 1);
+        // gross = −(112 − 100)/100 = −0.12 (not the −0.01 the stop implies).
+        let expected = -0.12 - 2.0 * cfg.cost_per_side;
+        assert!(
+            (r.net_return - expected).abs() < 1e-9,
+            "net {} != {expected}",
+            r.net_return
+        );
+    }
+
+    /// Mismatched array lengths must yield an empty report, not a panic.
+    #[test]
+    fn length_mismatch_is_empty_report() {
+        let preds = vec![(1usize, 0.9); 5];
+        let px = vec![100.0; 5];
+        let short = vec![100.0; 4];
+        assert_eq!(
+            backtest_signals(&preds, &short, &px, &px, &px, &BacktestConfig::default()).n_trades,
+            0
+        );
     }
 }

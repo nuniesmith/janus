@@ -116,7 +116,7 @@ pub use exchanges::kraken::{
 };
 pub use exchanges::{
     Balance, Exchange, OrderStatusResponse, OrderUpdate, PositionUpdate, bybit::BybitExchange,
-    rate_limit::RateLimiter, router::ExchangeRouter,
+    paper::PaperExchange, rate_limit::RateLimiter, router::ExchangeRouter,
 };
 pub use execution::{
     ExecutionEngine, ExecutionEngineFactory, ExecutionUpdate, KrakenExecutionConfig,

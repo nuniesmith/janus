@@ -13,6 +13,12 @@ pub enum ExecutionError {
     #[error("Configuration error: {0}")]
     Config(String),
 
+    /// No execution backend is configured — submission refused. A paper or
+    /// live backend must be explicitly wired; an order must never be accepted
+    /// into a lifecycle that cannot fill it.
+    #[error("No execution backend configured: {0}")]
+    NoBackend(String),
+
     /// Exchange API errors
     #[error("Exchange error ({exchange}): {message}")]
     Exchange {
@@ -242,6 +248,7 @@ impl ExecutionError {
             ExecutionError::UnknownExchange(_) | ExecutionError::UnsupportedSymbol(_) => {
                 Status::new(Code::InvalidArgument, self.to_string())
             }
+            ExecutionError::NoBackend(_) => Status::new(Code::FailedPrecondition, self.to_string()),
             ExecutionError::Grpc(status) => status.clone(),
             _ => Status::new(Code::Internal, self.to_string()),
         }

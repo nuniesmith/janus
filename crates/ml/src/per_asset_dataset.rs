@@ -30,11 +30,14 @@ pub struct Sample {
 /// * `features`: `n_features * n_bars`, channel-major (`channel * n_bars + bar`),
 ///   as produced by `precompute_all_features` / repeated `extract_features`.
 /// * `labels`: one label per bar (length `n_bars`).
+/// * `valid`: optional per-bar label validity (`labeler::LabeledSeries::valid`);
+///   when supplied, invalid bars are skipped instead of becoming flat samples.
 /// * `window`: time dimension of each sample.
 /// * `warmup`: first usable bar index; defaults to `window + WARMUP_EXTRA`.
 ///
-/// Returns one [`Sample`] per bar in `[warmup, n_bars)` (window ending at the
-/// labeled bar). Empty when the shapes disagree or there aren't enough bars.
+/// Returns one [`Sample`] per usable bar in `[warmup, n_bars)` (window ending
+/// at the labeled bar). Empty when the shapes disagree or there aren't enough
+/// bars.
 // `bar` drives the window-offset arithmetic, not just the `labels` index, so
 // range-indexing is intentional here.
 #[allow(clippy::needless_range_loop)]
@@ -43,6 +46,7 @@ pub fn make_windows(
     n_features: usize,
     n_bars: usize,
     labels: &[i64],
+    valid: Option<&[bool]>,
     window: usize,
     warmup: Option<usize>,
 ) -> Vec<Sample> {
@@ -50,6 +54,7 @@ pub fn make_windows(
         || n_features == 0
         || features.len() != n_features * n_bars
         || labels.len() != n_bars
+        || valid.is_some_and(|v| v.len() != n_bars)
     {
         return Vec::new();
     }
@@ -60,6 +65,11 @@ pub fn make_windows(
 
     let mut out = Vec::with_capacity(n_bars - warmup);
     for bar in warmup..n_bars {
+        // Bars whose forward label horizon is unobservable carry a placeholder
+        // flat label; they must not become (flat) training samples.
+        if valid.is_some_and(|v| !v[bar]) {
+            continue;
+        }
         let start = bar + 1 - window; // window ends at `bar` (inclusive)
         let mut sample = vec![0.0f32; n_features * window];
         for c in 0..n_features {
@@ -125,6 +135,7 @@ mod tests {
             n_features,
             n_bars,
             &labels,
+            None,
             window,
             Some(window - 1),
         );
@@ -149,9 +160,36 @@ mod tests {
 
     #[test]
     fn shape_mismatch_and_short_inputs_yield_nothing() {
-        assert!(make_windows(&[1.0, 2.0, 3.0], 2, 2, &[0, 0], 2, None).is_empty()); // len 3 != 4
+        assert!(make_windows(&[1.0, 2.0, 3.0], 2, 2, &[0, 0], None, 2, None).is_empty()); // len 3 != 4
         let feats = vec![0.0f32; 2 * 10];
-        assert!(make_windows(&feats, 2, 10, &[0; 10], 2, Some(50)).is_empty()); // warmup >= n_bars
+        assert!(make_windows(&feats, 2, 10, &[0; 10], None, 2, Some(50)).is_empty()); // warmup >= n_bars
+        // Invalid label-validity length must also yield nothing.
+        assert!(make_windows(&feats, 2, 10, &[0; 10], Some(&[true; 9]), 2, None).is_empty());
+    }
+
+    /// A `valid` mask must exclude invalid bars from the sample set entirely —
+    /// an unknown future label is not a flat sample.
+    #[test]
+    fn validity_mask_skips_invalid_bars() {
+        let (n_features, n_bars, window) = (2usize, 30usize, 5usize);
+        let features: Vec<f32> = (0..n_features)
+            .flat_map(|c| (0..n_bars).map(move |t| (c * 1000 + t) as f32))
+            .collect();
+        let labels: Vec<i64> = vec![1; n_bars];
+        // Bars 10..30 invalid → windows end at bars (window-1)..10 only.
+        let mut valid = vec![true; n_bars];
+        valid[10..].fill(false);
+        let samples = make_windows(
+            &features,
+            n_features,
+            n_bars,
+            &labels,
+            Some(&valid),
+            window,
+            Some(window - 1),
+        );
+        assert_eq!(samples.len(), 10 - (window - 1));
+        assert!(samples.iter().all(|s| s.label == 1));
     }
 
     #[test]

@@ -31,6 +31,11 @@ const LABEL_SHORT: usize = 2;
 
 /// CNN inference configuration — all sourced from the environment, disabled by
 /// default so the live path is unchanged unless explicitly opted in.
+///
+/// The inference/feature window is *not* configured here: it is derived from
+/// the loaded checkpoint ([`PerAssetCnnConfig::window`]) so a model trained
+/// with a nondefault `--window` is served with the window it was trained on,
+/// never the default.
 #[derive(Debug, Clone)]
 pub struct CnnConfig {
     /// `ENABLE_CNN_INFERENCE` (default `false`).
@@ -39,8 +44,14 @@ pub struct CnnConfig {
     pub checkpoint: PathBuf,
     /// `CNN_CONFIDENCE_THRESHOLD` — minimum softmax confidence to cast a vote.
     pub confidence_threshold: f64,
-    /// Feature/inference window (bars).
-    pub window: usize,
+    /// `CNN_APPROVED_SYMBOL` — the single symbol this checkpoint may vote on.
+    /// A per-asset CNN is trained on one asset; enabling inference without an
+    /// approved symbol would let one asset's model vote on every symbol, so
+    /// `CnnInference::new` disables CNN entirely in that case (fail-closed).
+    pub approved_symbol: Option<String>,
+    /// `CNN_APPROVED_INTERVAL` — optional interval binding (e.g. `15m`).
+    /// When set, votes are restricted to that interval as well.
+    pub approved_interval: Option<String>,
 }
 
 impl Default for CnnConfig {
@@ -49,7 +60,8 @@ impl Default for CnnConfig {
             enabled: false,
             checkpoint: PathBuf::from("models/per_asset_cnn.bin"),
             confidence_threshold: 0.5,
-            window: feat::DEFAULT_WINDOW,
+            approved_symbol: None,
+            approved_interval: None,
         }
     }
 }
@@ -71,7 +83,12 @@ impl CnnConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(d.confidence_threshold),
-            window: d.window,
+            approved_symbol: std::env::var("CNN_APPROVED_SYMBOL")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
+            approved_interval: std::env::var("CNN_APPROVED_INTERVAL")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
         }
     }
 }
@@ -80,6 +97,10 @@ impl CnnConfig {
 pub struct CnnInference {
     config: CnnConfig,
     model: Option<PerAssetCnn<CpuBackend>>,
+    /// Effective feature/inference window: the loaded checkpoint's configured
+    /// window, or [`feat::DEFAULT_WINDOW`] when inactive. Feature extraction
+    /// and the per-symbol candle buffer must both use this value.
+    window: usize,
 }
 
 impl CnnInference {
@@ -92,33 +113,63 @@ impl CnnInference {
 
     /// Build from an explicit config (loading the champion if `enabled`).
     pub fn new(config: CnnConfig) -> Self {
-        let model = if config.enabled {
+        // Fail-closed asset-scope binding: a per-asset checkpoint is trained
+        // on ONE asset. Enabling CNN without an approved symbol would let a
+        // single asset's model vote on every symbol in the universe, so that
+        // misconfiguration disables CNN inference entirely.
+        let mut config = config;
+        if config.enabled && config.approved_symbol.is_none() {
+            warn!(
+                "CNN inference enabled without CNN_APPROVED_SYMBOL — disabled (a per-asset \
+                 checkpoint must be bound to its symbol before its votes may enter consensus)"
+            );
+            config.enabled = false;
+        }
+        let (model, window) = if config.enabled {
             let device = <CpuBackend as Backend>::Device::default();
             match PerAssetCnn::<CpuBackend>::load(&config.checkpoint, &device) {
                 Ok(m) => {
+                    let window = m.config().window;
                     info!(
-                        "CNN inference enabled: loaded champion from {:?}",
+                        "CNN inference enabled: loaded champion from {:?} (window {window})",
                         config.checkpoint
                     );
-                    Some(m)
+                    (Some(m), window)
                 }
                 Err(e) => {
                     warn!(
                         "ENABLE_CNN_INFERENCE set but loading {:?} failed: {e} — CNN inference disabled",
                         config.checkpoint
                     );
-                    None
+                    (None, feat::DEFAULT_WINDOW)
                 }
             }
         } else {
-            None
+            (None, feat::DEFAULT_WINDOW)
         };
-        Self { config, model }
+        Self {
+            config,
+            model,
+            window,
+        }
     }
 
     /// `true` when a champion is loaded and CNN voting is active.
     pub fn is_active(&self) -> bool {
         self.model.is_some()
+    }
+
+    /// Effective feature/inference window (bars): the checkpoint's configured
+    /// window when a champion is loaded, else the pipeline default. Size the
+    /// per-symbol [`CandleBuffer`]s with this — a checkpoint trained with a
+    /// nondefault window must never be served with the default window.
+    pub fn window(&self) -> usize {
+        self.window
+    }
+
+    /// A [`CandleBuffer`] sized for this inference's effective window.
+    pub fn candle_buffer(&self) -> CandleBuffer {
+        CandleBuffer::for_window(self.window)
     }
 
     /// Produce an optional signal vote `(signal, confidence)` from a window of
@@ -138,7 +189,7 @@ impl CnnInference {
         state: LiveState,
     ) -> Option<(SignalType, f64)> {
         let model = self.model.as_ref()?;
-        let window = self.config.window;
+        let window = self.window;
         let features = feat::extract_features(open, high, low, close, volume, &state, window)?;
 
         let nf = model.config().n_features;
@@ -168,13 +219,41 @@ impl CnnInference {
     /// Convenience for the strategy-consensus loop: turn a per-symbol
     /// [`CandleBuffer`] into a ready-to-push consensus vote tuple
     /// `(janus_core::SignalType, weight, source)`. Returns `None` when CNN
-    /// inference is inactive, there are too few bars, or the signal is
-    /// non-actionable / low-confidence — so the rule path is untouched.
+    /// inference is inactive, there are too few bars, the signal is
+    /// non-actionable / low-confidence, or the request is outside the
+    /// checkpoint's approved asset scope — so the rule path is untouched.
+    ///
+    /// `symbol` / `interval` are checked against [`CnnConfig::approved_symbol`]
+    /// / [`CnnConfig::approved_interval`] (fail-closed): a per-asset model's
+    /// vote must never leak to another symbol or timeframe.
     pub fn consensus_vote(
         &self,
+        symbol: &str,
+        interval: &str,
         buffer: &CandleBuffer,
         state: LiveState,
     ) -> Option<(janus_core::SignalType, f64, String)> {
+        // Asset-scope binding (fail-closed).
+        if let Some(approved) = self.config.approved_symbol.as_deref() {
+            if approved != symbol {
+                warn!(
+                    approved_symbol = approved,
+                    requested_symbol = symbol,
+                    "CNN vote refused: symbol outside the checkpoint's approved scope"
+                );
+                return None;
+            }
+            if let Some(approved_interval) = self.config.approved_interval.as_deref()
+                && approved_interval != interval
+            {
+                warn!(
+                    approved_interval = approved_interval,
+                    requested_interval = interval,
+                    "CNN vote refused: interval outside the checkpoint's approved scope"
+                );
+                return None;
+            }
+        }
         let (signal, confidence) = self.vote(
             &buffer.open,
             &buffer.high,
@@ -285,6 +364,24 @@ mod tests {
                 ..CnnConfig::default()
             },
             model: Some(model),
+            window: PerAssetCnnConfig::default().window,
+        }
+    }
+
+    /// An active CNN bound to a specific asset scope.
+    fn active_scoped(threshold: f64, symbol: &str, interval: &str) -> CnnInference {
+        let device = <CpuBackend as Backend>::Device::default();
+        let model = PerAssetCnn::<CpuBackend>::new(PerAssetCnnConfig::default(), &device);
+        CnnInference {
+            config: CnnConfig {
+                enabled: true,
+                confidence_threshold: threshold,
+                approved_symbol: Some(symbol.to_string()),
+                approved_interval: Some(interval.to_string()),
+                ..CnnConfig::default()
+            },
+            model: Some(model),
+            window: PerAssetCnnConfig::default().window,
         }
     }
 
@@ -307,7 +404,10 @@ mod tests {
         for i in 0..o.len() {
             buf.push(o[i], h[i], l[i], c[i], v[i]);
         }
-        assert!(cnn.consensus_vote(&buf, LiveState::default()).is_none());
+        assert!(
+            cnn.consensus_vote("BTCUSD", "15m", &buf, LiveState::default())
+                .is_none()
+        );
     }
 
     #[test]
@@ -318,7 +418,9 @@ mod tests {
         for i in 0..o.len() {
             buf.push(o[i], h[i], l[i], c[i], v[i]);
         }
-        if let Some((sig, conf, src)) = cnn.consensus_vote(&buf, LiveState::default()) {
+        if let Some((sig, conf, src)) =
+            cnn.consensus_vote("BTCUSD", "15m", &buf, LiveState::default())
+        {
             assert_eq!(src, "per_asset_cnn");
             assert!((0.0..=1.0).contains(&conf));
             assert!(matches!(
@@ -326,6 +428,52 @@ mod tests {
                 janus_core::SignalType::Buy | janus_core::SignalType::Sell
             ));
         }
+    }
+
+    /// Asset-scope binding (fail-closed): a checkpoint bound to BTCUSD/15m
+    /// must refuse votes for another symbol and another interval — a
+    /// per-asset model's vote must never leak to another asset or timeframe.
+    #[test]
+    fn consensus_vote_refuses_out_of_scope_symbol_and_interval() {
+        let cnn = active_scoped(0.0, "BTCUSD", "15m");
+        let mut buf = CandleBuffer::for_window(60);
+        let (o, h, l, c, v) = synth(140);
+        for i in 0..o.len() {
+            buf.push(o[i], h[i], l[i], c[i], v[i]);
+        }
+        assert!(
+            cnn.consensus_vote("ETHUSD", "15m", &buf, LiveState::default())
+                .is_none(),
+            "another symbol must never receive this checkpoint's vote"
+        );
+        assert!(
+            cnn.consensus_vote("BTCUSD", "1h", &buf, LiveState::default())
+                .is_none(),
+            "another interval must never receive this checkpoint's vote"
+        );
+        // In-scope request behaves like the unscoped model (no scope refusal).
+        if let Some((_, conf, src)) =
+            cnn.consensus_vote("BTCUSD", "15m", &buf, LiveState::default())
+        {
+            assert_eq!(src, "per_asset_cnn");
+            assert!((0.0..=1.0).contains(&conf));
+        }
+    }
+
+    /// Enabling CNN without CNN_APPROVED_SYMBOL must disable inference
+    /// outright (fail-closed): one asset's model must never vote on every
+    /// symbol in the universe.
+    #[test]
+    fn enabled_without_approved_symbol_is_disabled() {
+        let cnn = CnnInference::new(CnnConfig {
+            enabled: true,
+            checkpoint: PathBuf::from("/nonexistent/per_asset_cnn.bin"),
+            ..CnnConfig::default()
+        });
+        assert!(
+            !cnn.is_active(),
+            "enabled-without-scope must be disabled before any checkpoint is even loaded"
+        );
     }
 
     #[test]
@@ -377,5 +525,53 @@ mod tests {
             !cnn.is_active(),
             "a missing checkpoint must disable, not crash"
         );
+    }
+
+    /// A checkpoint trained with a nondefault window must be served with the
+    /// window it was trained on — the config default (60) must never override
+    /// the artifact. Global pooling lets a window mismatch run silently, which
+    /// is exactly the failure mode this guards against.
+    #[test]
+    fn effective_window_comes_from_checkpoint_not_default() {
+        let device = <CpuBackend as Backend>::Device::default();
+        let window = 40usize; // ≠ DEFAULT_WINDOW (60)
+        let cfg = PerAssetCnnConfig {
+            window,
+            ..PerAssetCnnConfig::default()
+        };
+        let model = PerAssetCnn::<CpuBackend>::new(cfg, &device);
+        let dir =
+            std::env::temp_dir().join(format!("janus-cnn-window-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("w40.bin");
+        model.save(&path).unwrap();
+
+        let cnn = CnnInference::new(CnnConfig {
+            enabled: true,
+            checkpoint: path,
+            // Scope binding is orthogonal to the window-under-test; a bound
+            // symbol is required for CNN to be active at all.
+            approved_symbol: Some("TESTUSD".to_string()),
+            ..CnnConfig::default()
+        });
+        assert!(cnn.is_active());
+        assert_eq!(cnn.window(), window, "window must come from the checkpoint");
+        // The companion buffer is sized for that window, and a vote over a
+        // checkpoint-sized buffer succeeds end to end.
+        let mut buf = cnn.candle_buffer();
+        let (o, h, l, c, v) = synth(feat::min_rows(window) + 20);
+        for i in 0..o.len() {
+            buf.push(o[i], h[i], l[i], c[i], v[i]);
+        }
+        if let Some((sig, conf, _src)) =
+            cnn.consensus_vote("BTCUSD", "15m", &buf, LiveState::default())
+        {
+            assert!((0.0..=1.0).contains(&conf));
+            assert!(matches!(
+                sig,
+                janus_core::SignalType::Buy | janus_core::SignalType::Sell
+            ));
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
