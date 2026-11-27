@@ -167,6 +167,13 @@ impl ExecutionService for ExecutionServiceImpl {
 
         order.time_in_force = time_in_force;
         order.strategy = strategy;
+        order.reduce_only = req.reduce_only.unwrap_or(false);
+
+        // A client_order_id is the idempotency key across retries and
+        // restarts; an empty string is treated as "not provided".
+        order.client_order_id = req
+            .client_order_id
+            .filter(|id| !id.trim().is_empty());
 
         if let Some(price) = req.price {
             order.price = Some(

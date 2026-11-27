@@ -426,11 +426,45 @@ impl SignalGenerator {
             .insert("strategy".to_string(), strategy_name);
         // Propagate the live regime + amygdala fear from the source signal
         // (Track 3) so the execution-path TradingSignal carries them too, not
-        // just signal-bus consumers.
-        for key in ["regime", "fear", "prop_firm", "risk_check"] {
+        // just signal-bus consumers. The risk-* keys carry the RiskManager's
+        // approved sizing and protective prices (entry / stop / take-profit)
+        // into the execution client, which orders with them instead of
+        // re-deriving size or clamping it up.
+        for key in [
+            "regime",
+            "fear",
+            "prop_firm",
+            "risk_check",
+            "position_size_units",
+            "position_value",
+            "risk_amount",
+            "risk_percentage",
+            "risk_reward_ratio",
+            "risk_entry_price",
+            "risk_stop_loss",
+            "risk_take_profit",
+        ] {
             if let Some(val) = signal.metadata.get(key) {
                 trading_signal.metadata.insert(key.to_string(), val.clone());
             }
+        }
+        // Surface the approved entry / stop / take-profit on the TradingSignal
+        // fields themselves so both execution paths (direct and brain-gated)
+        // see them as first-class prices, not just metadata strings.
+        if let Some(entry) = signal.metadata.get("risk_entry_price")
+            && let Ok(entry) = entry.parse::<f64>()
+        {
+            trading_signal.entry_price = Some(entry);
+        }
+        if let Some(stop) = signal.metadata.get("risk_stop_loss")
+            && let Ok(stop) = stop.parse::<f64>()
+        {
+            trading_signal.stop_loss = Some(stop);
+        }
+        if let Some(tp) = signal.metadata.get("risk_take_profit")
+            && let Ok(tp) = tp.parse::<f64>()
+        {
+            trading_signal.take_profit = Some(tp);
         }
 
         // ── Brain-gated path ───────────────────────────────────────

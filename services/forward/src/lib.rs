@@ -1843,10 +1843,13 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                                 if cnn.is_active() {
                                     let open = kline.open.to_f64().unwrap_or(0.0) as f32;
                                     let volume = kline.volume.to_f64().unwrap_or(0.0) as f32;
-                                    let buf =
-                                        cnn_buffers.entry(analyzer_key.clone()).or_default();
+                                    let buf = cnn_buffers
+                                        .entry(analyzer_key.clone())
+                                        .or_insert_with(|| cnn.candle_buffer());
                                     buf.push(open, high as f32, low as f32, close as f32, volume);
                                     if let Some(vote) = cnn.consensus_vote(
+                                        &symbol_str,
+                                        &kline.interval,
                                         buf,
                                         janus_ml::features::per_asset_cnn::LiveState::default(),
                                     ) {
@@ -2219,6 +2222,11 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                                 // live portfolio (concurrent positions, exposure, daily
                                 // loss). Result is surfaced as `risk_check` metadata; it
                                 // does not block (enforcement is a noted follow-up).
+                                // The approved signal is kept: its sizing metadata
+                                // (position_size_units, risk_amount, …) is what the
+                                // execution client must order with, so an approval and
+                                // the order it produces cannot disagree.
+                                let mut approved_risk_signal: Option<crate::signal::TradingSignal> = None;
                                 let risk_check = {
                                     let fwd_type = match final_type {
                                         janus_core::SignalType::Buy => crate::signal::SignalType::Buy,
@@ -2246,7 +2254,10 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                                     let rm = risk_manager.read().await;
                                     let pf = portfolio.read().await;
                                     match rm.apply_risk_management(ts, &md, &pf) {
-                                        Ok(_) => "ok".to_string(),
+                                        Ok(approved) => {
+                                            approved_risk_signal = Some(approved);
+                                            "ok".to_string()
+                                        }
                                         Err(e) => {
                                             warn!(
                                                 symbol = %symbol_str,
@@ -2291,6 +2302,43 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                                 let signal = signal.with_metadata("prop_firm", &prop_firm_label);
                                 // Portfolio-aware RiskManager verdict (advisory).
                                 let signal = signal.with_metadata("risk_check", &risk_check);
+
+                                // Carry the approved sizing out of the RiskManager into the
+                                // submission path: the execution client sizes the order from
+                                // `position_size_units` (never re-derives it, never bumps it
+                                // up to a minimum) and prices protective exits from the
+                                // approved entry / stop / take-profit.
+                                let signal = match approved_risk_signal.as_ref() {
+                                    Some(approved) => {
+                                        let mut s = signal;
+                                        if let Some(units) = approved.metadata.get("position_size_units") {
+                                            s = s.with_metadata("position_size_units", units);
+                                        }
+                                        if let Some(v) = approved.metadata.get("position_value") {
+                                            s = s.with_metadata("position_value", v);
+                                        }
+                                        if let Some(v) = approved.metadata.get("risk_amount") {
+                                            s = s.with_metadata("risk_amount", v);
+                                        }
+                                        if let Some(v) = approved.metadata.get("risk_percentage") {
+                                            s = s.with_metadata("risk_percentage", v);
+                                        }
+                                        if let Some(v) = approved.metadata.get("risk_reward_ratio") {
+                                            s = s.with_metadata("risk_reward_ratio", v);
+                                        }
+                                        if let Some(entry) = approved.entry_price {
+                                            s = s.with_metadata("risk_entry_price", format!("{entry}"));
+                                        }
+                                        if let Some(stop) = approved.stop_loss {
+                                            s = s.with_metadata("risk_stop_loss", format!("{stop}"));
+                                        }
+                                        if let Some(tp) = approved.take_profit {
+                                            s = s.with_metadata("risk_take_profit", format!("{tp}"));
+                                        }
+                                        s
+                                    }
+                                    None => signal,
+                                };
 
                                 // Unified execution-gate verdict (Track C). Advisory
                                 // unless JANUS_GATE_ENFORCE. Feeds the RiskManager
@@ -2408,7 +2456,34 @@ pub async fn start_module(state: Arc<janus_core::JanusState>) -> janus_core::Res
                                 // gate is part of the environment).
                                 let mut exp_blocked: Option<String> = None;
                                 if final_type != janus_core::SignalType::Hold && avg_confidence >= exec_floor {
-                                    let block_reason = if prop_firm_enforce
+                                    // ── Feed-freshness gate (always on) ─────────────
+                                    // A Buy entry must never be submitted on stale
+                                    // candles: kline.close_time is Unix µs; if the
+                                    // freshest bar is older than
+                                    // JANUS_MAX_FEED_STALE_SECS (default 300), the
+                                    // price the RiskManager sized against may no
+                                    // longer exist. Exits (reduce-only sells) are
+                                    // exempt: closing a position on stale data is
+                                    // safer than being unable to close it at all.
+                                    let now_us = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|d| d.as_micros() as i64)
+                                        .unwrap_or(0);
+                                    let feed_age_secs =
+                                        ((now_us - kline.close_time).max(0) / 1_000_000) as u64;
+                                    let max_feed_age_secs: u64 = std::env::var("JANUS_MAX_FEED_STALE_SECS")
+                                        .ok()
+                                        .and_then(|v| v.parse().ok())
+                                        .unwrap_or(300);
+                                    let stale_buy_entry = final_type == janus_core::SignalType::Buy
+                                        && feed_age_secs > max_feed_age_secs;
+
+                                    let block_reason = if stale_buy_entry {
+                                        Some(format!(
+                                            "feed_stale: kline close_time is {feed_age_secs}s old \
+                                             (max {max_feed_age_secs}s)"
+                                        ))
+                                    } else if prop_firm_enforce
                                         && prop_firm_label.starts_with("violation")
                                     {
                                         Some(format!("prop-firm: {prop_firm_label}"))

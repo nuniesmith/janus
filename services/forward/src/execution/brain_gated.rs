@@ -339,7 +339,7 @@ impl BrainGatedExecutionClient {
                 let applied_scale = *scale;
                 drop(stats); // release lock before async call
 
-                let result = self.submit_with_scale(signal, applied_scale).await;
+                let result = self.submit_with_scale(signal, applied_scale, false).await;
 
                 let mut stats = self.stats.write().await;
                 match result {
@@ -396,7 +396,7 @@ impl BrainGatedExecutionClient {
                         decision.symbol, decision.strategy, applied_scale, reason_clone,
                     );
 
-                    let result = self.submit_with_scale(signal, applied_scale).await;
+                    let result = self.submit_with_scale(signal, applied_scale, true).await;
 
                     let mut stats = self.stats.write().await;
                     match result {
@@ -484,38 +484,53 @@ impl BrainGatedExecutionClient {
     // Internal: scaled submission
     // ────────────────────────────────────────────────────────────────
 
-    /// Submit a signal with the given scale factor applied to its
-    /// confidence (which the execution client uses for quantity sizing).
+    /// Submit a signal with the given scale factor applied.
+    ///
+    /// `reduce_only` marks the order as an exit: it is forwarded as the
+    /// proto `reduce_only` flag, which the execution service enforces against
+    /// the tracked position (the order may only shrink it, never flip it).
+    ///
+    /// When `apply_scale_to_signal` is set, the scale applies to the
+    /// RiskManager-approved `position_size_units` metadata (the execution
+    /// client's authoritative quantity source) — never to confidence, which
+    /// is a belief signal, not a size. Signals without an approved size keep
+    /// the legacy confidence-scaled default in the client.
     async fn submit_with_scale(
         &mut self,
         signal: &TradingSignal,
         scale: f64,
+        reduce_only: bool,
     ) -> Result<SubmitSignalResponse> {
+        let mut outgoing = signal.clone();
         if self.config.apply_scale_to_signal {
-            let mut scaled_signal = signal.clone();
-            // Scale confidence which is used by ExecutionClient for quantity
-            scaled_signal.confidence = (signal.confidence * scale).clamp(0.0, 1.0);
-            // Annotate the metadata with the brain scale factor
-            scaled_signal
-                .metadata
-                .insert("brain_scale".to_string(), format!("{:.4}", scale));
-            scaled_signal
-                .metadata
-                .insert("brain_gated".to_string(), "true".to_string());
-            scaled_signal
-                .metadata
-                .insert("brain_gated_at".to_string(), Utc::now().to_rfc3339());
-            self.execution_client.submit_signal(&scaled_signal).await
-        } else {
-            let mut annotated_signal = signal.clone();
-            annotated_signal
-                .metadata
-                .insert("brain_scale".to_string(), format!("{:.4}", scale));
-            annotated_signal
-                .metadata
-                .insert("brain_gated".to_string(), "true".to_string());
-            self.execution_client.submit_signal(&annotated_signal).await
+            // Scale the approved position size (the execution client's
+            // authoritative quantity source), not confidence.
+            if let Some(units) = outgoing.metadata.get("position_size_units")
+                && let Ok(units) = units.parse::<f64>()
+            {
+                let scaled = (units * scale).max(0.0);
+                outgoing
+                    .metadata
+                    .insert("position_size_units".to_string(), scaled.to_string());
+            }
+            // Keep confidence unscaled: it is a belief signal, not a size.
         }
+        // Annotate the metadata with the brain scale factor
+        outgoing
+            .metadata
+            .insert("brain_scale".to_string(), format!("{:.4}", scale));
+        outgoing
+            .metadata
+            .insert("brain_gated".to_string(), "true".to_string());
+        outgoing
+            .metadata
+            .insert("brain_gated_at".to_string(), Utc::now().to_rfc3339());
+        if reduce_only {
+            outgoing
+                .metadata
+                .insert("reduce_only".to_string(), "true".to_string());
+        }
+        self.execution_client.submit_signal(&outgoing).await
     }
 
     // ────────────────────────────────────────────────────────────────

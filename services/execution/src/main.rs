@@ -134,6 +134,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Wire the kill switch guard into the order manager
             mgr.set_order_gate(kill_switch_gate.clone());
             info!("Order manager initialized successfully (with kill switch guard)");
+
+            // ── Execution backend selection ─────────────────────────────
+            // An order manager without a backend rejects every submission:
+            // paper trading runs against a simulated venue that fills
+            // through the real order lifecycle; live venues are not wired
+            // yet and must be added explicitly, never defaulted to.
+            let backend = std::env::var("EXECUTION_BACKEND").unwrap_or_else(|_| "paper".to_string());
+            match backend.as_str() {
+                "paper" => {
+                    let paper = janus_execution::PaperExchange::from_env();
+                    let mut router = janus_execution::ExchangeRouter::new();
+                    router
+                        .add_paper_exchange("paper", Arc::new(paper))
+                        .await;
+                    mgr.set_exchange_router(Arc::new(router));
+                    info!("Execution backend: paper (simulated fills, no real funds at risk)");
+                }
+                "live" => {
+                    return Err(
+                        "EXECUTION_BACKEND=live is not supported yet: no live venue adapter is \
+                         wired. Use 'paper' while the execution path is being validated."
+                            .into(),
+                    );
+                }
+                other => {
+                    return Err(format!("Unknown EXECUTION_BACKEND '{other}' (supported: paper)")
+                        .into());
+                }
+            }
+
             Arc::new(mgr)
         }
         Err(e) => {

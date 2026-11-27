@@ -74,6 +74,12 @@ pub struct OrderManager {
     /// This is defense-in-depth: even if the brain pipeline's kill switch
     /// fires, the execution service independently refuses orders.
     order_gate: Option<Arc<dyn OrderGate>>,
+
+    /// Durable idempotency index: `client_order_id` → internal order ID for
+    /// every accepted order. A duplicate submission (client retry, network
+    /// replay, post-crash resend) resolves to the original order instead of
+    /// creating a second one.
+    client_order_index: Arc<RwLock<HashMap<String, String>>>,
 }
 
 impl OrderManager {
@@ -93,6 +99,7 @@ impl OrderManager {
             completed_orders: Arc::new(RwLock::new(HashMap::new())),
             max_completed_cache: 1000,
             order_gate: None,
+            client_order_index: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -115,6 +122,7 @@ impl OrderManager {
             completed_orders: Arc::new(RwLock::new(HashMap::new())),
             max_completed_cache: 1000,
             order_gate: None,
+            client_order_index: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -149,6 +157,50 @@ impl OrderManager {
             "Submitting order"
         );
 
+        // ── Durable idempotency: resolve duplicate submissions ───────────
+        // A client_order_id is the stable identity across retries and
+        // restarts. An order that was already accepted (in memory, or
+        // persisted as an intent before any exchange I/O) resolves to the
+        // original — a resend must never create a second order.
+        if let Some(client_order_id) = order.client_order_id.clone() {
+            if let Some(existing) = self.client_order_index.read().get(&client_order_id) {
+                warn!(
+                    client_order_id = %client_order_id,
+                    existing_order_id = %existing,
+                    "Duplicate submission: client_order_id already known — returning existing order"
+                );
+                return Ok(existing.clone());
+            }
+            match self
+                .history
+                .find_order_id_by_client_order_id(&client_order_id)
+                .await
+            {
+                Ok(Some(existing)) => {
+                    warn!(
+                        client_order_id = %client_order_id,
+                        existing_order_id = %existing,
+                        "Duplicate submission found in persisted history (restart recovery) — returning existing order"
+                    );
+                    self.client_order_index
+                        .write()
+                        .insert(client_order_id, existing.clone());
+                    return Ok(existing.clone());
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    // Fail closed: without a uniqueness verdict, submitting
+                    // could duplicate an order that already reached the venue.
+                    error!(
+                        client_order_id = %client_order_id,
+                        error = %e,
+                        "Cannot verify client_order_id uniqueness — refusing to submit"
+                    );
+                    return Err(e);
+                }
+            }
+        }
+
         // Pre-trade validation
         let validation_result = self.validator.validate_order(&order).await?;
         if !validation_result.is_valid {
@@ -174,13 +226,54 @@ impl OrderManager {
             )));
         }
 
+        // ── Reduce-only enforcement ─────────────────────────────────────
+        // A reduce-only order may only shrink an existing opposite position;
+        // it must never open or increase exposure, and must never cross
+        // through zero into the opposite direction. Enforced here against
+        // the tracked position, before any venue sees the order.
+        if order.reduce_only {
+            let position = self
+                .position_tracker
+                .get_position(&order.exchange, order.symbol.clone())
+                .await;
+            validate_reduce_only_order(position.size, &order)?;
+        }
+
         // Track order
         self.tracker.add_order(&order)?;
+
+        if let Some(client_order_id) = &order.client_order_id {
+            self.client_order_index
+                .write()
+                .insert(client_order_id.clone(), order.id.clone());
+        }
 
         // Add to active orders
         {
             let mut active = self.active_orders.write();
             active.insert(order.id.clone(), order.clone());
+        }
+
+        // ── Persist the intent BEFORE any exchange I/O ──────────────────
+        // If the process dies between venue acceptance and acknowledgment,
+        // the persisted intent is what recovery (and duplicate detection)
+        // finds. A persistence failure must fail closed: submitting with no
+        // recovery identity is how duplicate orders happen.
+        if let Err(e) = self.history.record_order(&order).await {
+            error!(
+                order_id = %order.id,
+                error = %e,
+                "Failed to persist order intent before submission — refusing to submit (fail-closed)"
+            );
+            order.status = OrderStatusEnum::Rejected;
+            self.tracker.transition(
+                &order.id,
+                OrderStatusEnum::New,
+                OrderStatusEnum::Rejected,
+                Some(format!("Intent persistence failed: {e}")),
+            )?;
+            self.move_to_completed(&order);
+            return Err(e);
         }
 
         // Submit to exchange if router is available
@@ -208,6 +301,23 @@ impl OrderManager {
                         exchange_order_id = %exchange_order_id,
                         "Order submitted to exchange"
                     );
+
+                    // ── Paper backend: inject the simulated fill ────────
+                    // The paper venue fills market orders at placement time;
+                    // routing that fill through `handle_fill` (positions,
+                    // history, state transitions) is what makes a paper run
+                    // exercise the same lifecycle as a live one.
+                    if let Some(paper) = router.paper().await
+                        && let Some(fill) = paper.take_fill(&exchange_order_id)
+                    {
+                        if let Err(e) = self.handle_fill(&order.id, fill).await {
+                            error!(
+                                order_id = %order.id,
+                                error = %e,
+                                "Paper fill rejected by fill handler"
+                            );
+                        }
+                    }
                 }
                 Err(e) => {
                     error!(
@@ -230,14 +340,27 @@ impl OrderManager {
                 }
             }
         } else {
-            // No exchange router - just mark as submitted
-            order.status = OrderStatusEnum::Submitted;
+            // ── No execution backend: refuse, never fake success ────────
+            // An order accepted into a lifecycle that cannot fill it is a
+            // lie: the caller believes an order exists that does not.
+            error!(
+                order_id = %order.id,
+                "No execution backend configured — rejecting order"
+            );
+            order.status = OrderStatusEnum::Rejected;
             self.tracker.transition(
                 &order.id,
                 OrderStatusEnum::New,
-                OrderStatusEnum::Submitted,
-                Some("No exchange router configured".to_string()),
+                OrderStatusEnum::Rejected,
+                Some("No execution backend configured".to_string()),
             )?;
+            self.move_to_completed(&order);
+            self.history.record_order(&order).await?;
+            return Err(ExecutionError::NoBackend(
+                "no exchange router is configured; set EXECUTION_BACKEND=paper (or wire a live \
+                 venue) before submitting orders"
+                    .to_string(),
+            ));
         }
 
         // Persist to history
@@ -627,6 +750,55 @@ pub struct OrderStatistics {
     pub total_orders_tracked: usize,
 }
 
+/// Enforce a reduce-only order against the tracked position size.
+///
+/// Rules (pure function, no I/O):
+/// - a reduce-only order with no opposing position is rejected;
+/// - the order must trade on the side that closes the position;
+/// - the quantity may not exceed the absolute position size, so the
+///   order can never cross through zero into the opposite direction.
+///
+/// Returns the effective quantity (order quantity, since anything larger
+/// is rejected outright).
+pub(crate) fn validate_reduce_only_order(position_size: Decimal, order: &Order) -> Result<()> {
+    if position_size.is_zero() {
+        return Err(ExecutionError::Validation(format!(
+            "reduce-only order rejected: no open position on {} / {}",
+            order.exchange, order.symbol
+        )));
+    }
+
+    // Positive size = long → close with a Sell; negative = short → Buy.
+    let closing_side = if position_size.is_sign_positive() {
+        crate::types::OrderSide::Sell
+    } else {
+        crate::types::OrderSide::Buy
+    };
+
+    if order.side != closing_side {
+        return Err(ExecutionError::Validation(format!(
+            "reduce-only order rejected: side {side} would not reduce the {direction} position \
+             on {} / {}",
+            order.exchange, order.symbol,
+            side = order.side,
+            direction = if position_size.is_sign_positive() { "long" } else { "short" },
+        )));
+    }
+
+    let abs_position = position_size.abs();
+    if order.quantity > abs_position {
+        return Err(ExecutionError::Validation(format!(
+            "reduce-only order rejected: quantity {qty} exceeds position size {pos} on {} / {}; \
+             reducing may never open the opposite side",
+            order.exchange, order.symbol,
+            qty = order.quantity,
+            pos = abs_position,
+        )));
+    }
+
+    Ok(())
+}
+
 /// Evaluate the kill-switch order gate for an order.
 ///
 /// Returns `Err(ExecutionError::KillSwitchActive)` when a gate is configured
@@ -691,8 +863,54 @@ mod tests {
             fills: Vec::new(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            reduce_only: false,
             metadata: HashMap::new(),
         }
+    }
+
+    // Reduce-only enforcement: a reduce-only order may only shrink an
+    // existing opposite position. Each rejection path below is a way an
+    // unguarded reduce-only order could open or flip exposure.
+    fn reduce_only_order(side: crate::types::OrderSide, quantity: Decimal) -> Order {
+        let mut order = gate_test_order();
+        order.side = side;
+        order.quantity = quantity;
+        order.reduce_only = true;
+        order
+    }
+
+    #[test]
+    fn reduce_only_rejected_with_no_position() {
+        let err = validate_reduce_only_order(Decimal::ZERO, &reduce_only_order(crate::types::OrderSide::Sell, Decimal::ONE))
+            .expect_err("reduce-only with no position must be rejected");
+        assert!(matches!(err, ExecutionError::Validation(_)));
+    }
+
+    #[test]
+    fn reduce_only_rejected_on_wrong_side() {
+        // Long position (positive size): closing side is Sell, so a Buy is rejected.
+        let err = validate_reduce_only_order(Decimal::from(2), &reduce_only_order(crate::types::OrderSide::Buy, Decimal::ONE))
+            .expect_err("reduce-only buy against a long must be rejected");
+        assert!(matches!(err, ExecutionError::Validation(_)));
+    }
+
+    #[test]
+    fn reduce_only_rejected_when_larger_than_position() {
+        // Selling more than the long holds would flip into a short.
+        let err = validate_reduce_only_order(Decimal::from(2), &reduce_only_order(crate::types::OrderSide::Sell, Decimal::from(3)))
+            .expect_err("reduce-only larger than the position must be rejected");
+        assert!(matches!(err, ExecutionError::Validation(_)));
+    }
+
+    #[test]
+    fn reduce_only_allows_exact_reduction() {
+        // Exact-size Sell closes the long without crossing zero.
+        validate_reduce_only_order(Decimal::from(2), &reduce_only_order(crate::types::OrderSide::Sell, Decimal::from(2)))
+            .expect("exact reduce must be allowed");
+
+        // Short position (negative size) closes with a Buy.
+        validate_reduce_only_order(Decimal::from(-5), &reduce_only_order(crate::types::OrderSide::Buy, Decimal::from(5)))
+            .expect("exact short reduction must be allowed");
     }
 
     // The single most safety-critical invariant in the execution service: a

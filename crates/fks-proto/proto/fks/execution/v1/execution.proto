@@ -66,6 +66,12 @@ message SubmitSignalRequest {
   optional double price = 9;
   optional double stop_price = 10;
   map<string, string> metadata = 11;
+  // Client-supplied idempotency key. The execution service deduplicates on
+  // it across retries and restarts; a resend resolves to the original order.
+  optional string client_order_id = 12;
+  // When true the order may only shrink an existing opposite position; it is
+  // rejected outright if there is no position or it would cross through zero.
+  optional bool reduce_only = 13;
 }
 
 message SubmitSignalResponse {
