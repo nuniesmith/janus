@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Fast local readiness checks only: never install, fetch, or start trading here.
+set -euo pipefail
+
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+export PATH="$HOME/.cargo/bin:$PATH"
+rust_version=$(sed -n 's/^ARG RUST_VERSION=//p' Dockerfile)
+# Explicit selection avoids rustup attempting an install if the snapshot is stale.
+rustup run "$rust_version" rustc --version
+rustup run "$rust_version" cargo --version
+protoc --version

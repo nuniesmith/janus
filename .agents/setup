@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# Prepare the CPU Rust workspace for Amp's reusable orb snapshot.
+# Full builds, Docker services, CUDA and LaTeX/Python paper tools are on demand.
+set -euo pipefail
+
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+SECONDS=0
+
+printf '[setup +%ss] Checking native build dependencies\n' "$SECONDS"
+packages=(build-essential ca-certificates curl clang libclang-dev cmake libssl-dev pkg-config protobuf-compiler shellcheck)
+missing=()
+for package in "${packages[@]}"; do
+    if [[ "$(dpkg-query -W -f='${Status}' "$package" 2>/dev/null || true)" != 'install ok installed' ]]; then
+        missing+=("$package")
+    fi
+done
+if ((${#missing[@]})); then
+    sudo -n apt-get update -qq
+    sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing[@]}"
+fi
+
+# Keep the Docker build's pin as the source of truth, not the lower workspace MSRV.
+rust_version=$(sed -n 's/^ARG RUST_VERSION=//p' Dockerfile)
+[[ "$rust_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+    echo 'Expected one exact RUST_VERSION pin in Dockerfile' >&2
+    exit 1
+}
+printf '[setup +%ss] Preparing Rust %s with rustfmt and Clippy\n' "$SECONDS" "$rust_version"
+export PATH="$HOME/.cargo/bin:$PATH"
+if ! command -v rustup >/dev/null; then
+    curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs |
+        sh -s -- -y --profile minimal --default-toolchain none --no-modify-path
+fi
+if ! rustup toolchain list | grep -q "^${rust_version}-"; then
+    rustup toolchain install "$rust_version" --profile minimal --component rustfmt,clippy
+else
+    for component in rustfmt clippy; do
+        if ! rustup component list --toolchain "$rust_version" --installed | grep -q "^${component}-"; then
+            rustup component add --toolchain "$rust_version" "$component"
+        fi
+    done
+fi
+rustup override set "$rust_version"
+
+# Amp and supervised services start in fresh non-interactive login shells.
+# Preserve the existing profile (including Amp's own environment handling).
+# shellcheck disable=SC2016 # Expand HOME in the future login shell, not here.
+profile_line='[ ! -f "$HOME/.cargo/env" ] || . "$HOME/.cargo/env"'
+if ! grep -Fqx "$profile_line" "$HOME/.bash_profile" 2>/dev/null; then
+    printf '\n# Rust installed by Janus orb setup\n%s\n' "$profile_line" >> "$HOME/.bash_profile"
+fi
+
+printf '[setup +%ss] Caching locked Cargo dependencies for this host\n' "$SECONDS"
+host=$(rustc -vV | sed -n 's/^host: //p')
+cargo fetch --locked --target "$host"
+
+printf '[setup +%ss] Ready: %s; %s\n' "$SECONDS" "$(rustc --version)" "$(protoc --version)"

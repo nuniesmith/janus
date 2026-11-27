@@ -16,6 +16,9 @@ target/
 logs/
 *.log
 
+# Amp portal metadata is local to each orb.
+.amp/portals/*
+
 # Trained-model binaries — only metadata (.json) + feature contracts are tracked
 **/checkpoints/**/*.bin
 **/*.onnx
