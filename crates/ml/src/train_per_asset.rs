@@ -19,7 +19,7 @@ use burn_core::tensor::{Tensor, TensorData};
 use crate::backend::AutodiffCpuBackend;
 use crate::backend::CpuBackend;
 use crate::features::per_asset_cnn::{LiveState, precompute_features};
-use crate::labeler::{BreakoutLabelConfig, generate_labels_breakout, label_counts};
+use crate::labeler::{BreakoutLabelConfig, generate_labels_breakout_labeled, label_counts};
 use crate::models::per_asset_cnn::PerAssetCnn;
 use crate::models::trainable_per_asset_cnn::{CnnTrainer, TrainablePerAssetCnnConfig};
 use crate::per_asset_dataset::{Sample, class_weights, make_windows};
@@ -112,7 +112,7 @@ pub fn train_champion(
     let nf = cfg.model.n_features;
     let n_bars = close.len();
 
-    // 1) features (full series) + 2) labels.
+    // 1) features (full series) + 2) labels (with observability mask).
     let features = precompute_features(
         open,
         high,
@@ -122,10 +122,18 @@ pub fn train_champion(
         &LiveState::default(),
         cfg.window,
     )?;
-    let labels = generate_labels_breakout(high, low, close, &cfg.label);
+    let labeled = generate_labels_breakout_labeled(open, high, low, close, &cfg.label);
 
     // 3) sliding-window samples → train on all of them (CPU backend).
-    let samples = make_windows(&features, nf, n_bars, &labels, cfg.window, None);
+    let samples = make_windows(
+        &features,
+        nf,
+        n_bars,
+        &labeled.labels,
+        Some(&labeled.valid),
+        cfg.window,
+        None,
+    );
     train_on_samples::<AutodiffCpuBackend>(&samples, cfg)
 }
 
@@ -385,13 +393,23 @@ pub fn train_champion_with_holdout<B: AutodiffBackend>(
         &LiveState::default(),
         cfg.window,
     )?;
-    let labels = generate_labels_breakout(high, low, close, &cfg.label);
-    let all = make_windows(&features, nf, n_bars, &labels, cfg.window, None);
+    let labeled = generate_labels_breakout_labeled(open, high, low, close, &cfg.label);
+    let all = make_windows(
+        &features,
+        nf,
+        n_bars,
+        &labeled.labels,
+        Some(&labeled.valid),
+        cfg.window,
+        None,
+    );
     if all.is_empty() {
         return None;
     }
 
     // all[k] is the window ending at bar `first_bar + k` (mirrors make_windows).
+    // Bars with an unobservable outcome (the final label-horizon tail) were
+    // already dropped by the validity mask, so the holdout never scores them.
     let first_bar = (cfg.window + crate::per_asset_dataset::WARMUP_EXTRA).max(cfg.window - 1);
     let horizon = cfg.label.max_breakout_wait + cfg.label.max_hold_bars;
     let split_bar = ((n_bars as f64) * (1.0 - val_frac)) as usize;
@@ -460,15 +478,25 @@ pub fn train_walk_forward<B: AutodiffBackend>(
         &LiveState::default(),
         cfg.window,
     )?;
-    let labels = generate_labels_breakout(high, low, close, &cfg.label);
-    let all = make_windows(&features, nf, n_bars, &labels, cfg.window, None);
+    let labeled = generate_labels_breakout_labeled(open, high, low, close, &cfg.label);
+    let all = make_windows(
+        &features,
+        nf,
+        n_bars,
+        &labeled.labels,
+        Some(&labeled.valid),
+        cfg.window,
+        None,
+    );
     if all.is_empty() {
         return None;
     }
 
     let first_bar = (cfg.window + crate::per_asset_dataset::WARMUP_EXTRA).max(cfg.window - 1);
     let horizon = cfg.label.max_breakout_wait + cfg.label.max_hold_bars;
-    let last = n_bars.saturating_sub(horizon); // last bar with a complete forward label
+    // Last bar with a fully observable forward label — the labeler's exclusive
+    // endpoint (`n - horizon - 1`), so validation never scores unknown labels.
+    let last = n_bars.saturating_sub(horizon + 1);
     if last <= first_bar {
         return None;
     }
@@ -599,20 +627,31 @@ pub fn walk_forward_backtest<B: AutodiffBackend>(
         &LiveState::default(),
         cfg.window,
     )?;
-    let labels = generate_labels_breakout(high, low, close, &cfg.label);
-    let all = make_windows(&features, nf, n_bars, &labels, cfg.window, None);
+    let labeled = generate_labels_breakout_labeled(open, high, low, close, &cfg.label);
+    let all = make_windows(
+        &features,
+        nf,
+        n_bars,
+        &labeled.labels,
+        Some(&labeled.valid),
+        cfg.window,
+        None,
+    );
     if all.is_empty() {
         return None;
     }
 
     // f64 price arrays for the trade simulation.
+    let op: Vec<f64> = open.iter().map(|&x| x as f64).collect();
     let hi: Vec<f64> = high.iter().map(|&x| x as f64).collect();
     let lo: Vec<f64> = low.iter().map(|&x| x as f64).collect();
     let cl: Vec<f64> = close.iter().map(|&x| x as f64).collect();
 
     let first_bar = (cfg.window + crate::per_asset_dataset::WARMUP_EXTRA).max(cfg.window - 1);
     let horizon = cfg.label.max_breakout_wait + cfg.label.max_hold_bars;
-    let last = n_bars.saturating_sub(horizon);
+    // Last bar with a fully observable forward label — the labeler's exclusive
+    // endpoint (`n - horizon - 1`), so no fold simulates on unknown labels.
+    let last = n_bars.saturating_sub(horizon + 1);
     if last <= first_bar {
         return None;
     }
@@ -645,6 +684,7 @@ pub fn walk_forward_backtest<B: AutodiffBackend>(
         }
         reports.push(crate::backtest::backtest_signals(
             &preds,
+            &op[lo_b..hi_b],
             &hi[lo_b..hi_b],
             &lo[lo_b..hi_b],
             &cl[lo_b..hi_b],
